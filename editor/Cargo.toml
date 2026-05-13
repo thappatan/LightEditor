@@ -46,12 +46,16 @@ license = "Apache-2.0"      # ADR-011
 rust-version = "1.75"       # adjust per Claude Code recommendation
 
 # Shared dependencies pinned here when consumed by multiple crates.
-# Add as crates start needing them.
+# Add as crates start needing them; M0 (spike) initialized winit/wgpu/glyphon/
+# cosmic-text/pollster/log/env_logger.
 [workspace.dependencies]
-# winit = "0.30"
-# wgpu = "0.20"
-# cosmic-text = "0.12"
-# glyphon = "0.5"
+winit = "0.30"
+wgpu = "29"
+cosmic-text = "0.18"
+glyphon = "0.11"
+pollster = "0.4"
+log = "0.4"
+env_logger = "0.11"
 # ropey = "1.6"
 # tree-sitter = "0.22"
 # tokio = { version = "1", features = ["full"] }
