@@ -3,6 +3,12 @@
 > Track project management changes (folder structure, milestones, ADRs)
 > Code-level changelog will live in editor/CHANGELOG.md when implementation starts
 
+## 2026-05-14 — Session 4 (License decision)
+
+- Resolved license open question → Apache 2.0 ([ADR-011](../docs/adr/adr-011-license-apache-2-0.md)) ratifying the LICENSE file present at repo root
+- Updated `editor/Cargo.toml` workspace license metadata
+- First PR through the trunk-based workflow (branch `docs/license-decision`)
+
 ## 2026-05-13 — Session 3 (CI + release pipeline)
 
 - Added `CONTRIBUTING.md` — Conventional Commits 1.0, trunk-based branching, PR-only `main`, branch protection rules
