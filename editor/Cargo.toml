@@ -36,7 +36,7 @@ members = [
     # "crates/config",         # settings + keymaps
     # "crates/workspace",      # project management
     # "crates/theme",          # theme engine
-    # "crates/app",            # main binary (entry point)
+    "crates/app",              # main binary (M0 spike entry point)
 ]
 
 [workspace.package]
