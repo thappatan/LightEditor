@@ -42,7 +42,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "TBD"             # see meta/open-questions.md (still open)
+license = "Apache-2.0"      # ADR-011
 rust-version = "1.75"       # adjust per Claude Code recommendation
 
 # Shared dependencies pinned here when consumed by multiple crates.

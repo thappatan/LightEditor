@@ -897,13 +897,19 @@ editor/
 - **Alternatives**: Built-in Vim mode, pluggable optional layer
 - **Rationale**: ลด complexity ใน `editor-core` + ลด test surface; defer to plugin system (v2) ถ้ามี demand
 
+### ADR-011 — License: Apache 2.0
+
+- **Decision**: Apache License 2.0
+- **Alternatives**: MIT, GPL v3, AGPL, dual MIT/Apache-2.0, proprietary
+- **Rationale**: Explicit patent grant + Rust ecosystem fit + permissive adoption; trade off copyleft protection
+
 ---
 
 ## 10. Open Questions
 
 ต้องตัดสินใจก่อนเริ่ม implement หลัก:
 
-- [ ] License — open source หรือ proprietary? ถ้า open source ใช้ license ไหน (MIT, GPL, Apache)?
+- [x] ~~License — open source หรือ proprietary?~~ → **Resolved**: Apache 2.0 ([ADR-011](docs/adr/adr-011-license-apache-2-0.md))
 - [ ] Distribution — GitHub release, ผ่าน package manager, หรือทั้งคู่?
 - [ ] Plugin system — WASM, Lua, หรือไม่มี? (ตัดสินใจ defer ใน ADR-008)
 - [x] ~~Config format — TOML (แนะนำ), JSON, JSON5?~~ → **Resolved**: TOML ([ADR-009](docs/adr/adr-009-config-format-toml.md))

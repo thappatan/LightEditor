@@ -5,9 +5,6 @@
 
 ## Active
 
-- [ ] **License** — open source หรือ proprietary? ถ้า OSS เลือก license ไหน (MIT, Apache 2.0, GPL)?
-  - Impact: distribution, contribution, commercial strategy
-  - Need decision before: public repo / first external release
 - [ ] **Distribution** — GitHub release, package manager (brew/scoop/apt), หรือทั้งคู่?
   - Impact: update mechanism, code signing requirements
 - [ ] **Theme format** — VSCode-compatible (reuse ecosystem) หรือ custom (TOML)?
@@ -36,3 +33,4 @@
 - [x] **Plugin system v1**: Defer → [ADR-008](../docs/adr/adr-008-no-plugin-system-v1.md)
 - [x] **Config format**: TOML → [ADR-009](../docs/adr/adr-009-config-format-toml.md)
 - [x] **Modal editing**: ไม่รองรับใน v1 → [ADR-010](../docs/adr/adr-010-no-modal-editing.md)
+- [x] **License**: Apache 2.0 → [ADR-011](../docs/adr/adr-011-license-apache-2-0.md)
