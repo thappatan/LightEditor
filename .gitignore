@@ -1,0 +1,44 @@
+# Rust build artifacts
+target/
+**/target/
+*.rs.bk
+*.pdb
+
+# Cargo lock — keep for binary crates (we have one: crates/app), exclude here means we COMMIT it.
+# (Workspace convention: commit Cargo.lock for the final binary, ignore for libs. Our workspace
+# produces a binary in crates/app, so Cargo.lock IS committed at workspace root.)
+# (intentionally NOT excluding Cargo.lock)
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Editor / IDE local state
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# This project's runtime / per-workspace local state (per spec §4.1.5)
+# .editor/ holds workspace-scoped settings/keybindings/launch.json — committed
+# (NOT this directory) but local per-user overrides should be ignored if added.
+
+# Local environment / secrets
+.env
+.env.local
+*.local
+
+# Claude Code per-machine local state (settings.local.json is COMMITTED for permissions;
+# secrets/credentials are not.)
+.claude/.credentials.json
+
+# Skill installer state
+.agents/
+skills-lock.json
+
+# OS / tooling
+*.log

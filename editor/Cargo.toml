@@ -1,0 +1,75 @@
+# Cargo workspace for the code editor
+# Structure mirrors spec doc section 7
+#
+# NOTE: Members are commented out. Uncomment each as it gets initialized
+# by Claude Code via `cargo new --lib crates/<name>` (or --bin for app).
+# This prevents `cargo build` from failing on empty crate folders.
+
+[workspace]
+resolver = "2"
+members = [
+    # ── UI framework ──────────────────────────────────────
+    # "crates/ui/window",      # winit wrapper
+    # "crates/ui/render",      # wgpu pipeline
+    # "crates/ui/text",        # text shaping + rendering
+    # "crates/ui/scene",       # scene graph
+    # "crates/ui/widgets",     # widget primitives
+
+    # ── Core editor ───────────────────────────────────────
+    # "crates/buffer",         # text buffer (ropey)
+    # "crates/editor-core",    # editing operations
+    # "crates/syntax",         # tree-sitter
+    # "crates/lsp-client",     # LSP protocol
+    # "crates/dap-client",     # DAP protocol
+    # "crates/git",            # git integration (git2)
+    # "crates/terminal",       # terminal emulator (alacritty_terminal)
+
+    # ── AI ────────────────────────────────────────────────
+    # "crates/ai/providers",   # LLM providers
+    # "crates/ai/completion",  # inline completion (ghost text)
+    # "crates/ai/chat",        # chat sidebar
+    # "crates/ai/agent",       # agent loop
+    # "crates/ai/rag",         # codebase indexing
+    # "crates/ai/mcp",         # MCP client
+
+    # ── Application ───────────────────────────────────────
+    # "crates/config",         # settings + keymaps
+    # "crates/workspace",      # project management
+    # "crates/theme",          # theme engine
+    # "crates/app",            # main binary (entry point)
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "TBD"             # see meta/open-questions.md (still open)
+rust-version = "1.75"       # adjust per Claude Code recommendation
+
+# Shared dependencies pinned here when consumed by multiple crates.
+# Add as crates start needing them.
+[workspace.dependencies]
+# winit = "0.30"
+# wgpu = "0.20"
+# cosmic-text = "0.12"
+# glyphon = "0.5"
+# ropey = "1.6"
+# tree-sitter = "0.22"
+# tokio = { version = "1", features = ["full"] }
+# lsp-types = "0.95"
+# git2 = "0.18"
+# nucleo = "0.5"
+# reqwest = { version = "0.12", features = ["json", "stream"] }
+# eventsource-stream = "0.2"
+# keyring = "3"
+# arboard = "3"
+# fastembed = "3"
+# lancedb = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1               # better latency during development
