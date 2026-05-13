@@ -1,0 +1,65 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: editor
+          key: ${{ matrix.target }}
+      - name: build
+        working-directory: editor
+        run: cargo build --release --target ${{ matrix.target }} --bin app
+      - name: package
+        working-directory: editor/target/${{ matrix.target }}/release
+        run: |
+          tar -czf "light-editor-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: light-editor-${{ matrix.target }}
+          path: editor/target/${{ matrix.target }}/release/light-editor-*.tar.gz
+
+  release:
+    name: github release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/light-editor-*.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

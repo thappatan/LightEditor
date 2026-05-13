@@ -1,0 +1,24 @@
+# cargo-release configuration for the Light Editor workspace.
+# See https://github.com/crate-ci/cargo-release/blob/master/docs/reference.md
+
+# Workspace-wide release: all crates share the workspace.package version.
+shared-version = true
+
+# Don't publish to crates.io (private/TBD license — see meta/open-questions.md).
+publish = false
+
+# Tag format must match .github/workflows/release.yml trigger (v*.*.*).
+tag-name = "v{{version}}"
+tag-message = "release {{version}}"
+
+# Release commit message follows Conventional Commits.
+pre-release-commit-message = "chore(release): v{{version}}"
+
+# Push the tag (CI takes over to build binaries).
+push = true
+push-remote = "origin"
+
+# Be strict: refuse to release if working tree is dirty or branch is not main.
+allow-branch = ["main"]
+sign-commit = false
+sign-tag = false
