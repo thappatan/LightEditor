@@ -18,6 +18,13 @@ defaults:
   run:
     working-directory: editor
 
+# Until the first crate lands (M0 spike), the Cargo workspace has
+# `members = []` and every cargo subcommand refuses with "manifest is
+# virtual, and the workspace has no members". Each job below detects
+# that state and treats it as a vacuous pass so docs-only PRs are not
+# blocked. Once any `"crates/..."` line is uncommented in
+# editor/Cargo.toml, the real cargo command runs.
+
 jobs:
   fmt:
     name: fmt
@@ -27,7 +34,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - name: cargo fmt --check
+        run: |
+          if grep -qE '^[[:space:]]*"crates/' Cargo.toml; then
+            cargo fmt --all -- --check
+          else
+            echo "::notice::editor/Cargo.toml has no active workspace members yet — skipping cargo fmt."
+          fi
 
   check:
     name: check
@@ -42,7 +55,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: editor
-      - run: cargo check --workspace --all-targets
+      - name: cargo check
+        run: |
+          if grep -qE '^[[:space:]]*"crates/' Cargo.toml; then
+            cargo check --workspace --all-targets
+          else
+            echo "::notice::editor/Cargo.toml has no active workspace members yet — skipping cargo check."
+          fi
 
   clippy:
     name: clippy
@@ -55,7 +74,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: editor
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo clippy
+        run: |
+          if grep -qE '^[[:space:]]*"crates/' Cargo.toml; then
+            cargo clippy --workspace --all-targets -- -D warnings
+          else
+            echo "::notice::editor/Cargo.toml has no active workspace members yet — skipping cargo clippy."
+          fi
 
   test:
     name: test
@@ -70,7 +95,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: editor
+      - name: workspace active?
+        id: ws
+        run: |
+          if grep -qE '^[[:space:]]*"crates/' Cargo.toml; then
+            echo "active=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "active=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::editor/Cargo.toml has no active workspace members yet — skipping nextest."
+          fi
       - uses: taiki-e/install-action@v2
+        if: steps.ws.outputs.active == 'true'
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace
+      - name: cargo nextest
+        if: steps.ws.outputs.active == 'true'
+        run: cargo nextest run --workspace
