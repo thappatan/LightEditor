@@ -489,6 +489,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "editor-core"
+version = "0.1.0"
+dependencies = [
+ "editor-buffer",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "editor-ui-render"
 version = "0.1.0"
 dependencies = [
