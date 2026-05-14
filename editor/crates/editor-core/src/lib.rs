@@ -16,3 +16,7 @@ pub use editor::Editor;
 pub use selection::Selection;
 pub use selection_set::SelectionSet;
 pub use undo::UndoTree;
+
+// Re-exported: callers placing selections from pixel coordinates (mouse input)
+// need `Position` to talk to the buffer.
+pub use editor_buffer::Position;

@@ -120,6 +120,20 @@ impl Editor {
         self.move_vertical(extend, false);
     }
 
+    // ── direct selection placement ────────────────────────────────────────
+
+    /// Replace all selections with a single one — e.g. a mouse click, a drag,
+    /// or jumping to a search result.
+    ///
+    /// This is not an edit, so it records no undo step. The caller is
+    /// responsible for passing in-bounds `char` indices; positions past the
+    /// buffer end are clamped.
+    pub fn set_selection(&mut self, selection: Selection) {
+        let len = self.buffer.len_chars();
+        let clamped = Selection::new(selection.anchor.min(len), selection.head.min(len));
+        self.selections = SelectionSet::single(clamped);
+    }
+
     // ── undo / redo ───────────────────────────────────────────────────────
 
     /// Whether [`undo`](Editor::undo) would do anything.
@@ -645,6 +659,23 @@ mod tests {
         ed.undo();
         // selection state is restored along with the buffer
         assert_eq!(ed.selections().primary(), Selection::cursor(2));
+    }
+
+    #[test]
+    fn set_selection_replaces_all_and_clamps() {
+        let mut ed = Editor::from("hello");
+        ed.selections_mut_for_test(SelectionSet::new(
+            vec![Selection::cursor(0), Selection::cursor(3)],
+            0,
+        ));
+        // collapses the multi-cursor set to one selection
+        ed.set_selection(Selection::new(1, 4));
+        assert_eq!(ed.selections().len(), 1);
+        assert_eq!(ed.selections().primary(), Selection::new(1, 4));
+
+        // out-of-bounds indices are clamped to the buffer length
+        ed.set_selection(Selection::new(99, 100));
+        assert_eq!(ed.selections().primary(), Selection::cursor(5));
     }
 
     // Test-only helper to seed selection state without going through editing.
