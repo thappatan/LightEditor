@@ -24,7 +24,7 @@ use wgpu::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -73,6 +73,9 @@ struct State {
     /// While a left-button drag is in progress, the `char` index where it
     /// started (the selection's anchor).
     drag_anchor: Option<usize>,
+    /// Vertical scroll offset, in physical pixels. The text and everything
+    /// positioned against it is drawn shifted up by this much.
+    scroll_y: f32,
     /// The buffer text changed — TextStack needs a reshape before the next frame.
     text_dirty: bool,
     /// The editor state changed — the scene needs rebuilding before the next frame.
@@ -118,6 +121,7 @@ impl State {
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
             drag_anchor: None,
+            scroll_y: 0.0,
             text_dirty: false,
             scene_dirty: true,
             pending_keystroke: None,
@@ -224,6 +228,24 @@ impl State {
         self.drag_anchor = None;
     }
 
+    /// Mouse wheel: scroll the viewport vertically. A positive `delta_y`
+    /// scrolls toward the top of the document.
+    fn handle_scroll(&mut self, delta_y: f32) {
+        let new = (self.scroll_y - delta_y).clamp(0.0, self.max_scroll());
+        if new != self.scroll_y {
+            self.scroll_y = new;
+            self.scene_dirty = true;
+            self.window.request_redraw();
+        }
+    }
+
+    /// The largest valid scroll offset — content height beyond the viewport.
+    fn max_scroll(&self) -> f32 {
+        let content = self.editor.buffer().len_lines() as f32 * LINE_HEIGHT;
+        let visible = self.gpu.surface_config.height as f32 - TEXT_INSET;
+        (content - visible).max(0.0)
+    }
+
     /// Pointer moved. During a drag, extend the selection from the drag anchor
     /// to the pointer; otherwise just remember the position.
     fn handle_mouse_move(&mut self, x: f32, y: f32) {
@@ -245,9 +267,9 @@ impl State {
     /// mapping is correct for complex scripts — a click lands on a real
     /// grapheme boundary, not an assumed monospace column.
     fn char_at_pixel(&self, x: f32, y: f32) -> Option<usize> {
-        // Into text-origin-relative coordinates.
+        // Into text-origin-relative coordinates, undoing the scroll offset.
         let tx = x - TEXT_INSET;
-        let ty = y - TEXT_INSET;
+        let ty = y - TEXT_INSET + self.scroll_y;
         let cursor = self.text.buffer.hit(tx, ty)?;
 
         // cosmic-text gives (line, byte-in-line); convert to a char index.
@@ -282,7 +304,12 @@ impl State {
         for selection in self.editor.selections().iter() {
             if let Some((cx, cy)) = self.caret_pixel(selection.head) {
                 root.push_child(SceneNode::quad(
-                    Rect::new(TEXT_INSET + cx, TEXT_INSET + cy, CARET_WIDTH, LINE_HEIGHT),
+                    Rect::new(
+                        TEXT_INSET + cx,
+                        TEXT_INSET + cy - self.scroll_y,
+                        CARET_WIDTH,
+                        LINE_HEIGHT,
+                    ),
                     SceneColor::rgb(120, 160, 255),
                 ));
             }
@@ -306,10 +333,11 @@ impl State {
 
         // A tiny minimum width so a zero-width line (e.g. a selected blank
         // line, or a selected trailing newline) is still visible.
+        let scroll = self.scroll_y;
         let mut push = |x0: f32, y: f32, x1: f32| {
             rects.push(Rect::new(
                 TEXT_INSET + x0,
-                TEXT_INSET + y,
+                TEXT_INSET + y - scroll,
                 (x1 - x0).max(3.0),
                 LINE_HEIGHT,
             ));
@@ -442,7 +470,7 @@ impl State {
                 [TextArea {
                     buffer: &self.text.buffer,
                     left: TEXT_INSET,
-                    top: TEXT_INSET,
+                    top: TEXT_INSET - self.scroll_y,
                     scale: 1.0,
                     bounds: TextBounds {
                         left: 0,
@@ -588,6 +616,14 @@ impl ApplicationHandler for App {
                 ElementState::Pressed => state.handle_mouse_press(),
                 ElementState::Released => state.handle_mouse_release(),
             },
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Normalize both delta kinds to physical pixels.
+                let delta_y = match delta {
+                    MouseScrollDelta::LineDelta(_, lines) => lines * LINE_HEIGHT,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+                };
+                state.handle_scroll(delta_y);
+            }
             WindowEvent::RedrawRequested => {
                 state.render();
             }
