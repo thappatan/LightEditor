@@ -1,0 +1,10 @@
+[package]
+name = "editor-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+editor-buffer = { workspace = true }
+unicode-segmentation = { workspace = true }

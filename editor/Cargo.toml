@@ -17,7 +17,7 @@ members = [
 
     # ── Core editor ───────────────────────────────────────
     "crates/buffer",           # text buffer (ropey)
-    # "crates/editor-core",    # editing operations
+    "crates/editor-core",      # editing operations
     # "crates/syntax",         # tree-sitter
     # "crates/lsp-client",     # LSP protocol
     # "crates/dap-client",     # DAP protocol
@@ -51,6 +51,7 @@ rust-version = "1.75"       # adjust per Claude Code recommendation
 [workspace.dependencies]
 # Internal crates (path deps).
 editor-buffer = { path = "crates/buffer" }
+editor-core = { path = "crates/editor-core" }
 editor-ui-render = { path = "crates/ui/render" }
 editor-ui-text = { path = "crates/ui/text" }
 # Third-party.
@@ -62,6 +63,7 @@ pollster = "0.4"
 log = "0.4"
 env_logger = "0.11"
 ropey = "1.6"
+unicode-segmentation = "1"
 # tree-sitter = "0.22"
 # tokio = { version = "1", features = ["full"] }
 # lsp-types = "0.95"
