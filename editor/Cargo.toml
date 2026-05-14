@@ -10,8 +10,8 @@ resolver = "2"
 members = [
     # ── UI framework ──────────────────────────────────────
     # "crates/ui/window",      # winit wrapper
-    # "crates/ui/render",      # wgpu pipeline
-    # "crates/ui/text",        # text shaping + rendering
+    "crates/ui/render",        # wgpu pipeline
+    "crates/ui/text",          # text shaping + rendering
     # "crates/ui/scene",       # scene graph
     # "crates/ui/widgets",     # widget primitives
 
@@ -36,7 +36,7 @@ members = [
     # "crates/config",         # settings + keymaps
     # "crates/workspace",      # project management
     # "crates/theme",          # theme engine
-    "crates/app",              # main binary (M0 spike entry point)
+    "crates/app",              # main binary (entry point)
 ]
 
 [workspace.package]
@@ -49,6 +49,10 @@ rust-version = "1.75"       # adjust per Claude Code recommendation
 # Add as crates start needing them; M0 (spike) initialized winit/wgpu/glyphon/
 # cosmic-text/pollster/log/env_logger.
 [workspace.dependencies]
+# Internal crates (path deps).
+editor-ui-render = { path = "crates/ui/render" }
+editor-ui-text = { path = "crates/ui/text" }
+# Third-party.
 winit = "0.30"
 wgpu = "29"
 cosmic-text = "0.18"

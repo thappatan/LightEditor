@@ -1,23 +1,19 @@
-// Light Editor — M0 spike (see tasks/milestone-0-spike.md).
+// Light Editor — application entry point.
 //
-// Proves the core graphics + text stack from spec §2.3 + §3:
-//   winit → wgpu surface → glyphon (cosmic-text + swash) → GPU.
-//
-// One window, one clear color, multilingual sample rendered each frame,
-// frame time logged every second. All "real" architecture (scene graph,
-// retained-mode widgets, dirty regions) is deferred to M1+.
+// Currently runs the M0 spike behavior (see tasks/milestone-0-spike.md): one
+// window rendering a multilingual sample, frame time logged every second. The
+// GPU and text plumbing now live in editor-ui-render and editor-ui-text; this
+// binary owns only the window lifecycle, the render-pass orchestration, and
+// the latency instrumentation. Scene graph / retained-mode widgets are M1+.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
-};
+use editor_ui_render::GpuContext;
+use editor_ui_text::glyphon::{Color, Resolution, TextArea, TextBounds};
+use editor_ui_text::TextStack;
 use wgpu::{
-    CompositeAlphaMode, CurrentSurfaceTexture, DeviceDescriptor, Instance, LoadOp,
-    MultisampleState, Operations, PresentMode, RenderPassColorAttachment, RenderPassDescriptor,
-    RequestAdapterOptions, SurfaceConfiguration, TextureFormat, TextureUsages,
+    LoadOp, Operations, RenderPassColorAttachment, RenderPassDescriptor, StoreOp,
     TextureViewDescriptor,
 };
 use winit::application::ApplicationHandler;
@@ -28,6 +24,10 @@ use winit::window::{Window, WindowId};
 
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
+
+/// Padding between the window edge and the text block, in physical pixels.
+const TEXT_PADDING: f32 = 80.0;
+const TEXT_INSET: f32 = 40.0;
 
 // Per spec §3.4 the testing matrix for the text pipeline is Thai, CJK, Arabic
 // (RTL), Hangul, Devanagari, emoji ZWJ. One block covers all of them.
@@ -40,22 +40,6 @@ LightEditor — M0 spike\n\
 \n\
 The quick brown fox jumps over the lazy dog.\n\
 ";
-
-struct GpuContext {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
-    surface_config: SurfaceConfiguration,
-}
-
-struct TextStack {
-    font_system: FontSystem,
-    swash_cache: SwashCache,
-    viewport: Viewport,
-    atlas: TextAtlas,
-    renderer: TextRenderer,
-    buffer: Buffer,
-}
 
 struct State {
     window: Arc<Window>,
@@ -72,78 +56,20 @@ struct State {
 impl State {
     fn new(window: Arc<Window>, cold_start: Instant) -> Self {
         let size = window.inner_size();
-
-        let instance = Instance::default();
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("failed to create wgpu surface");
-
-        let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .expect("no compatible wgpu adapter found");
-
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&DeviceDescriptor::default()))
-                .expect("failed to request device");
-
-        let format = TextureFormat::Bgra8UnormSrgb;
-        let surface_config = SurfaceConfiguration {
-            usage: TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: PresentMode::Fifo,
-            alpha_mode: CompositeAlphaMode::Auto,
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &surface_config);
-
-        // Glyphon owns the GPU-side glyph atlas (spec §3.3 step 5).
-        let cache = Cache::new(&device);
-        let viewport = Viewport::new(&device, &cache);
-        let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
-        let renderer = TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
-
-        // cosmic-text handles shape + cluster (spec §3.3 step 2-3).
-        let mut font_system = FontSystem::new();
-        let swash_cache = SwashCache::new();
-
-        // 24-pt body text, 32-pt line height — readable on a 1280x720 window.
-        let metrics = Metrics::new(24.0, 32.0);
-        let mut buffer = Buffer::new(&mut font_system, metrics);
-        buffer.set_size(
-            &mut font_system,
-            Some(size.width as f32 - 80.0),
-            Some(size.height as f32 - 80.0),
-        );
-        buffer.set_text(
-            &mut font_system,
+        let gpu = GpuContext::new(window.clone());
+        let text = TextStack::new(
+            &gpu.device,
+            &gpu.queue,
+            gpu.format(),
+            size.width as f32 - TEXT_PADDING,
+            size.height as f32 - TEXT_PADDING,
             SAMPLE_TEXT,
-            &Attrs::new().family(Family::SansSerif),
-            Shaping::Advanced, // bidi + complex script (Thai/Arabic/Devanagari) on
-            None,              // default alignment
         );
-        buffer.shape_until_scroll(&mut font_system, false);
 
         Self {
             window,
-            gpu: GpuContext {
-                device,
-                queue,
-                surface,
-                surface_config,
-            },
-            text: TextStack {
-                font_system,
-                swash_cache,
-                viewport,
-                atlas,
-                renderer,
-                buffer,
-            },
+            gpu,
+            text,
             frame_count: 0,
             last_report: Instant::now(),
             last_frame_us: 0,
@@ -152,18 +78,10 @@ impl State {
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-        self.gpu.surface_config.width = size.width;
-        self.gpu.surface_config.height = size.height;
-        self.gpu
-            .surface
-            .configure(&self.gpu.device, &self.gpu.surface_config);
-        self.text.buffer.set_size(
-            &mut self.text.font_system,
-            Some(size.width as f32 - 80.0),
-            Some(size.height as f32 - 80.0),
+        self.gpu.resize(size.width, size.height);
+        self.text.set_size(
+            size.width as f32 - TEXT_PADDING,
+            size.height as f32 - TEXT_PADDING,
         );
     }
 
@@ -188,8 +106,8 @@ impl State {
                 &self.text.viewport,
                 [TextArea {
                     buffer: &self.text.buffer,
-                    left: 40.0,
-                    top: 40.0,
+                    left: TEXT_INSET,
+                    top: TEXT_INSET,
                     scale: 1.0,
                     bounds: TextBounds {
                         left: 0,
@@ -204,17 +122,8 @@ impl State {
             )
             .expect("text prepare failed");
 
-        let frame = match self.gpu.surface.get_current_texture() {
-            CurrentSurfaceTexture::Success(f) | CurrentSurfaceTexture::Suboptimal(f) => f,
-            CurrentSurfaceTexture::Outdated | CurrentSurfaceTexture::Lost => {
-                self.gpu
-                    .surface
-                    .configure(&self.gpu.device, &self.gpu.surface_config);
-                return;
-            }
-            CurrentSurfaceTexture::Timeout
-            | CurrentSurfaceTexture::Occluded
-            | CurrentSurfaceTexture::Validation => return,
+        let Some(frame) = self.gpu.acquire() else {
+            return;
         };
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
@@ -232,7 +141,7 @@ impl State {
                             b: 0.04,
                             a: 1.0,
                         }),
-                        store: wgpu::StoreOp::Store,
+                        store: StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: None,
