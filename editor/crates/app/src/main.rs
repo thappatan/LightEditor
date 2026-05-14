@@ -16,7 +16,7 @@ use std::time::Instant;
 use editor_core::Editor;
 use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Rect, Scene, SceneNode};
-use editor_ui_text::glyphon::{Attrs, Color, Family, Resolution, Shaping, TextArea, TextBounds};
+use editor_ui_text::glyphon::{Color, Resolution, TextArea, TextBounds};
 use editor_ui_text::TextStack;
 use wgpu::{
     LoadOp, Operations, RenderPassColorAttachment, RenderPassDescriptor, StoreOp,
@@ -253,26 +253,11 @@ impl State {
         Some((0.0, pos.line as f32 * LINE_HEIGHT))
     }
 
-    /// Reshape TextStack's buffer from the current editor text.
-    fn reshape_text(&mut self) {
-        let content = self.editor.text();
-        self.text.buffer.set_text(
-            &mut self.text.font_system,
-            &content,
-            &Attrs::new().family(Family::SansSerif),
-            Shaping::Advanced,
-            None,
-        );
-        self.text
-            .buffer
-            .shape_until_scroll(&mut self.text.font_system, false);
-    }
-
     fn render(&mut self) {
         let frame_start = Instant::now();
 
         if self.text_dirty {
-            self.reshape_text();
+            self.text.set_content(&self.editor.text());
             self.text_dirty = false;
         }
         if self.scene_dirty {

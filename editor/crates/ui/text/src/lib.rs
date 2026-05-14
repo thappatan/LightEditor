@@ -17,6 +17,20 @@ pub use glyphon;
 const FONT_SIZE: f32 = 24.0;
 const LINE_HEIGHT: f32 = 32.0;
 
+/// The editor uses a monospace family. `Family::SansSerif` resolves
+/// inconsistently across platforms once complex-script fallback kicks in (on
+/// macOS the generic sans-serif and the Thai fallback font don't visually
+/// match, so Latin runs next to Thai look like a different typeface).
+/// `Monospace` gives Latin a stable face; Thai still falls back to a
+/// Thai-capable font, but consistently.
+const FONT_FAMILY: Family<'static> = Family::Monospace;
+
+/// The default text attributes — one place so `new` and `set_content` always
+/// shape with the same font, weight, and style.
+fn default_attrs() -> Attrs<'static> {
+    Attrs::new().family(FONT_FAMILY)
+}
+
 /// Owns everything needed to shape and GPU-render one text buffer.
 ///
 /// Fields are public: until the scene graph lands the caller drives
@@ -55,23 +69,32 @@ impl TextStack {
 
         let mut buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         buffer.set_size(&mut font_system, Some(width), Some(height));
-        buffer.set_text(
-            &mut font_system,
-            text,
-            &Attrs::new().family(Family::SansSerif),
-            Shaping::Advanced,
-            None, // default alignment
-        );
-        buffer.shape_until_scroll(&mut font_system, false);
 
-        Self {
+        let mut stack = Self {
             font_system,
             swash_cache,
             viewport,
             atlas,
             renderer,
             buffer,
-        }
+        };
+        stack.set_content(text);
+        stack
+    }
+
+    /// Reshape the buffer to `text`, using the stack's standard font attributes
+    /// and `Shaping::Advanced`. This is the only path that shapes text — `new`
+    /// uses it too — so the font can never drift between the initial render
+    /// and a later edit.
+    pub fn set_content(&mut self, text: &str) {
+        self.buffer.set_text(
+            &mut self.font_system,
+            text,
+            &default_attrs(),
+            Shaping::Advanced,
+            None, // default alignment
+        );
+        self.buffer.shape_until_scroll(&mut self.font_system, false);
     }
 
     /// Resize the shaped buffer to a new area (physical pixels). A zero
