@@ -76,6 +76,10 @@ struct State {
     /// Vertical scroll offset, in physical pixels. The text and everything
     /// positioned against it is drawn shifted up by this much.
     scroll_y: f32,
+    /// Set when the change that dirtied the scene moved the caret (an edit,
+    /// arrow key, click, or drag) — the next rebuild scrolls it into view.
+    /// Wheel scrolling leaves this `false` so it isn't yanked back.
+    follow_caret: bool,
     /// The buffer text changed — TextStack needs a reshape before the next frame.
     text_dirty: bool,
     /// The editor state changed — the scene needs rebuilding before the next frame.
@@ -122,6 +126,7 @@ impl State {
             mouse_pos: (0.0, 0.0),
             drag_anchor: None,
             scroll_y: 0.0,
+            follow_caret: false,
             text_dirty: false,
             scene_dirty: true,
             pending_keystroke: None,
@@ -206,6 +211,7 @@ impl State {
         if handled {
             self.text_dirty |= text_changed;
             self.scene_dirty = true;
+            self.follow_caret = true;
             self.pending_keystroke = Some(Instant::now());
             self.window.request_redraw();
         }
@@ -220,6 +226,7 @@ impl State {
         self.drag_anchor = Some(char_idx);
         self.editor.set_selection(Selection::cursor(char_idx));
         self.scene_dirty = true;
+        self.follow_caret = true;
         self.window.request_redraw();
     }
 
@@ -246,6 +253,24 @@ impl State {
         (content - visible).max(0.0)
     }
 
+    /// Scroll the viewport the minimum amount needed to bring the primary
+    /// caret fully into view. A no-op when it is already visible.
+    fn ensure_caret_visible(&mut self) {
+        let head = self.editor.selections().primary().head;
+        let Some((_, caret_top)) = self.caret_pixel(head) else {
+            return;
+        };
+        let caret_bottom = caret_top + LINE_HEIGHT;
+        let visible = self.gpu.surface_config.height as f32 - TEXT_INSET;
+
+        if caret_top < self.scroll_y {
+            self.scroll_y = caret_top;
+        } else if caret_bottom > self.scroll_y + visible {
+            self.scroll_y = caret_bottom - visible;
+        }
+        self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll());
+    }
+
     /// Pointer moved. During a drag, extend the selection from the drag anchor
     /// to the pointer; otherwise just remember the position.
     fn handle_mouse_move(&mut self, x: f32, y: f32) {
@@ -258,6 +283,7 @@ impl State {
         };
         self.editor.set_selection(Selection::new(anchor, head));
         self.scene_dirty = true;
+        self.follow_caret = true;
         self.window.request_redraw();
     }
 
@@ -440,6 +466,10 @@ impl State {
             self.text_dirty = false;
         }
         if self.scene_dirty {
+            if self.follow_caret {
+                self.ensure_caret_visible();
+                self.follow_caret = false;
+            }
             self.rebuild_scene();
             self.scene_dirty = false;
         }
