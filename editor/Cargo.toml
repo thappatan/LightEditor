@@ -12,7 +12,7 @@ members = [
     # "crates/ui/window",      # winit wrapper
     "crates/ui/render",        # wgpu pipeline
     "crates/ui/text",          # text shaping + rendering
-    # "crates/ui/scene",       # scene graph
+    "crates/ui/scene",         # scene graph
     # "crates/ui/widgets",     # widget primitives
 
     # ── Core editor ───────────────────────────────────────
@@ -53,6 +53,7 @@ rust-version = "1.75"       # adjust per Claude Code recommendation
 editor-buffer = { path = "crates/buffer" }
 editor-core = { path = "crates/editor-core" }
 editor-ui-render = { path = "crates/ui/render" }
+editor-ui-scene = { path = "crates/ui/scene" }
 editor-ui-text = { path = "crates/ui/text" }
 # Third-party.
 winit = "0.30"
