@@ -45,15 +45,19 @@ pub struct TextStack {
 }
 
 impl TextStack {
-    /// Build the stack and shape `text` into a buffer sized `width` x `height`
-    /// (in physical pixels). `text` is shaped with `Shaping::Advanced` so
-    /// complex scripts (Thai, Arabic, Devanagari) cluster correctly.
+    /// Build the stack and shape `text` into a buffer `width` pixels wide.
+    ///
+    /// The buffer height is left unbounded (`None`): cosmic-text's
+    /// `shape_until_scroll` only shapes lines that fit inside `height_opt`, so
+    /// a bounded height would silently drop every line past the first
+    /// screenful. The caller scrolls and clips the viewport itself. `text` is
+    /// shaped with `Shaping::Advanced` so complex scripts (Thai, Arabic,
+    /// Devanagari) cluster correctly.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         width: f32,
-        height: f32,
         text: &str,
     ) -> Self {
         // Glyphon owns the GPU-side glyph atlas (spec §3.3 step 5).
@@ -68,7 +72,7 @@ impl TextStack {
         let swash_cache = SwashCache::new();
 
         let mut buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
-        buffer.set_size(&mut font_system, Some(width), Some(height));
+        buffer.set_size(&mut font_system, Some(width), None);
 
         let mut stack = Self {
             font_system,
@@ -97,13 +101,13 @@ impl TextStack {
         self.buffer.shape_until_scroll(&mut self.font_system, false);
     }
 
-    /// Resize the shaped buffer to a new area (physical pixels). A zero
-    /// dimension is ignored.
-    pub fn set_size(&mut self, width: f32, height: f32) {
-        if width <= 0.0 || height <= 0.0 {
+    /// Set the wrap width (physical pixels). Height stays unbounded — see
+    /// [`new`](TextStack::new). A non-positive width is ignored.
+    pub fn set_width(&mut self, width: f32) {
+        if width <= 0.0 {
             return;
         }
         self.buffer
-            .set_size(&mut self.font_system, Some(width), Some(height));
+            .set_size(&mut self.font_system, Some(width), None);
     }
 }

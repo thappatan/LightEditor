@@ -104,7 +104,6 @@ impl State {
             &gpu.queue,
             gpu.format(),
             size.width as f32 - TEXT_PADDING,
-            size.height as f32 - TEXT_PADDING,
             WELCOME_TEXT,
         );
         let editor = Editor::from(WELCOME_TEXT);
@@ -141,10 +140,7 @@ impl State {
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.gpu.resize(size.width, size.height);
-        self.text.set_size(
-            size.width as f32 - TEXT_PADDING,
-            size.height as f32 - TEXT_PADDING,
-        );
+        self.text.set_width(size.width as f32 - TEXT_PADDING);
         self.text_dirty = true;
         self.scene_dirty = true;
     }
