@@ -1,14 +1,13 @@
 // Light Editor — application entry point.
 //
-// An editable text surface: keyboard input drives editor-core, the editor
-// state is turned into a scene-graph each change, and the scene is rendered —
-// background panel + caret quads via QuadRenderer, buffer text via TextStack.
-// Keystroke latency (key press -> frame presented) is logged against the
-// spec §8 16ms target.
+// An editable text surface: keyboard and mouse input drive editor-core, the
+// editor state is turned into a scene-graph each change, and the scene is
+// rendered — selection highlights + caret quads via QuadRenderer, buffer text
+// via TextStack. The viewport scrolls (wheel, caret-follow, drag-past-edge)
+// and everything is sized in physical pixels scaled by the window's DPI.
 //
-// Still missing for a "real" editor: selection highlight, mouse input,
-// scrolling, multiple buffers/panes, a proper widget tree. Those are later
-// M1 PRs.
+// Still missing for a "real" editor: multiple buffers/panes, a proper widget
+// tree, find/replace, the file tree. Those are later M1 work.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -29,17 +28,17 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
+/// Initial window size, in logical pixels.
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
 
-/// Inset of the text block from the window's top-left, in physical pixels.
-const TEXT_INSET: f32 = 40.0;
-/// Padding subtracted from the window size to get the text-wrap width/height.
-const TEXT_PADDING: f32 = 80.0;
-/// Line height — must match `editor-ui-text`'s metrics (24pt / 32px).
-const LINE_HEIGHT: f32 = 32.0;
-/// Caret width in physical pixels.
-const CARET_WIDTH: f32 = 2.0;
+/// Inset of the text block from the window's top-left, in *logical* pixels.
+/// Multiplied by the window scale factor to get physical pixels.
+const TEXT_INSET_DIP: f32 = 28.0;
+/// Total horizontal padding (inset on both sides), in logical pixels.
+const TEXT_PADDING_DIP: f32 = 2.0 * TEXT_INSET_DIP;
+/// Caret width, in logical pixels.
+const CARET_WIDTH_DIP: f32 = 2.0;
 
 /// A spaces-per-tab stand-in until config lands.
 const TAB_AS_SPACES: &str = "    ";
@@ -50,6 +49,7 @@ const WELCOME_TEXT: &str = "\
 LightEditor — editable surface\n\
 \n\
 Type to edit. Arrows move; Shift+Arrows select.\n\
+Click to place the caret; drag to select; wheel to scroll.\n\
 \n\
 สวัสดีชาวโลก  ·  你好,世界  ·  مرحبا بالعالم\n\
 안녕하세요 세계  ·  नमस्ते दुनिया\n\
@@ -66,10 +66,21 @@ struct State {
     editor: Editor,
     /// The scene rebuilt from `editor` whenever it changes.
     scene: Scene,
+
+    /// Window scale factor; physical = logical * scale.
+    scale: f32,
+    /// `TEXT_INSET_DIP` / `TEXT_PADDING_DIP` / `CARET_WIDTH_DIP`, in physical
+    /// pixels for the current scale.
+    text_inset: f32,
+    text_padding: f32,
+    caret_width: f32,
+
     /// Latched keyboard modifiers (Shift for selection-extending movement).
     modifiers: ModifiersState,
-    /// Last known pointer position, in physical pixels.
-    mouse_pos: (f32, f32),
+    /// Last known pointer position in physical pixels — `None` until the first
+    /// `CursorMoved`, so a click before any move is ignored rather than
+    /// landing at (0, 0).
+    mouse_pos: Option<(f32, f32)>,
     /// While a left-button drag is in progress, the `char` index where it
     /// started (the selection's anchor).
     drag_anchor: Option<usize>,
@@ -77,8 +88,8 @@ struct State {
     /// positioned against it is drawn shifted up by this much.
     scroll_y: f32,
     /// Set when the change that dirtied the scene moved the caret (an edit,
-    /// arrow key, click, or drag) — the next rebuild scrolls it into view.
-    /// Wheel scrolling leaves this `false` so it isn't yanked back.
+    /// arrow key, or click) — the next rebuild scrolls it into view. Wheel
+    /// scrolling and drag-scrolling leave this `false` so they aren't undone.
     follow_caret: bool,
     /// The buffer text changed — TextStack needs a reshape before the next frame.
     text_dirty: bool,
@@ -96,14 +107,18 @@ struct State {
 
 impl State {
     fn new(window: Arc<Window>, cold_start: Instant) -> Self {
+        let scale = window.scale_factor() as f32;
         let size = window.inner_size();
         let gpu = GpuContext::new(window.clone());
         let quads = QuadRenderer::new(&gpu.device, gpu.format());
+
+        let text_padding = TEXT_PADDING_DIP * scale;
         let text = TextStack::new(
             &gpu.device,
             &gpu.queue,
             gpu.format(),
-            size.width as f32 - TEXT_PADDING,
+            size.width as f32 - text_padding,
+            scale,
             WELCOME_TEXT,
         );
         let editor = Editor::from(WELCOME_TEXT);
@@ -121,8 +136,12 @@ impl State {
             text,
             editor,
             scene,
+            scale,
+            text_inset: TEXT_INSET_DIP * scale,
+            text_padding,
+            caret_width: CARET_WIDTH_DIP * scale,
             modifiers: ModifiersState::empty(),
-            mouse_pos: (0.0, 0.0),
+            mouse_pos: None,
             drag_anchor: None,
             scroll_y: 0.0,
             follow_caret: false,
@@ -138,16 +157,39 @@ impl State {
         state
     }
 
+    /// Line height in physical pixels — the single unit carets, highlights,
+    /// and scroll math all work in. Sourced from TextStack so it can never
+    /// drift from the actual font metrics.
+    fn line_height(&self) -> f32 {
+        self.text.line_height()
+    }
+
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.gpu.resize(size.width, size.height);
-        self.text.set_width(size.width as f32 - TEXT_PADDING);
+        self.text.set_width(size.width as f32 - self.text_padding);
         self.text_dirty = true;
         self.scene_dirty = true;
         // ControlFlow::Wait won't redraw on its own — a resize must ask.
         self.window.request_redraw();
     }
 
-    /// Route a key press into `editor`. Returns whether the editor changed.
+    /// Re-size everything for a new window scale factor (the window moved to a
+    /// display with different DPI).
+    fn apply_scale(&mut self, scale: f32) {
+        if scale <= 0.0 || scale == self.scale {
+            return;
+        }
+        self.scale = scale;
+        self.text_inset = TEXT_INSET_DIP * scale;
+        self.text_padding = TEXT_PADDING_DIP * scale;
+        self.caret_width = CARET_WIDTH_DIP * scale;
+        self.text.set_scale(scale);
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Route a key press into `editor`.
     fn handle_key(&mut self, event: KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
@@ -218,7 +260,10 @@ impl State {
     /// Left-button press: place a single cursor where the pointer is and start
     /// a potential drag (the anchor stays here while the head follows).
     fn handle_mouse_press(&mut self) {
-        let Some(char_idx) = self.char_at_pixel(self.mouse_pos.0, self.mouse_pos.1) else {
+        let Some((mx, my)) = self.mouse_pos else {
+            return;
+        };
+        let Some(char_idx) = self.char_at_pixel(mx, my) else {
             return;
         };
         self.drag_anchor = Some(char_idx);
@@ -231,6 +276,34 @@ impl State {
     /// Left-button release: end any drag.
     fn handle_mouse_release(&mut self) {
         self.drag_anchor = None;
+    }
+
+    /// Pointer moved. During a drag, extend the selection from the drag anchor
+    /// to the pointer; a drag past the top/bottom edge also scrolls the view.
+    fn handle_mouse_move(&mut self, x: f32, y: f32) {
+        self.mouse_pos = Some((x, y));
+        let Some(anchor) = self.drag_anchor else {
+            return;
+        };
+
+        // Dragging past a viewport edge scrolls the view one step per move
+        // event. Continuous auto-scroll (without moving the mouse) would need
+        // a timer — deferred.
+        let surface_h = self.gpu.surface_config.height as f32;
+        if y < self.text_inset {
+            self.scroll_y = (self.scroll_y - (self.text_inset - y)).clamp(0.0, self.max_scroll());
+        } else if y > surface_h {
+            self.scroll_y = (self.scroll_y + (y - surface_h)).clamp(0.0, self.max_scroll());
+        }
+
+        let Some(head) = self.char_at_pixel(x, y) else {
+            return;
+        };
+        self.editor.set_selection(Selection::new(anchor, head));
+        self.scene_dirty = true;
+        // We scrolled deliberately above; don't let caret-follow fight it.
+        self.follow_caret = false;
+        self.window.request_redraw();
     }
 
     /// Mouse wheel: scroll the viewport vertically. A positive `delta_y`
@@ -247,7 +320,7 @@ impl State {
     /// Total shaped text height in physical pixels.
     ///
     /// Measured from the actual cosmic-text layout, so wrapped lines count
-    /// once per *visual* row — `buffer.len_lines() * LINE_HEIGHT` would
+    /// once per *visual* row — `buffer.len_lines() * line_height` would
     /// undercount because it only sees logical lines.
     fn content_height(&self) -> f32 {
         self.text
@@ -255,12 +328,12 @@ impl State {
             .layout_runs()
             .map(|run| run.line_top + run.line_height)
             .fold(0.0_f32, f32::max)
-            .max(LINE_HEIGHT)
+            .max(self.line_height())
     }
 
     /// The largest valid scroll offset — content height beyond the viewport.
     fn max_scroll(&self) -> f32 {
-        let visible = self.gpu.surface_config.height as f32 - TEXT_INSET;
+        let visible = self.gpu.surface_config.height as f32 - self.text_inset;
         (self.content_height() - visible).max(0.0)
     }
 
@@ -271,8 +344,8 @@ impl State {
         let Some((_, caret_top)) = self.caret_pixel(head) else {
             return;
         };
-        let caret_bottom = caret_top + LINE_HEIGHT;
-        let visible = self.gpu.surface_config.height as f32 - TEXT_INSET;
+        let caret_bottom = caret_top + self.line_height();
+        let visible = self.gpu.surface_config.height as f32 - self.text_inset;
 
         if caret_top < self.scroll_y {
             self.scroll_y = caret_top;
@@ -282,22 +355,6 @@ impl State {
         self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll());
     }
 
-    /// Pointer moved. During a drag, extend the selection from the drag anchor
-    /// to the pointer; otherwise just remember the position.
-    fn handle_mouse_move(&mut self, x: f32, y: f32) {
-        self.mouse_pos = (x, y);
-        let Some(anchor) = self.drag_anchor else {
-            return;
-        };
-        let Some(head) = self.char_at_pixel(x, y) else {
-            return;
-        };
-        self.editor.set_selection(Selection::new(anchor, head));
-        self.scene_dirty = true;
-        self.follow_caret = true;
-        self.window.request_redraw();
-    }
-
     /// Hit-test a physical-pixel point to a buffer `char` index.
     ///
     /// Goes through cosmic-text's shaped layout (`Buffer::hit`), so the
@@ -305,8 +362,8 @@ impl State {
     /// grapheme boundary, not an assumed monospace column.
     fn char_at_pixel(&self, x: f32, y: f32) -> Option<usize> {
         // Into text-origin-relative coordinates, undoing the scroll offset.
-        let tx = x - TEXT_INSET;
-        let ty = y - TEXT_INSET + self.scroll_y;
+        let tx = x - self.text_inset;
+        let ty = y - self.text_inset + self.scroll_y;
         let cursor = self.text.buffer.hit(tx, ty)?;
 
         // cosmic-text gives (line, byte-in-line); convert to a char index.
@@ -338,14 +395,15 @@ impl State {
         }
 
         // Carets on top of the highlights.
+        let line_height = self.line_height();
         for selection in self.editor.selections().iter() {
             if let Some((cx, cy)) = self.caret_pixel(selection.head) {
                 root.push_child(SceneNode::quad(
                     Rect::new(
-                        TEXT_INSET + cx,
-                        TEXT_INSET + cy - self.scroll_y,
-                        CARET_WIDTH,
-                        LINE_HEIGHT,
+                        self.text_inset + cx,
+                        self.text_inset + cy - self.scroll_y,
+                        self.caret_width,
+                        line_height,
                     ),
                     SceneColor::rgb(120, 160, 255),
                 ));
@@ -370,13 +428,15 @@ impl State {
 
         // A tiny minimum width so a zero-width line (e.g. a selected blank
         // line, or a selected trailing newline) is still visible.
+        let inset = self.text_inset;
         let scroll = self.scroll_y;
+        let line_height = self.line_height();
         let mut push = |x0: f32, y: f32, x1: f32| {
             rects.push(Rect::new(
-                TEXT_INSET + x0,
-                TEXT_INSET + y - scroll,
+                inset + x0,
+                inset + y - scroll,
                 (x1 - x0).max(3.0),
-                LINE_HEIGHT,
+                line_height,
             ));
         };
 
@@ -439,9 +499,11 @@ impl State {
     /// Pixel offset of the caret at `(line, column)`, relative to the text
     /// origin.
     ///
-    /// Uses the shaped cosmic-text layout, so the x position is correct for
-    /// complex scripts — the caret lands on a real glyph boundary, not an
-    /// assumed monospace column.
+    /// Uses the shaped cosmic-text layout. A wrapped logical line spans
+    /// several visual runs (each with the same `line_i`); this picks the run
+    /// whose byte range actually contains the caret, so the caret stays on the
+    /// right visual row. The x position comes from a real glyph boundary, so
+    /// it is correct for complex scripts too.
     fn caret_pixel_at(&self, line: usize, column: usize) -> Option<(f32, f32)> {
         let line_str = self.editor.buffer().line(line)?;
         let byte_in_line = line_str
@@ -450,23 +512,36 @@ impl State {
             .map(|(b, _)| b)
             .unwrap_or(line_str.len());
 
+        // Visual end of the last run seen for this line — the fallback when
+        // the caret's byte falls past every run (e.g. trailing position).
+        let mut last_run_end: Option<(f32, f32)> = None;
+
         for run in self.text.buffer.layout_runs() {
             if run.line_i != line {
                 continue;
             }
-            let y = run.line_top;
-            let mut x = 0.0;
-            for glyph in run.glyphs.iter() {
-                if glyph.start >= byte_in_line {
-                    return Some((glyph.x, y));
+            let run_start = run.glyphs.first().map(|g| g.start).unwrap_or(0);
+            let run_end = run.glyphs.last().map(|g| g.end).unwrap_or(run_start);
+            let run_end_x = run.glyphs.last().map(|g| g.x + g.w).unwrap_or(0.0);
+            last_run_end = Some((run_end_x, run.line_top));
+
+            // Is the caret within this visual run?
+            if byte_in_line >= run_start && byte_in_line <= run_end {
+                let mut x = 0.0;
+                for glyph in run.glyphs.iter() {
+                    if glyph.start >= byte_in_line {
+                        return Some((glyph.x, run.line_top));
+                    }
+                    x = glyph.x + glyph.w;
                 }
-                x = glyph.x + glyph.w;
+                // Past the last glyph of this run — caret at the run's end.
+                return Some((x, run.line_top));
             }
-            // Past the last glyph — caret sits at the end of the line.
-            return Some((x, y));
         }
-        // Line has no layout run (e.g. an empty trailing line).
-        Some((0.0, line as f32 * LINE_HEIGHT))
+
+        // The caret's byte is past every run of this line, or the line has no
+        // runs at all (an empty line still gets one, so the latter is rare).
+        last_run_end.or(Some((0.0, line as f32 * self.line_height())))
     }
 
     fn render(&mut self) {
@@ -500,6 +575,7 @@ impl State {
                 height: self.gpu.surface_config.height,
             },
         );
+        let inset = self.text_inset;
         self.text
             .renderer
             .prepare(
@@ -510,8 +586,8 @@ impl State {
                 &self.text.viewport,
                 [TextArea {
                     buffer: &self.text.buffer,
-                    left: TEXT_INSET,
-                    top: TEXT_INSET - self.scroll_y,
+                    left: inset,
+                    top: inset - self.scroll_y,
                     scale: 1.0,
                     bounds: TextBounds {
                         left: 0,
@@ -553,7 +629,7 @@ impl State {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            // Caret quads first, text on top.
+            // Caret/highlight quads first, text on top.
             self.quads.render(&mut pass);
             self.text
                 .renderer
@@ -639,7 +715,8 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => state.resize(size),
-            WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                state.apply_scale(scale_factor as f32);
                 state.resize(state.window.inner_size());
             }
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -660,7 +737,7 @@ impl ApplicationHandler for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 // Normalize both delta kinds to physical pixels.
                 let delta_y = match delta {
-                    MouseScrollDelta::LineDelta(_, lines) => lines * LINE_HEIGHT,
+                    MouseScrollDelta::LineDelta(_, lines) => lines * state.line_height(),
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                 };
                 state.handle_scroll(delta_y);
