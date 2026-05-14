@@ -3,6 +3,15 @@
 > Track project management changes (folder structure, milestones, ADRs)
 > Code-level changelog will live in editor/CHANGELOG.md when implementation starts
 
+## 2026-05-14 — Session 5 (M0 Spike)
+
+- **Milestone 0 complete** — technology stack de-risked (ADR-002/003 validated)
+- Initialized `crates/app` binary; spike implements winit window + wgpu 29 surface + glyphon 0.11/cosmic-text 0.18 multilingual text rendering
+- Centralized M0 dependencies in `editor/Cargo.toml` `[workspace.dependencies]`; spec's draft pins were stale (wgpu 0.20→29, cosmic-text 0.12→0.18, glyphon 0.5→0.11)
+- Benchmark: frame time ~8ms (½ of 16ms target), cold start 130-170ms warm / 923ms first-ever — over 100ms target, M1 follow-up needed
+- CI fixes: `cache-bin: false` + `prefix-key` bump (stale macOS cargo-bin cache), `--no-tests=pass` (nextest on empty test suite)
+- Findings: [docs/research/m0-spike-results.md](../docs/research/m0-spike-results.md)
+
 ## 2026-05-14 — Session 4 (License decision)
 
 - Resolved license open question → Apache 2.0 ([ADR-011](../docs/adr/adr-011-license-apache-2-0.md)) ratifying the LICENSE file present at repo root

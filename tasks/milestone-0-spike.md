@@ -2,9 +2,9 @@
 milestone: 0
 title: Spike — Rendering & Text Foundation
 target_duration: 1-2 weeks
-started: TBD
-completed: TBD
-status: not_started
+started: 2026-05-14
+completed: 2026-05-14
+status: complete
 ---
 
 # Milestone 0 — Spike
@@ -16,27 +16,32 @@ status: not_started
 
 ## Tasks
 
-- [ ] Setup Cargo workspace + verify build บน macOS/Linux/Windows
-- [ ] Window + GPU rendering hello-world
-  - [ ] winit window initialization
-  - [ ] wgpu surface + clear color
-  - [ ] Event loop เบื้องต้น (close window works)
-- [ ] Text shaping Thai working
-  - [ ] Integrate cosmic-text + swash
-  - [ ] Render "สวัสดีชาวโลก" ถูกต้องตาม cluster (no broken vowel/tone)
-  - [ ] Wire glyphon เพื่อ raster + cache บน GPU
-  - [ ] Test matrix: Thai, CJK, Arabic (RTL), emoji ZWJ
-- [ ] Baseline latency benchmark
-  - [ ] Measure frame time + report P50/P95/P99
-  - [ ] Measure cold start time
-  - [ ] เทียบกับ performance targets (section 8): startup <100ms, frame 16ms
-- [ ] Document findings ใน `docs/research/m0-spike-results.md`
+- [x] Setup Cargo workspace + verify build บน macOS/Linux/Windows
+  - macOS: built + ran. Linux/Windows: CI confirms compile on ubuntu+macos; Windows ยังไม่ทดสอบ
+- [x] Window + GPU rendering hello-world
+  - [x] winit window initialization (1280x720, ApplicationHandler API)
+  - [x] wgpu surface + clear color
+  - [x] Event loop เบื้องต้น (close window works)
+- [x] Text shaping Thai working
+  - [x] Integrate cosmic-text + swash
+  - [x] Render "สวัสดีชาวโลก" ถูกต้องตาม cluster (no broken vowel/tone)
+  - [x] Wire glyphon เพื่อ raster + cache บน GPU
+  - [x] Test matrix: Thai, CJK, Arabic (RTL), emoji ZWJ — + Hangul, Devanagari
+- [x] Baseline latency benchmark
+  - [~] Measure frame time — logged 1-second rolling avg (~8ms); proper P50/P95/P99 deferred to M1
+  - [x] Measure cold start time — warm 130-170ms, first-ever 923ms
+  - [x] เทียบกับ performance targets (section 8): frame ✅ well under 16ms; cold start ⚠️ over 100ms target
+- [x] Document findings ใน `docs/research/m0-spike-results.md`
 
 ## Blockers
 - (none)
 
 ## Notes
-_(log สำคัญที่เกิดระหว่าง milestone นี้)_
+- Stack de-risked — ADR-002/003 hold up. Full results: [docs/research/m0-spike-results.md](../docs/research/m0-spike-results.md)
+- Frame time ~8ms (½ of 16ms target) — comfortable headroom
+- Cold start is the one concern: 130-170ms warm (over 100ms target, under 250ms hard limit), 923ms on a first-ever cold GPU cache. M1 follow-up: flamegraph `App::new()`, suspect eager `FontSystem::new()` font enumeration
+- Spec's draft dependency pins were stale — actual: wgpu 29, cosmic-text 0.18, glyphon 0.11, winit 0.30 (centralized in `editor/Cargo.toml`)
+- P50/P95/P99 percentile capture + automated grapheme-cluster correctness tests pushed to M1 (need a `criterion` harness)
 
 ## Decisions Made
 - [ADR-001 — Rust](../docs/adr/adr-001-rust-language.md)
