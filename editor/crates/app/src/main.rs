@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use editor_core::{Editor, Selection};
+use editor_core::{Editor, Position, Selection};
 use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{Color, Resolution, TextArea, TextBounds};
@@ -24,7 +24,7 @@ use wgpu::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -68,6 +68,11 @@ struct State {
     scene: Scene,
     /// Latched keyboard modifiers (Shift for selection-extending movement).
     modifiers: ModifiersState,
+    /// Last known pointer position, in physical pixels.
+    mouse_pos: (f32, f32),
+    /// While a left-button drag is in progress, the `char` index where it
+    /// started (the selection's anchor).
+    drag_anchor: Option<usize>,
     /// The buffer text changed — TextStack needs a reshape before the next frame.
     text_dirty: bool,
     /// The editor state changed — the scene needs rebuilding before the next frame.
@@ -111,6 +116,8 @@ impl State {
             editor,
             scene,
             modifiers: ModifiersState::empty(),
+            mouse_pos: (0.0, 0.0),
+            drag_anchor: None,
             text_dirty: false,
             scene_dirty: true,
             pending_keystroke: None,
@@ -198,6 +205,60 @@ impl State {
             self.pending_keystroke = Some(Instant::now());
             self.window.request_redraw();
         }
+    }
+
+    /// Left-button press: place a single cursor where the pointer is and start
+    /// a potential drag (the anchor stays here while the head follows).
+    fn handle_mouse_press(&mut self) {
+        let Some(char_idx) = self.char_at_pixel(self.mouse_pos.0, self.mouse_pos.1) else {
+            return;
+        };
+        self.drag_anchor = Some(char_idx);
+        self.editor.set_selection(Selection::cursor(char_idx));
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Left-button release: end any drag.
+    fn handle_mouse_release(&mut self) {
+        self.drag_anchor = None;
+    }
+
+    /// Pointer moved. During a drag, extend the selection from the drag anchor
+    /// to the pointer; otherwise just remember the position.
+    fn handle_mouse_move(&mut self, x: f32, y: f32) {
+        self.mouse_pos = (x, y);
+        let Some(anchor) = self.drag_anchor else {
+            return;
+        };
+        let Some(head) = self.char_at_pixel(x, y) else {
+            return;
+        };
+        self.editor.set_selection(Selection::new(anchor, head));
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Hit-test a physical-pixel point to a buffer `char` index.
+    ///
+    /// Goes through cosmic-text's shaped layout (`Buffer::hit`), so the
+    /// mapping is correct for complex scripts — a click lands on a real
+    /// grapheme boundary, not an assumed monospace column.
+    fn char_at_pixel(&self, x: f32, y: f32) -> Option<usize> {
+        // Into text-origin-relative coordinates.
+        let tx = x - TEXT_INSET;
+        let ty = y - TEXT_INSET;
+        let cursor = self.text.buffer.hit(tx, ty)?;
+
+        // cosmic-text gives (line, byte-in-line); convert to a char index.
+        let line_str = self.editor.buffer().line(cursor.line)?;
+        let column = line_str
+            .char_indices()
+            .take_while(|(b, _)| *b < cursor.index)
+            .count();
+        self.editor
+            .buffer()
+            .position_to_char(Position::new(cursor.line, column))
     }
 
     /// Rebuild `scene` from the current editor state: selection-highlight
@@ -516,6 +577,17 @@ impl ApplicationHandler for App {
                 state.modifiers = modifiers.state();
             }
             WindowEvent::KeyboardInput { event, .. } => state.handle_key(event),
+            WindowEvent::CursorMoved { position, .. } => {
+                state.handle_mouse_move(position.x as f32, position.y as f32);
+            }
+            WindowEvent::MouseInput {
+                state: button_state,
+                button: MouseButton::Left,
+                ..
+            } => match button_state {
+                ElementState::Pressed => state.handle_mouse_press(),
+                ElementState::Released => state.handle_mouse_release(),
+            },
             WindowEvent::RedrawRequested => {
                 state.render();
             }
