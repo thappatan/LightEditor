@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use editor_core::Editor;
+use editor_core::{Editor, Selection};
 use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{Color, Resolution, TextArea, TextBounds};
@@ -200,14 +200,24 @@ impl State {
         }
     }
 
-    /// Rebuild `scene` from the current editor state: a caret quad per
-    /// selection head. The buffer text is drawn by TextStack, not via a scene
-    /// `Text` node yet — TextStack is still single-buffer.
+    /// Rebuild `scene` from the current editor state: selection-highlight
+    /// quads under the text, then a caret quad per selection head.
+    ///
+    /// The buffer text is drawn by TextStack, not via a scene `Text` node yet
+    /// — TextStack is still single-buffer.
     fn rebuild_scene(&mut self) {
         let w = self.gpu.surface_config.width as f32;
         let h = self.gpu.surface_config.height as f32;
         let mut root = SceneNode::group(Rect::new(0.0, 0.0, w, h));
 
+        // Selection highlights first — they sit behind the text and the carets.
+        for selection in self.editor.selections().iter() {
+            for rect in self.selection_rects(selection) {
+                root.push_child(SceneNode::quad(rect, SceneColor::rgba(120, 160, 255, 64)));
+            }
+        }
+
+        // Carets on top of the highlights.
         for selection in self.editor.selections().iter() {
             if let Some((cx, cy)) = self.caret_pixel(selection.head) {
                 root.push_child(SceneNode::quad(
@@ -220,22 +230,102 @@ impl State {
         self.scene = Scene::new(root);
     }
 
+    /// The absolute highlight rectangles for `selection` — empty for a bare
+    /// cursor, one rect for a single-line span, or one rect per line for a
+    /// multi-line span (first line from the start column to end-of-content,
+    /// middle lines full content width, last line from column 0 to the end).
+    fn selection_rects(&self, selection: &Selection) -> Vec<Rect> {
+        if selection.is_cursor() {
+            return Vec::new();
+        }
+        let buffer = self.editor.buffer();
+        let start = buffer.char_to_position(selection.start());
+        let end = buffer.char_to_position(selection.end());
+        let mut rects = Vec::new();
+
+        // A tiny minimum width so a zero-width line (e.g. a selected blank
+        // line, or a selected trailing newline) is still visible.
+        let mut push = |x0: f32, y: f32, x1: f32| {
+            rects.push(Rect::new(
+                TEXT_INSET + x0,
+                TEXT_INSET + y,
+                (x1 - x0).max(3.0),
+                LINE_HEIGHT,
+            ));
+        };
+
+        if start.line == end.line {
+            if let (Some((sx, sy)), Some((ex, _))) = (
+                self.caret_pixel_at(start.line, start.column),
+                self.caret_pixel_at(end.line, end.column),
+            ) {
+                push(sx, sy, ex);
+            }
+            return rects;
+        }
+
+        // First line: start column to end of content.
+        if let (Some((sx, sy)), Some((ex, _))) = (
+            self.caret_pixel_at(start.line, start.column),
+            self.caret_pixel_at(start.line, self.line_content_chars(start.line)),
+        ) {
+            push(sx, sy, ex);
+        }
+        // Middle lines: column 0 to end of content.
+        for line in (start.line + 1)..end.line {
+            if let (Some((x0, y)), Some((x1, _))) = (
+                self.caret_pixel_at(line, 0),
+                self.caret_pixel_at(line, self.line_content_chars(line)),
+            ) {
+                push(x0, y, x1);
+            }
+        }
+        // Last line: column 0 to the end column.
+        if let (Some((x0, y)), Some((ex, _))) = (
+            self.caret_pixel_at(end.line, 0),
+            self.caret_pixel_at(end.line, end.column),
+        ) {
+            push(x0, y, ex);
+        }
+        rects
+    }
+
+    /// Number of `char`s in `line`'s content, excluding any trailing newline.
+    fn line_content_chars(&self, line: usize) -> usize {
+        self.editor
+            .buffer()
+            .line(line)
+            .map(|s| {
+                s.trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .chars()
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// Pixel offset of the caret at `char_idx`, relative to the text origin.
+    fn caret_pixel(&self, char_idx: usize) -> Option<(f32, f32)> {
+        let pos = self.editor.buffer().char_to_position(char_idx);
+        self.caret_pixel_at(pos.line, pos.column)
+    }
+
+    /// Pixel offset of the caret at `(line, column)`, relative to the text
+    /// origin.
     ///
     /// Uses the shaped cosmic-text layout, so the x position is correct for
     /// complex scripts — the caret lands on a real glyph boundary, not an
     /// assumed monospace column.
-    fn caret_pixel(&self, char_idx: usize) -> Option<(f32, f32)> {
-        let pos = self.editor.buffer().char_to_position(char_idx);
-        let line_str = self.editor.buffer().line(pos.line)?;
+    fn caret_pixel_at(&self, line: usize, column: usize) -> Option<(f32, f32)> {
+        let line_str = self.editor.buffer().line(line)?;
         let byte_in_line = line_str
             .char_indices()
-            .nth(pos.column)
+            .nth(column)
             .map(|(b, _)| b)
             .unwrap_or(line_str.len());
 
         for run in self.text.buffer.layout_runs() {
-            if run.line_i != pos.line {
+            if run.line_i != line {
                 continue;
             }
             let y = run.line_top;
@@ -250,7 +340,7 @@ impl State {
             return Some((x, y));
         }
         // Line has no layout run (e.g. an empty trailing line).
-        Some((0.0, pos.line as f32 * LINE_HEIGHT))
+        Some((0.0, line as f32 * LINE_HEIGHT))
     }
 
     fn render(&mut self) {
