@@ -1,15 +1,16 @@
 // Light Editor — application entry point.
 //
-// Currently runs the M0 spike behavior (see tasks/milestone-0-spike.md): one
-// window rendering a multilingual sample, frame time logged every second. The
-// GPU and text plumbing now live in editor-ui-render and editor-ui-text; this
-// binary owns only the window lifecycle, the render-pass orchestration, and
-// the latency instrumentation. Scene graph / retained-mode widgets are M1+.
+// Renders a scene-graph layer (background panels via QuadRenderer) under the
+// M0 multilingual text sample, with frame time logged every second. The GPU,
+// scene, and text plumbing live in editor-ui-render / -scene / -text; this
+// binary owns the window lifecycle, render-pass orchestration, and latency
+// instrumentation. Widgets, input, and the editable surface are later M1 PRs.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use editor_ui_render::GpuContext;
+use editor_ui_render::{GpuContext, QuadRenderer};
+use editor_ui_scene::{Color as SceneColor, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{Color, Resolution, TextArea, TextBounds};
 use editor_ui_text::TextStack;
 use wgpu::{
@@ -29,6 +30,24 @@ const WINDOW_HEIGHT: u32 = 720;
 const TEXT_PADDING: f32 = 80.0;
 const TEXT_INSET: f32 = 40.0;
 
+/// Build a demo scene: a card panel behind the text plus an accent stripe.
+/// Stand-in content until real widgets land — exercises the scene graph and
+/// QuadRenderer end to end.
+fn demo_scene(width: f32, height: f32) -> Scene {
+    let mut root = SceneNode::group(Rect::new(0.0, 0.0, width, height));
+    // Card panel inset from the window edges.
+    root.push_child(SceneNode::quad(
+        Rect::new(20.0, 20.0, width - 40.0, height - 40.0),
+        SceneColor::rgb(28, 28, 36),
+    ));
+    // Accent stripe down the left edge of the card.
+    root.push_child(SceneNode::quad(
+        Rect::new(20.0, 20.0, 6.0, height - 40.0),
+        SceneColor::rgb(120, 160, 255),
+    ));
+    Scene::new(root)
+}
+
 // Per spec §3.4 the testing matrix for the text pipeline is Thai, CJK, Arabic
 // (RTL), Hangul, Devanagari, emoji ZWJ. One block covers all of them.
 const SAMPLE_TEXT: &str = "\
@@ -44,6 +63,8 @@ The quick brown fox jumps over the lazy dog.\n\
 struct State {
     window: Arc<Window>,
     gpu: GpuContext,
+    quads: QuadRenderer,
+    scene: Scene,
     text: TextStack,
 
     // Latency baseline (spec §8): rolling 1-second window.
@@ -57,6 +78,8 @@ impl State {
     fn new(window: Arc<Window>, cold_start: Instant) -> Self {
         let size = window.inner_size();
         let gpu = GpuContext::new(window.clone());
+        let quads = QuadRenderer::new(&gpu.device, gpu.format());
+        let scene = demo_scene(size.width as f32, size.height as f32);
         let text = TextStack::new(
             &gpu.device,
             &gpu.queue,
@@ -69,6 +92,8 @@ impl State {
         Self {
             window,
             gpu,
+            quads,
+            scene,
             text,
             frame_count: 0,
             last_report: Instant::now(),
@@ -79,6 +104,7 @@ impl State {
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.gpu.resize(size.width, size.height);
+        self.scene = demo_scene(size.width as f32, size.height as f32);
         self.text.set_size(
             size.width as f32 - TEXT_PADDING,
             size.height as f32 - TEXT_PADDING,
@@ -87,6 +113,14 @@ impl State {
 
     fn render(&mut self) {
         let frame_start = Instant::now();
+
+        self.quads.prepare(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &self.scene,
+            self.gpu.surface_config.width as f32,
+            self.gpu.surface_config.height as f32,
+        );
 
         self.text.viewport.update(
             &self.gpu.queue,
@@ -129,7 +163,7 @@ impl State {
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("clear + text"),
+                label: Some("clear + quads + text"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -149,6 +183,8 @@ impl State {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
+            // Scene quads first, text on top.
+            self.quads.render(&mut pass);
             self.text
                 .renderer
                 .render(&self.text.atlas, &self.text.viewport, &mut pass)

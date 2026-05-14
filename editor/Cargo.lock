@@ -474,6 +474,7 @@ name = "editor-app"
 version = "0.1.0"
 dependencies = [
  "editor-ui-render",
+ "editor-ui-scene",
  "editor-ui-text",
  "env_logger",
  "log",
@@ -500,6 +501,8 @@ dependencies = [
 name = "editor-ui-render"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "editor-ui-scene",
  "pollster",
  "wgpu",
  "winit",

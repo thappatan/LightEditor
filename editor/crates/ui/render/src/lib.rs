@@ -1,8 +1,13 @@
-//! GPU rendering context — the wgpu surface/device/queue plumbing.
+//! GPU rendering for the editor's UI framework (spec §3.2).
 //!
-//! Spec §3.2 (rendering strategy). This crate owns the wgpu objects and the
-//! surface lifecycle; orchestrating individual render passes is left to the
-//! caller until the scene graph lands (M1, later PR).
+//! [`GpuContext`] owns the wgpu device/queue/surface and the surface
+//! lifecycle. [`QuadRenderer`] consumes an `editor-ui-scene` `Scene` and draws
+//! its `Quad` primitives. Render-pass orchestration (clear, ordering text vs
+//! quads) stays with the caller.
+
+mod quad_renderer;
+
+pub use quad_renderer::QuadRenderer;
 
 use std::sync::Arc;
 
