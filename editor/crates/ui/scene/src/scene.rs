@@ -23,6 +23,12 @@ pub enum Primitive {
     Group,
     /// A solid-color rectangle filling the node's bounds.
     Quad { color: Color },
+    /// A run of text drawn at the node's bounds.
+    ///
+    /// This is a *draw descriptor*, not shaped glyphs — the scene graph stays
+    /// free of any font/shaping dependency. The renderer shapes `content` with
+    /// the text pipeline (cosmic-text) when it walks the scene.
+    Text { content: String, color: Color },
 }
 
 /// A node in the retained scene graph.
@@ -56,6 +62,17 @@ impl SceneNode {
     /// A solid-color rectangle.
     pub fn quad(bounds: Rect, color: Color) -> Self {
         Self::new(bounds, Primitive::Quad { color })
+    }
+
+    /// A run of text drawn within `bounds`.
+    pub fn text(bounds: Rect, content: impl Into<String>, color: Color) -> Self {
+        Self::new(
+            bounds,
+            Primitive::Text {
+                content: content.into(),
+                color,
+            },
+        )
     }
 
     /// The node's parent-relative bounds.
@@ -311,5 +328,31 @@ mod tests {
         node.clear_children(); // had a child
         assert!(node.is_dirty());
         assert!(node.children().is_empty());
+    }
+
+    #[test]
+    fn text_node_construction_and_dirty_on_content_change() {
+        let mut node = SceneNode::text(Rect::new(0.0, 0.0, 200.0, 24.0), "hello", Color::WHITE);
+        assert_eq!(
+            node.primitive(),
+            &Primitive::Text {
+                content: "hello".to_string(),
+                color: Color::WHITE,
+            }
+        );
+
+        node.clear_dirty_recursive();
+        // same content — no redirty
+        node.set_primitive(Primitive::Text {
+            content: "hello".to_string(),
+            color: Color::WHITE,
+        });
+        assert!(!node.is_dirty());
+        // changed content — dirty
+        node.set_primitive(Primitive::Text {
+            content: "hello!".to_string(),
+            color: Color::WHITE,
+        });
+        assert!(node.is_dirty());
     }
 }

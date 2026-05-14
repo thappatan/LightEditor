@@ -473,7 +473,9 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 name = "editor-app"
 version = "0.1.0"
 dependencies = [
+ "editor-core",
  "editor-ui-render",
+ "editor-ui-scene",
  "editor-ui-text",
  "env_logger",
  "log",
@@ -500,6 +502,8 @@ dependencies = [
 name = "editor-ui-render"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "editor-ui-scene",
  "pollster",
  "wgpu",
  "winit",

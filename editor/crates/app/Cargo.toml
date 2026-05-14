@@ -10,7 +10,9 @@ name = "app"
 path = "src/main.rs"
 
 [dependencies]
+editor-core = { workspace = true }
 editor-ui-render = { workspace = true }
+editor-ui-scene = { workspace = true }
 editor-ui-text = { workspace = true }
 winit = { workspace = true }
 wgpu = { workspace = true }

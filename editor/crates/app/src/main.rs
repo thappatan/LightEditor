@@ -1,15 +1,21 @@
 // Light Editor — application entry point.
 //
-// Currently runs the M0 spike behavior (see tasks/milestone-0-spike.md): one
-// window rendering a multilingual sample, frame time logged every second. The
-// GPU and text plumbing now live in editor-ui-render and editor-ui-text; this
-// binary owns only the window lifecycle, the render-pass orchestration, and
-// the latency instrumentation. Scene graph / retained-mode widgets are M1+.
+// An editable text surface: keyboard input drives editor-core, the editor
+// state is turned into a scene-graph each change, and the scene is rendered —
+// background panel + caret quads via QuadRenderer, buffer text via TextStack.
+// Keystroke latency (key press -> frame presented) is logged against the
+// spec §8 16ms target.
+//
+// Still missing for a "real" editor: selection highlight, mouse input,
+// scrolling, multiple buffers/panes, a proper widget tree. Those are later
+// M1 PRs.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use editor_ui_render::GpuContext;
+use editor_core::Editor;
+use editor_ui_render::{GpuContext, QuadRenderer};
+use editor_ui_scene::{Color as SceneColor, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{Color, Resolution, TextArea, TextBounds};
 use editor_ui_text::TextStack;
 use wgpu::{
@@ -18,35 +24,58 @@ use wgpu::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
 
-/// Padding between the window edge and the text block, in physical pixels.
-const TEXT_PADDING: f32 = 80.0;
+/// Inset of the text block from the window's top-left, in physical pixels.
 const TEXT_INSET: f32 = 40.0;
+/// Padding subtracted from the window size to get the text-wrap width/height.
+const TEXT_PADDING: f32 = 80.0;
+/// Line height — must match `editor-ui-text`'s metrics (24pt / 32px).
+const LINE_HEIGHT: f32 = 32.0;
+/// Caret width in physical pixels.
+const CARET_WIDTH: f32 = 2.0;
 
-// Per spec §3.4 the testing matrix for the text pipeline is Thai, CJK, Arabic
-// (RTL), Hangul, Devanagari, emoji ZWJ. One block covers all of them.
-const SAMPLE_TEXT: &str = "\
-LightEditor — M0 spike\n\
+/// A spaces-per-tab stand-in until config lands.
+const TAB_AS_SPACES: &str = "    ";
+
+/// Initial buffer content — the spec §3.4 multilingual matrix doubles as a
+/// smoke test that editing keeps complex scripts intact.
+const WELCOME_TEXT: &str = "\
+LightEditor — editable surface\n\
+\n\
+Type to edit. Arrows move; Shift+Arrows select.\n\
 \n\
 สวัสดีชาวโลก  ·  你好,世界  ·  مرحبا بالعالم\n\
 안녕하세요 세계  ·  नमस्ते दुनिया\n\
 🇹🇭 🌏 🚀 👨‍👩‍👧‍👦\n\
-\n\
-The quick brown fox jumps over the lazy dog.\n\
 ";
 
 struct State {
     window: Arc<Window>,
     gpu: GpuContext,
+    quads: QuadRenderer,
     text: TextStack,
 
-    // Latency baseline (spec §8): rolling 1-second window.
+    /// Editing model — buffer, multi-cursor selections, undo tree.
+    editor: Editor,
+    /// The scene rebuilt from `editor` whenever it changes.
+    scene: Scene,
+    /// Latched keyboard modifiers (Shift for selection-extending movement).
+    modifiers: ModifiersState,
+    /// The buffer text changed — TextStack needs a reshape before the next frame.
+    text_dirty: bool,
+    /// The editor state changed — the scene needs rebuilding before the next frame.
+    scene_dirty: bool,
+
+    /// When the last unhandled key press happened, for keystroke-latency timing.
+    pending_keystroke: Option<Instant>,
+    /// Rolling 1-second frame-time window (spec §8).
     frame_count: u64,
     last_report: Instant,
     last_frame_us: u128,
@@ -57,24 +86,41 @@ impl State {
     fn new(window: Arc<Window>, cold_start: Instant) -> Self {
         let size = window.inner_size();
         let gpu = GpuContext::new(window.clone());
+        let quads = QuadRenderer::new(&gpu.device, gpu.format());
         let text = TextStack::new(
             &gpu.device,
             &gpu.queue,
             gpu.format(),
             size.width as f32 - TEXT_PADDING,
             size.height as f32 - TEXT_PADDING,
-            SAMPLE_TEXT,
+            WELCOME_TEXT,
         );
+        let editor = Editor::from(WELCOME_TEXT);
+        let scene = Scene::new(SceneNode::group(Rect::new(
+            0.0,
+            0.0,
+            size.width as f32,
+            size.height as f32,
+        )));
 
-        Self {
+        let mut state = Self {
             window,
             gpu,
+            quads,
             text,
+            editor,
+            scene,
+            modifiers: ModifiersState::empty(),
+            text_dirty: false,
+            scene_dirty: true,
+            pending_keystroke: None,
             frame_count: 0,
             last_report: Instant::now(),
             last_frame_us: 0,
             cold_start: Some(cold_start),
-        }
+        };
+        state.rebuild_scene();
+        state
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -83,10 +129,149 @@ impl State {
             size.width as f32 - TEXT_PADDING,
             size.height as f32 - TEXT_PADDING,
         );
+        self.text_dirty = true;
+        self.scene_dirty = true;
+    }
+
+    /// Route a key press into `editor`. Returns whether the editor changed.
+    fn handle_key(&mut self, event: KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        let shift = self.modifiers.shift_key();
+
+        let mut text_changed = true;
+        let handled = match &event.logical_key {
+            Key::Named(NamedKey::Backspace) => {
+                self.editor.backspace();
+                true
+            }
+            Key::Named(NamedKey::Delete) => {
+                self.editor.delete_forward();
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.editor.insert_newline();
+                true
+            }
+            Key::Named(NamedKey::Space) => {
+                self.editor.insert(" ");
+                true
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.editor.insert(TAB_AS_SPACES);
+                true
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                self.editor.move_left(shift);
+                text_changed = false;
+                true
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                self.editor.move_right(shift);
+                text_changed = false;
+                true
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.editor.move_up(shift);
+                text_changed = false;
+                true
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.editor.move_down(shift);
+                text_changed = false;
+                true
+            }
+            // Printable character input — winit gives us the resolved text.
+            _ => match &event.text {
+                Some(text) if !text.is_empty() => {
+                    self.editor.insert(text);
+                    true
+                }
+                _ => false,
+            },
+        };
+
+        if handled {
+            self.text_dirty |= text_changed;
+            self.scene_dirty = true;
+            self.pending_keystroke = Some(Instant::now());
+            self.window.request_redraw();
+        }
+    }
+
+    /// Rebuild `scene` from the current editor state: a caret quad per
+    /// selection head. The buffer text is drawn by TextStack, not via a scene
+    /// `Text` node yet — TextStack is still single-buffer.
+    fn rebuild_scene(&mut self) {
+        let w = self.gpu.surface_config.width as f32;
+        let h = self.gpu.surface_config.height as f32;
+        let mut root = SceneNode::group(Rect::new(0.0, 0.0, w, h));
+
+        for selection in self.editor.selections().iter() {
+            if let Some((cx, cy)) = self.caret_pixel(selection.head) {
+                root.push_child(SceneNode::quad(
+                    Rect::new(TEXT_INSET + cx, TEXT_INSET + cy, CARET_WIDTH, LINE_HEIGHT),
+                    SceneColor::rgb(120, 160, 255),
+                ));
+            }
+        }
+
+        self.scene = Scene::new(root);
+    }
+
+    /// Pixel offset of the caret at `char_idx`, relative to the text origin.
+    ///
+    /// Uses the shaped cosmic-text layout, so the x position is correct for
+    /// complex scripts — the caret lands on a real glyph boundary, not an
+    /// assumed monospace column.
+    fn caret_pixel(&self, char_idx: usize) -> Option<(f32, f32)> {
+        let pos = self.editor.buffer().char_to_position(char_idx);
+        let line_str = self.editor.buffer().line(pos.line)?;
+        let byte_in_line = line_str
+            .char_indices()
+            .nth(pos.column)
+            .map(|(b, _)| b)
+            .unwrap_or(line_str.len());
+
+        for run in self.text.buffer.layout_runs() {
+            if run.line_i != pos.line {
+                continue;
+            }
+            let y = run.line_top;
+            let mut x = 0.0;
+            for glyph in run.glyphs.iter() {
+                if glyph.start >= byte_in_line {
+                    return Some((glyph.x, y));
+                }
+                x = glyph.x + glyph.w;
+            }
+            // Past the last glyph — caret sits at the end of the line.
+            return Some((x, y));
+        }
+        // Line has no layout run (e.g. an empty trailing line).
+        Some((0.0, pos.line as f32 * LINE_HEIGHT))
     }
 
     fn render(&mut self) {
         let frame_start = Instant::now();
+
+        if self.text_dirty {
+            self.text.set_content(&self.editor.text());
+            self.text_dirty = false;
+        }
+        if self.scene_dirty {
+            self.rebuild_scene();
+            self.scene_dirty = false;
+        }
+
+        self.quads.prepare(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &self.scene,
+            self.gpu.surface_config.width as f32,
+            self.gpu.surface_config.height as f32,
+        );
 
         self.text.viewport.update(
             &self.gpu.queue,
@@ -95,7 +280,6 @@ impl State {
                 height: self.gpu.surface_config.height,
             },
         );
-
         self.text
             .renderer
             .prepare(
@@ -129,7 +313,7 @@ impl State {
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("clear + text"),
+                label: Some("clear + carets + text"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -149,6 +333,8 @@ impl State {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
+            // Caret quads first, text on top.
+            self.quads.render(&mut pass);
             self.text
                 .renderer
                 .render(&self.text.atlas, &self.text.viewport, &mut pass)
@@ -161,7 +347,6 @@ impl State {
         self.last_frame_us = frame_start.elapsed().as_micros();
         self.frame_count += 1;
 
-        // First-frame report covers the cold-start budget (spec §8: target <100ms).
         if let Some(start) = self.cold_start.take() {
             log::info!(
                 "first frame presented in {:.1}ms (cold start budget: 100ms target / 250ms hard)",
@@ -169,10 +354,19 @@ impl State {
             );
         }
 
+        // Keystroke latency: from the key press to this frame being presented
+        // (spec §8 target 16ms / hard limit 33ms).
+        if let Some(key_at) = self.pending_keystroke.take() {
+            log::info!(
+                "keystroke latency {:.2}ms (target 16ms / hard 33ms)",
+                key_at.elapsed().as_secs_f32() * 1000.0
+            );
+        }
+
         if self.last_report.elapsed().as_secs() >= 1 {
             let elapsed = self.last_report.elapsed().as_secs_f32();
             log::info!(
-                "{:.1} fps · last frame {:.2}ms (target: 16ms, hard limit: 33ms)",
+                "{:.1} fps · last frame {:.2}ms",
                 self.frame_count as f32 / elapsed,
                 self.last_frame_us as f32 / 1000.0,
             );
@@ -202,14 +396,17 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("LightEditor — M0 spike")
+            .with_title("LightEditor — editable surface")
             .with_inner_size(PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
                 .expect("failed to create window"),
         );
-        self.state = Some(State::new(window, self.cold_start));
+        let state = State::new(window, self.cold_start);
+        // ControlFlow::Wait only draws on demand — kick off the first frame.
+        state.window.request_redraw();
+        self.state = Some(state);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -225,9 +422,12 @@ impl ApplicationHandler for App {
             WindowEvent::ScaleFactorChanged { .. } => {
                 state.resize(state.window.inner_size());
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                state.modifiers = modifiers.state();
+            }
+            WindowEvent::KeyboardInput { event, .. } => state.handle_key(event),
             WindowEvent::RedrawRequested => {
                 state.render();
-                state.window.request_redraw();
             }
             _ => {}
         }
@@ -241,7 +441,7 @@ fn main() {
     .init();
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("event loop failed");
 }
