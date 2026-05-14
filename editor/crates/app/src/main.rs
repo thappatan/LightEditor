@@ -143,6 +143,8 @@ impl State {
         self.text.set_width(size.width as f32 - TEXT_PADDING);
         self.text_dirty = true;
         self.scene_dirty = true;
+        // ControlFlow::Wait won't redraw on its own — a resize must ask.
+        self.window.request_redraw();
     }
 
     /// Route a key press into `editor`. Returns whether the editor changed.
@@ -242,11 +244,24 @@ impl State {
         }
     }
 
+    /// Total shaped text height in physical pixels.
+    ///
+    /// Measured from the actual cosmic-text layout, so wrapped lines count
+    /// once per *visual* row — `buffer.len_lines() * LINE_HEIGHT` would
+    /// undercount because it only sees logical lines.
+    fn content_height(&self) -> f32 {
+        self.text
+            .buffer
+            .layout_runs()
+            .map(|run| run.line_top + run.line_height)
+            .fold(0.0_f32, f32::max)
+            .max(LINE_HEIGHT)
+    }
+
     /// The largest valid scroll offset — content height beyond the viewport.
     fn max_scroll(&self) -> f32 {
-        let content = self.editor.buffer().len_lines() as f32 * LINE_HEIGHT;
         let visible = self.gpu.surface_config.height as f32 - TEXT_INSET;
-        (content - visible).max(0.0)
+        (self.content_height() - visible).max(0.0)
     }
 
     /// Scroll the viewport the minimum amount needed to bring the primary
