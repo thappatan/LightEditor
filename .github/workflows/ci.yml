@@ -55,6 +55,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: editor
+          # Don't restore ~/.cargo/bin from the cache — that has clobbered the
+          # cargo proxy on macos before (cache from an earlier run was built
+          # while the workspace was empty, leaving cargo pointing at
+          # rustup-init). Toolchain install is fast enough to repeat.
+          cache-bin: false
+          # Bump prefix-key to invalidate every cache key produced before the
+          # cache-bin: false fix landed.
+          prefix-key: "v1-rust"
       - name: cargo check
         run: |
           if grep -qE '^[[:space:]]*"crates/' Cargo.toml; then
@@ -74,6 +82,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: editor
+          # Don't restore ~/.cargo/bin from the cache — that has clobbered the
+          # cargo proxy on macos before (cache from an earlier run was built
+          # while the workspace was empty, leaving cargo pointing at
+          # rustup-init). Toolchain install is fast enough to repeat.
+          cache-bin: false
+          # Bump prefix-key to invalidate every cache key produced before the
+          # cache-bin: false fix landed.
+          prefix-key: "v1-rust"
       - name: cargo clippy
         run: |
           if grep -qE '^[[:space:]]*"crates/' Cargo.toml; then
@@ -95,6 +111,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: editor
+          # Don't restore ~/.cargo/bin from the cache — that has clobbered the
+          # cargo proxy on macos before (cache from an earlier run was built
+          # while the workspace was empty, leaving cargo pointing at
+          # rustup-init). Toolchain install is fast enough to repeat.
+          cache-bin: false
+          # Bump prefix-key to invalidate every cache key produced before the
+          # cache-bin: false fix landed.
+          prefix-key: "v1-rust"
       - name: workspace active?
         id: ws
         run: |
@@ -110,4 +134,7 @@ jobs:
           tool: cargo-nextest
       - name: cargo nextest
         if: steps.ws.outputs.active == 'true'
-        run: cargo nextest run --workspace
+        # --no-tests=pass is needed while the spike has no #[test] yet;
+        # cargo-nextest >= 0.9.50 otherwise exits 4 on empty test runs.
+        # Remove this flag once the first integration test lands.
+        run: cargo nextest run --workspace --no-tests=pass

@@ -1,0 +1,19 @@
+[package]
+name = "editor-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[dependencies]
+winit = { workspace = true }
+wgpu = { workspace = true }
+glyphon = { workspace = true }
+cosmic-text = { workspace = true }
+pollster = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
