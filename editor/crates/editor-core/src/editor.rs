@@ -1,7 +1,7 @@
 //! The editor — a buffer, its selections, and an undo history, with the
 //! editing and movement operations that tie them together (spec §4.1.1).
 
-use editor_buffer::TextBuffer;
+use editor_buffer::{Position, TextBuffer};
 use unicode_segmentation::GraphemeCursor;
 
 use crate::{Selection, SelectionSet, UndoTree};
@@ -98,6 +98,26 @@ impl Editor {
     /// for the `extend` semantics (a non-empty selection collapses to its end).
     pub fn move_right(&mut self, extend: bool) {
         self.move_horizontal(extend, false);
+    }
+
+    // ── vertical movement (column-preserving) ─────────────────────────────
+
+    /// Move every caret up one line, keeping its goal column (so moving up
+    /// through a short line and back down does not lose the column). With
+    /// `extend`, the anchor stays put. A caret already on the first line does
+    /// not move.
+    ///
+    /// Columns here are `char` columns, not grapheme or visual columns —
+    /// good enough for M1; visual-column vertical movement is a follow-up.
+    pub fn move_up(&mut self, extend: bool) {
+        self.move_vertical(extend, true);
+    }
+
+    /// Move every caret down one line. See [`move_up`](Editor::move_up) for
+    /// the `extend` and goal-column semantics. A caret already on the last
+    /// line does not move.
+    pub fn move_down(&mut self, extend: bool) {
+        self.move_vertical(extend, false);
     }
 
     // ── undo / redo ───────────────────────────────────────────────────────
@@ -223,10 +243,67 @@ impl Editor {
         self.selections = SelectionSet::new(new, primary_head);
     }
 
+    /// Move every caret up or down one line, preserving its goal column.
+    fn move_vertical(&mut self, extend: bool, up: bool) {
+        let primary_index = self.selections.primary_index();
+        let new: Vec<Selection> = self
+            .selections
+            .selections()
+            .iter()
+            .map(|sel| {
+                let head_pos = self.buffer.char_to_position(sel.head);
+                // Start a run from the current column; continue one already going.
+                let goal = sel.goal_column().unwrap_or(head_pos.column);
+
+                let target_line = if up {
+                    head_pos.line.checked_sub(1)
+                } else if head_pos.line + 1 < self.buffer.len_lines() {
+                    Some(head_pos.line + 1)
+                } else {
+                    None
+                };
+
+                let new_head = match target_line {
+                    Some(line) => {
+                        let col = goal.min(self.line_content_chars(line));
+                        self.buffer
+                            .position_to_char(Position::new(line, col))
+                            .expect("clamped position is in range")
+                    }
+                    // No line in that direction — the caret stays, but the
+                    // goal is kept so a reverse move resumes the column.
+                    None => sel.head,
+                };
+
+                let moved = if extend {
+                    Selection::new(sel.anchor, new_head)
+                } else {
+                    Selection::cursor(new_head)
+                };
+                moved.with_goal_column(goal)
+            })
+            .collect();
+        let primary_head = new[primary_index].head;
+        self.selections = SelectionSet::new(new, primary_head);
+    }
+
     /// Record the current state as a new undo snapshot.
     fn commit(&mut self) {
         self.undo
             .commit(self.buffer.clone(), self.selections.clone());
+    }
+
+    /// Number of `char`s in `line`, excluding any trailing `\n` or `\r\n`.
+    /// 0 if `line` is out of range.
+    fn line_content_chars(&self, line: usize) -> usize {
+        match self.buffer.line(line) {
+            Some(s) => s
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .chars()
+                .count(),
+            None => 0,
+        }
     }
 
     /// The `char` index of the grapheme boundary before `char_idx`.
@@ -473,6 +550,70 @@ mod tests {
         ed.selections_mut_for_test(SelectionSet::single(Selection::cursor(2)));
         ed.move_right(false); // over the '\n'
         assert_eq!(ed.selections().primary(), Selection::cursor(3));
+    }
+
+    #[test]
+    fn move_down_keeps_column() {
+        // "abcd\nefgh" — caret at col 2 of line 0 (char 2) moves to col 2 of
+        // line 1 (char 7).
+        let mut ed = Editor::from("abcd\nefgh");
+        ed.selections_mut_for_test(SelectionSet::single(Selection::cursor(2)));
+        ed.move_down(false);
+        assert_eq!(ed.selections().primary(), Selection::cursor(7));
+        ed.move_up(false);
+        assert_eq!(ed.selections().primary(), Selection::cursor(2));
+    }
+
+    #[test]
+    fn move_down_clamps_to_short_line_then_goal_column_restores() {
+        // line 0 "abcdef" (col 4), line 1 "xy" (max col 2), line 2 "uvwxyz".
+        // Down clamps to col 2 on the short line; down again restores col 4
+        // because the goal column is remembered.
+        let mut ed = Editor::from("abcdef\nxy\nuvwxyz");
+        ed.selections_mut_for_test(SelectionSet::single(Selection::cursor(4)));
+        ed.move_down(false);
+        // line 1 starts at char 7; clamped to col 2 → char 9
+        assert_eq!(ed.selections().primary(), Selection::cursor(9));
+        ed.move_down(false);
+        // line 2 starts at char 10; goal column 4 restored → char 14
+        assert_eq!(ed.selections().primary(), Selection::cursor(14));
+    }
+
+    #[test]
+    fn move_up_at_first_line_is_noop() {
+        let mut ed = Editor::from("abc\ndef");
+        ed.selections_mut_for_test(SelectionSet::single(Selection::cursor(1)));
+        ed.move_up(false);
+        assert_eq!(ed.selections().primary(), Selection::cursor(1));
+    }
+
+    #[test]
+    fn move_down_at_last_line_is_noop() {
+        let mut ed = Editor::from("abc\ndef");
+        ed.selections_mut_for_test(SelectionSet::single(Selection::cursor(5)));
+        ed.move_down(false);
+        assert_eq!(ed.selections().primary(), Selection::cursor(5));
+    }
+
+    #[test]
+    fn move_down_with_extend_grows_selection() {
+        let mut ed = Editor::from("abcd\nefgh");
+        ed.selections_mut_for_test(SelectionSet::single(Selection::cursor(1)));
+        ed.move_down(true);
+        // anchor stays at 1, head moves to col 1 of line 1 = char 6
+        assert_eq!(ed.selections().primary(), Selection::new(1, 6));
+    }
+
+    #[test]
+    fn horizontal_move_resets_the_goal_column() {
+        // Down onto a short line (column clamped), then a horizontal move,
+        // then down again — the goal column must NOT resurrect the old column.
+        let mut ed = Editor::from("abcdef\nxy\nuvwxyz");
+        ed.selections_mut_for_test(SelectionSet::single(Selection::cursor(4)));
+        ed.move_down(false); // clamped to char 9 (col 2 of "xy")
+        ed.move_left(false); // char 8 — clears the goal column
+        ed.move_down(false); // col 1 of line 2 ("uvwxyz" starts at 10) → char 11
+        assert_eq!(ed.selections().primary(), Selection::cursor(11));
     }
 
     #[test]
