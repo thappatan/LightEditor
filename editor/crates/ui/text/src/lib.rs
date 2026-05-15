@@ -13,11 +13,6 @@ use glyphon::{
 // directly — they reach the types through this crate.
 pub use glyphon;
 
-/// Body text size and line height, in *logical* points (DIPs). The physical
-/// metrics are these scaled by the window's scale factor — see [`TextStack`].
-const FONT_SIZE_PT: f32 = 16.0;
-const LINE_HEIGHT_PT: f32 = 22.0;
-
 /// The editor uses a monospace family. `Family::SansSerif` resolves
 /// inconsistently across platforms once complex-script fallback kicks in (on
 /// macOS the generic sans-serif and the Thai fallback font don't visually
@@ -32,11 +27,6 @@ fn default_attrs() -> Attrs<'static> {
     Attrs::new().family(FONT_FAMILY)
 }
 
-/// Physical-pixel [`Metrics`] for a given window scale factor.
-fn metrics_for(scale: f32) -> Metrics {
-    Metrics::new(FONT_SIZE_PT * scale, LINE_HEIGHT_PT * scale)
-}
-
 /// Owns everything needed to shape and GPU-render one text buffer.
 ///
 /// Fields are public: until the scene graph lands the caller drives
@@ -48,13 +38,18 @@ pub struct TextStack {
     pub atlas: TextAtlas,
     pub renderer: TextRenderer,
     pub buffer: Buffer,
+    /// Font size in *logical* points (DIPs). Physical metrics = pt × scale.
+    font_size_pt: f32,
+    /// Line height in logical points.
+    line_height_pt: f32,
     /// Window scale factor the buffer's metrics are currently sized for.
     scale: f32,
 }
 
 impl TextStack {
     /// Build the stack and shape `text` into a buffer `width` physical pixels
-    /// wide, with metrics sized for `scale` (the window's scale factor).
+    /// wide, with metrics derived from `font_size_pt × scale` and
+    /// `line_height_pt × scale`.
     ///
     /// The buffer height is left unbounded (`None`): cosmic-text's
     /// `shape_until_scroll` only shapes lines that fit inside `height_opt`, so
@@ -62,11 +57,16 @@ impl TextStack {
     /// screenful. The caller scrolls and clips the viewport itself. `text` is
     /// shaped with `Shaping::Advanced` so complex scripts (Thai, Arabic,
     /// Devanagari) cluster correctly.
+    // A builder would be tidier but every caller passes every argument; a
+    // refactor is a follow-up.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         width: f32,
+        font_size_pt: f32,
+        line_height_pt: f32,
         scale: f32,
         text: &str,
     ) -> Self {
@@ -81,7 +81,8 @@ impl TextStack {
         let mut font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
 
-        let mut buffer = Buffer::new(&mut font_system, metrics_for(scale));
+        let metrics = Metrics::new(font_size_pt * scale, line_height_pt * scale);
+        let mut buffer = Buffer::new(&mut font_system, metrics);
         buffer.set_size(&mut font_system, Some(width), None);
 
         let mut stack = Self {
@@ -91,17 +92,19 @@ impl TextStack {
             atlas,
             renderer,
             buffer,
+            font_size_pt,
+            line_height_pt,
             scale,
         };
         stack.set_content(text);
         stack
     }
 
-    /// The current line height, in physical pixels — `LINE_HEIGHT_PT` scaled
-    /// by the window scale factor. Callers use this to position carets,
-    /// highlights, and scroll math so everything stays in one unit.
+    /// The current line height, in physical pixels — `line_height_pt × scale`.
+    /// Callers use this to position carets, highlights, and scroll math so
+    /// everything stays in one unit.
     pub fn line_height(&self) -> f32 {
-        LINE_HEIGHT_PT * self.scale
+        self.line_height_pt * self.scale
     }
 
     /// Reshape the buffer to `text`, using the stack's standard font attributes
@@ -137,8 +140,31 @@ impl TextStack {
             return;
         }
         self.scale = scale;
-        self.buffer
-            .set_metrics(&mut self.font_system, metrics_for(scale));
+        self.reapply_metrics();
+    }
+
+    /// Re-size the font itself (point size + line height in logical points).
+    /// Used to pick up settings changes.
+    pub fn set_font_size(&mut self, font_size_pt: f32, line_height_pt: f32) {
+        if font_size_pt <= 0.0 || line_height_pt <= 0.0 {
+            return;
+        }
+        if font_size_pt == self.font_size_pt && line_height_pt == self.line_height_pt {
+            return;
+        }
+        self.font_size_pt = font_size_pt;
+        self.line_height_pt = line_height_pt;
+        self.reapply_metrics();
+    }
+
+    /// Push the current `(font_size_pt, line_height_pt, scale)` triple into
+    /// the cosmic-text buffer and reshape.
+    fn reapply_metrics(&mut self) {
+        let metrics = Metrics::new(
+            self.font_size_pt * self.scale,
+            self.line_height_pt * self.scale,
+        );
+        self.buffer.set_metrics(&mut self.font_system, metrics);
         self.buffer.shape_until_scroll(&mut self.font_system, false);
     }
 }

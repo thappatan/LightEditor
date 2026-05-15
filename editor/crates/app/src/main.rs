@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use editor_config::Settings;
 use editor_core::{Editor, Position, Selection};
 use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Rect, Scene, SceneNode};
@@ -58,8 +59,9 @@ const FIND_WIDTH_DIP: f32 = 480.0;
 const FIND_TOP_DIP: f32 = 16.0;
 const FIND_PAD_DIP: f32 = 8.0;
 
-/// A spaces-per-tab stand-in until config lands.
-const TAB_AS_SPACES: &str = "    ";
+/// Subdirectory under the user's XDG config dir that holds settings.toml.
+const CONFIG_SUBDIR: &str = "lighteditor";
+const CONFIG_FILENAME: &str = "settings.toml";
 
 /// Whether the platform's "primary" modifier (Cmd on macOS, Ctrl on
 /// Linux/Windows) is held. Used to gate shortcuts like Cmd-S.
@@ -152,6 +154,9 @@ struct State {
     /// Third TextStack for the find-bar caption ("Find: query   3/12").
     find_text: TextStack,
 
+    /// Spaces inserted by the Tab key (pre-built from `settings.editor.tab_size`).
+    tab_spaces: String,
+
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
     /// Rolling 1-second frame-time window (spec §8).
@@ -167,11 +172,16 @@ impl State {
         cold_start: Instant,
         initial_text: &str,
         file_path: Option<PathBuf>,
+        settings: &Settings,
     ) -> Self {
         let scale = window.scale_factor() as f32;
         let size = window.inner_size();
         let gpu = GpuContext::new(window.clone());
         let quads = QuadRenderer::new(&gpu.device, gpu.format());
+
+        let font_size_pt = settings.editor.font_size;
+        let line_height_pt = settings.editor.line_height;
+        let tab_spaces = " ".repeat(settings.editor.tab_size);
 
         let text_padding = TEXT_PADDING_DIP * scale;
         let text = TextStack::new(
@@ -179,6 +189,8 @@ impl State {
             &gpu.queue,
             gpu.format(),
             size.width as f32 - text_padding,
+            font_size_pt,
+            line_height_pt,
             scale,
             initial_text,
         );
@@ -192,14 +204,24 @@ impl State {
             &gpu.queue,
             gpu.format(),
             palette_width,
+            font_size_pt,
+            line_height_pt,
             scale,
             "",
         );
 
         // Find-bar TextStack, same reasoning — single-row caption.
         let find_width = (FIND_WIDTH_DIP - 2.0 * FIND_PAD_DIP) * scale;
-        let find_text =
-            TextStack::new(&gpu.device, &gpu.queue, gpu.format(), find_width, scale, "");
+        let find_text = TextStack::new(
+            &gpu.device,
+            &gpu.queue,
+            gpu.format(),
+            find_width,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "",
+        );
         let scene = Scene::new(SceneNode::group(Rect::new(
             0.0,
             0.0,
@@ -231,6 +253,7 @@ impl State {
             palette_text,
             find: None,
             find_text,
+            tab_spaces,
             pending_keystroke: None,
             frame_count: 0,
             last_report: Instant::now(),
@@ -362,7 +385,8 @@ impl State {
                 true
             }
             Key::Named(NamedKey::Tab) => {
-                self.editor.insert(TAB_AS_SPACES);
+                let spaces = self.tab_spaces.clone();
+                self.editor.insert(&spaces);
                 true
             }
             Key::Named(NamedKey::ArrowLeft) => {
@@ -1367,15 +1391,17 @@ struct App {
     cold_start: Instant,
     initial_text: String,
     file_path: Option<PathBuf>,
+    settings: Settings,
     state: Option<State>,
 }
 
 impl App {
-    fn new(initial_text: String, file_path: Option<PathBuf>) -> Self {
+    fn new(initial_text: String, file_path: Option<PathBuf>, settings: Settings) -> Self {
         Self {
             cold_start: Instant::now(),
             initial_text,
             file_path,
+            settings,
             state: None,
         }
     }
@@ -1399,6 +1425,7 @@ impl ApplicationHandler for App {
             self.cold_start,
             &self.initial_text,
             self.file_path.clone(),
+            &self.settings,
         );
         // ControlFlow::Wait only draws on demand — kick off the first frame.
         state.window.request_redraw();
@@ -1472,8 +1499,18 @@ fn main() {
         None => (WELCOME_TEXT.to_string(), None),
     };
 
+    // Load settings from ~/.config/lighteditor/settings.toml (XDG path) —
+    // missing or malformed files fall through to the defaults.
+    let settings = match dirs::config_dir() {
+        Some(dir) => Settings::load_or_default(&dir.join(CONFIG_SUBDIR).join(CONFIG_FILENAME)),
+        None => {
+            log::warn!("no XDG config dir; using default settings");
+            Settings::default()
+        }
+    };
+
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(initial_text, file_path);
+    let mut app = App::new(initial_text, file_path, settings);
     event_loop.run_app(&mut app).expect("event loop failed");
 }
