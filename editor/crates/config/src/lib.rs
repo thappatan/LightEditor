@@ -43,7 +43,72 @@ impl Default for EditorSettings {
     }
 }
 
+/// A partial settings document — every field optional. Used for the
+/// per-workspace override file, where a sparse document means "only override
+/// the fields I name; leave the rest at the user/default value".
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct PartialSettings {
+    #[serde(default)]
+    pub editor: PartialEditorSettings,
+}
+
+/// Editor-section partial settings — every field optional.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct PartialEditorSettings {
+    #[serde(default)]
+    pub font_size: Option<f32>,
+    #[serde(default)]
+    pub line_height: Option<f32>,
+    #[serde(default)]
+    pub tab_size: Option<usize>,
+}
+
 impl Settings {
+    /// Overlay every present field of `partial` onto `self` in place. Missing
+    /// fields are left untouched, so calling with `PartialSettings::default()`
+    /// is a no-op.
+    pub fn merge(&mut self, partial: &PartialSettings) {
+        if let Some(v) = partial.editor.font_size {
+            self.editor.font_size = v;
+        }
+        if let Some(v) = partial.editor.line_height {
+            self.editor.line_height = v;
+        }
+        if let Some(v) = partial.editor.tab_size {
+            self.editor.tab_size = v;
+        }
+    }
+
+    /// Read a TOML *partial* settings file from `path`. Same fault tolerance
+    /// as [`Self::load_or_default`] — missing / unreadable / malformed all
+    /// fall through to an empty [`PartialSettings`] so the caller's user-level
+    /// settings stay intact.
+    pub fn load_partial(path: &Path) -> PartialSettings {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match toml::from_str::<PartialSettings>(&text) {
+                Ok(s) => {
+                    log::info!("loaded workspace settings from {}", path.display());
+                    s
+                }
+                Err(e) => {
+                    log::warn!(
+                        "workspace settings at {} are malformed ({e}); ignoring",
+                        path.display()
+                    );
+                    PartialSettings::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PartialSettings::default(),
+            Err(e) => {
+                log::warn!(
+                    "couldn't read workspace settings from {} ({e}); ignoring",
+                    path.display()
+                );
+                PartialSettings::default()
+            }
+        }
+    }
+
     /// Read a TOML settings file from `path`. Tolerant of every common
     /// failure mode — missing file, IO error, malformed TOML — by falling
     /// back to [`Default`] and logging.
@@ -127,6 +192,56 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let s = Settings::load_or_default(&path);
         assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn merge_partial_overrides_only_present_fields() {
+        let mut s = Settings::default();
+        let partial = PartialSettings {
+            editor: PartialEditorSettings {
+                font_size: Some(20.0),
+                line_height: None,
+                tab_size: Some(2),
+            },
+        };
+        s.merge(&partial);
+        assert_eq!(s.editor.font_size, 20.0);
+        // line_height was None → unchanged
+        assert_eq!(s.editor.line_height, 22.0);
+        assert_eq!(s.editor.tab_size, 2);
+    }
+
+    #[test]
+    fn merge_empty_partial_is_a_noop() {
+        let mut s = Settings {
+            editor: EditorSettings {
+                font_size: 18.0,
+                line_height: 26.0,
+                tab_size: 2,
+            },
+        };
+        let before = s.clone();
+        s.merge(&PartialSettings::default());
+        assert_eq!(s, before);
+    }
+
+    #[test]
+    fn load_partial_missing_file_is_empty() {
+        let path = std::env::temp_dir().join("lighteditor-test-partial-missing.toml");
+        let _ = std::fs::remove_file(&path);
+        let p = Settings::load_partial(&path);
+        assert_eq!(p, PartialSettings::default());
+    }
+
+    #[test]
+    fn load_partial_parses_sparse_document() {
+        let path = std::env::temp_dir().join("lighteditor-test-partial-sparse.toml");
+        std::fs::write(&path, "[editor]\nfont_size = 18.0\n").unwrap();
+        let p = Settings::load_partial(&path);
+        assert_eq!(p.editor.font_size, Some(18.0));
+        assert_eq!(p.editor.line_height, None);
+        assert_eq!(p.editor.tab_size, None);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

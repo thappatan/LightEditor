@@ -103,6 +103,10 @@ const FIND_PAD_DIP: f32 = 8.0;
 /// Subdirectory under the user's XDG config dir that holds settings.toml.
 const CONFIG_SUBDIR: &str = "lighteditor";
 const CONFIG_FILENAME: &str = "settings.toml";
+/// Subdirectory under the current working directory that may hold a
+/// workspace-scoped settings override (spec §4.1.5 — Workspace ranks above
+/// User in the precedence Default → User → Workspace).
+const WORKSPACE_CONFIG_SUBDIR: &str = ".lighteditor";
 
 /// Whether the platform's "primary" modifier (Cmd on macOS, Ctrl on
 /// Linux/Windows) is held. Used to gate shortcuts like Cmd-S.
@@ -2178,19 +2182,26 @@ struct App {
     file_path: Option<PathBuf>,
     settings: Settings,
     settings_path: Option<PathBuf>,
-    /// Kept alive so the watcher thread doesn't shut down; consulted only
-    /// via the user-event proxy so the field itself is otherwise unused.
-    _settings_watcher: Option<RecommendedWatcher>,
+    /// Optional `.lighteditor/settings.toml` next to the cwd. Overlaid on top
+    /// of `settings_path` when both exist (workspace > user > default).
+    workspace_settings_path: Option<PathBuf>,
+    /// Kept alive so the watcher threads don't shut down; consulted only
+    /// via the user-event proxy so the fields themselves are otherwise unused.
+    _user_watcher: Option<RecommendedWatcher>,
+    _workspace_watcher: Option<RecommendedWatcher>,
     state: Option<State>,
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         initial_text: String,
         file_path: Option<PathBuf>,
         settings: Settings,
         settings_path: Option<PathBuf>,
-        settings_watcher: Option<RecommendedWatcher>,
+        workspace_settings_path: Option<PathBuf>,
+        user_watcher: Option<RecommendedWatcher>,
+        workspace_watcher: Option<RecommendedWatcher>,
     ) -> Self {
         Self {
             cold_start: Instant::now(),
@@ -2198,9 +2209,24 @@ impl App {
             file_path,
             settings,
             settings_path,
-            _settings_watcher: settings_watcher,
+            workspace_settings_path,
+            _user_watcher: user_watcher,
+            _workspace_watcher: workspace_watcher,
             state: None,
         }
+    }
+
+    /// Re-read user + workspace settings from disk and overlay them. The
+    /// user file ranks below workspace per spec §4.1.5.
+    fn current_settings(&self) -> Settings {
+        let mut s = match self.settings_path.as_deref() {
+            Some(p) => Settings::load_or_default(p),
+            None => Settings::default(),
+        };
+        if let Some(p) = self.workspace_settings_path.as_deref() {
+            s.merge(&Settings::load_partial(p));
+        }
+        s
     }
 }
 
@@ -2208,12 +2234,9 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::SettingsChanged => {
-                let Some(path) = self.settings_path.as_ref() else {
-                    return;
-                };
-                let new_settings = Settings::load_or_default(path);
+                let new_settings = self.current_settings();
                 // macOS fsevent fires several events for one save (write
-                // tmp, rename, attribute change) — bail when the parsed
+                // tmp, rename, attribute change) — bail when the merged
                 // contents haven't actually changed so the log isn't N×.
                 if new_settings == self.settings {
                     return;
@@ -2320,27 +2343,46 @@ fn main() {
     };
 
     let settings_path = dirs::config_dir().map(|d| d.join(CONFIG_SUBDIR).join(CONFIG_FILENAME));
-    let settings = match settings_path.as_deref() {
+    let workspace_settings_path = std::env::current_dir()
+        .ok()
+        .map(|d| d.join(WORKSPACE_CONFIG_SUBDIR).join(CONFIG_FILENAME));
+
+    // Default → User → Workspace per spec §4.1.5.
+    let mut settings = match settings_path.as_deref() {
         Some(p) => Settings::load_or_default(p),
         None => {
             log::warn!("no XDG config dir; using default settings");
             Settings::default()
         }
     };
+    if let Some(p) = workspace_settings_path.as_deref() {
+        settings.merge(&Settings::load_partial(p));
+    }
 
     let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()
         .expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    // Watch settings.toml so font_size / line_height / tab_size hot-reload
-    // without a restart. Skipped if the OS has no config dir, the parent
-    // directory can't be created, or notify rejects the path.
-    let watcher = settings_path
+    // Watch both settings.toml paths so font_size / line_height / tab_size
+    // hot-reload without a restart. Either watcher firing triggers a full
+    // re-merge, so the precedence rules stay consistent.
+    let user_watcher = settings_path
+        .as_deref()
+        .and_then(|p| spawn_settings_watcher(p, event_loop.create_proxy()));
+    let workspace_watcher = workspace_settings_path
         .as_deref()
         .and_then(|p| spawn_settings_watcher(p, event_loop.create_proxy()));
 
-    let mut app = App::new(initial_text, file_path, settings, settings_path, watcher);
+    let mut app = App::new(
+        initial_text,
+        file_path,
+        settings,
+        settings_path,
+        workspace_settings_path,
+        user_watcher,
+        workspace_watcher,
+    );
     event_loop.run_app(&mut app).expect("event loop failed");
 }
 
