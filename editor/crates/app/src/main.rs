@@ -25,7 +25,7 @@ use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Point, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{Color, FontSystem, Resolution, SwashCache, TextArea, TextBounds};
 use editor_ui_text::{TextGpu, TextStack};
-use find::FindBar;
+use find::{FindBar, FindFocus};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use palette::{Command, CommandPalette};
 use wgpu::{
@@ -1681,12 +1681,20 @@ impl State {
             return;
         };
         let count = find.match_count();
-        let suffix = if count == 0 {
+        let count_label = if count == 0 {
             "no matches".to_string()
         } else {
             format!("{}/{}", find.current_index() + 1, count)
         };
-        let caption = format!("Find: {}   {}", find.query(), suffix);
+        let (q_mark, r_mark) = match find.focus() {
+            FindFocus::Query => ("❯", " "),
+            FindFocus::Replacement => (" ", "❯"),
+        };
+        let caption = format!(
+            "{q_mark} Find:    {query}   {count_label}\n{r_mark} Replace: {replacement}",
+            query = find.query(),
+            replacement = find.replacement(),
+        );
         self.find_text.set_content(&mut self.font_system, &caption);
     }
 
@@ -1706,19 +1714,50 @@ impl State {
     fn handle_find_key(&mut self, event: KeyEvent) {
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_find(),
-            Key::Named(NamedKey::Enter) => {
-                let shift = self.modifiers.shift_key();
+            Key::Named(NamedKey::Tab) => {
                 if let Some(f) = self.doc_mut().find.as_mut() {
-                    if shift {
-                        f.prev_match();
-                    } else {
-                        f.next_match();
-                    }
+                    f.toggle_focus();
                 }
                 self.refresh_find_text();
-                self.select_current_match();
                 self.scene_dirty = true;
                 self.window.request_redraw();
+            }
+            Key::Named(NamedKey::Enter) => {
+                let cmd_alt = is_cmd_or_ctrl(self.modifiers) && self.modifiers.alt_key();
+                if cmd_alt {
+                    self.replace_all();
+                    return;
+                }
+                let shift = self.modifiers.shift_key();
+                let focus = self
+                    .doc()
+                    .find
+                    .as_ref()
+                    .map(|f| f.focus())
+                    .unwrap_or(FindFocus::Query);
+                match (focus, shift) {
+                    (FindFocus::Replacement, false) => {
+                        self.replace_current();
+                    }
+                    (_, true) => {
+                        if let Some(f) = self.doc_mut().find.as_mut() {
+                            f.prev_match();
+                        }
+                        self.refresh_find_text();
+                        self.select_current_match();
+                        self.scene_dirty = true;
+                        self.window.request_redraw();
+                    }
+                    (_, false) => {
+                        if let Some(f) = self.doc_mut().find.as_mut() {
+                            f.next_match();
+                        }
+                        self.refresh_find_text();
+                        self.select_current_match();
+                        self.scene_dirty = true;
+                        self.window.request_redraw();
+                    }
+                }
             }
             Key::Named(NamedKey::Backspace) => {
                 let text = self.doc().editor.text();
@@ -1736,13 +1775,24 @@ impl State {
                 }
                 if let Some(text) = &event.text {
                     let buffer_text = self.doc().editor.text();
+                    let typing_in_query = self
+                        .doc()
+                        .find
+                        .as_ref()
+                        .map(|f| f.focus() == FindFocus::Query)
+                        .unwrap_or(true);
                     if let Some(f) = self.doc_mut().find.as_mut() {
                         for c in text.chars() {
                             f.push_char(c, &buffer_text);
                         }
                     }
                     self.refresh_find_text();
-                    self.select_current_match();
+                    // Only chase the new match when the user is editing the
+                    // *query* — typing in the replacement field shouldn't
+                    // jump the editor around.
+                    if typing_in_query {
+                        self.select_current_match();
+                    }
                     self.scene_dirty = true;
                     self.window.request_redraw();
                 }
@@ -1750,13 +1800,79 @@ impl State {
         }
     }
 
-    /// The find bar's backdrop rectangle. Tucked under the tab strip.
+    /// Replace the currently-highlighted match with the bar's replacement
+    /// string, then refresh matches and advance to the next match (if any).
+    fn replace_current(&mut self) {
+        let (range, replacement) = match self.doc().find.as_ref() {
+            Some(bar) => match bar.current_match() {
+                Some(r) => (r, bar.replacement().to_string()),
+                None => return,
+            },
+            None => return,
+        };
+        {
+            let editor = &mut self.doc_mut().editor;
+            editor.set_selection(Selection::new(range.start, range.end));
+            editor.insert(&replacement);
+        }
+        let buffer_text = self.doc().editor.text();
+        if let Some(f) = self.doc_mut().find.as_mut() {
+            f.refresh(&buffer_text);
+        }
+        if !self.doc().dirty {
+            self.doc_mut().dirty = true;
+            self.update_title();
+            self.refresh_tabs_text();
+        }
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.refresh_find_text();
+        self.select_current_match();
+        self.window.request_redraw();
+    }
+
+    /// Replace every match in buffer order with the bar's replacement
+    /// string. Walks in reverse so earlier positions don't shift after we
+    /// touch later ones, then refreshes matches and flashes the count.
+    fn replace_all(&mut self) {
+        let (matches, replacement) = match self.doc().find.as_ref() {
+            Some(bar) => (bar.matches().to_vec(), bar.replacement().to_string()),
+            None => return,
+        };
+        if matches.is_empty() {
+            return;
+        }
+        let count = matches.len();
+        for range in matches.iter().rev() {
+            let editor = &mut self.doc_mut().editor;
+            editor.set_selection(Selection::new(range.start, range.end));
+            editor.insert(&replacement);
+        }
+        let buffer_text = self.doc().editor.text();
+        if let Some(f) = self.doc_mut().find.as_mut() {
+            f.refresh(&buffer_text);
+        }
+        if !self.doc().dirty {
+            self.doc_mut().dirty = true;
+            self.update_title();
+            self.refresh_tabs_text();
+        }
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.refresh_find_text();
+        self.set_status_flash(format!("replaced {count}"));
+        self.window.request_redraw();
+    }
+
+    /// The find bar's backdrop rectangle. Two rows tall (Find / Replace),
+    /// tucked under the tab strip.
     fn find_panel_rect(&self) -> Rect {
         let pad = FIND_PAD_DIP * self.scale;
         let width = FIND_WIDTH_DIP * self.scale;
-        // Sit just below the tab strip rather than at the very top.
         let top = (TAB_BAR_HEIGHT_DIP + FIND_TOP_DIP) * self.scale;
-        let height = self.line_height() + 2.0 * pad;
+        let height = 2.0 * self.line_height() + 2.0 * pad;
         let surface_w = self.gpu.surface_config.width as f32;
         let left = surface_w - width - FIND_TOP_DIP * self.scale;
         Rect::new(left.max(0.0), top, width, height)

@@ -10,9 +10,21 @@
 
 use std::ops::Range;
 
+/// Which input row of a [`FindBar`] is currently receiving key events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindFocus {
+    Query,
+    Replacement,
+}
+
 /// State of the find bar.
 pub struct FindBar {
     query: String,
+    /// Replacement string for find-and-replace. Lives on the same bar so a
+    /// user toggling between query and replacement keeps both in flight.
+    replacement: String,
+    /// Which input row keys go to. `Tab` toggles.
+    focus: FindFocus,
     /// Char-index ranges (half-open) of every literal match against the
     /// buffer text the bar was last updated against. In buffer order.
     matches: Vec<Range<usize>>,
@@ -22,10 +34,12 @@ pub struct FindBar {
 }
 
 impl FindBar {
-    /// A find bar with no query, no matches.
+    /// A find bar with no query, no matches, focus on the query input.
     pub fn new() -> Self {
         Self {
             query: String::new(),
+            replacement: String::new(),
+            focus: FindFocus::Query,
             matches: Vec::new(),
             current: 0,
         }
@@ -33,6 +47,22 @@ impl FindBar {
 
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    pub fn replacement(&self) -> &str {
+        &self.replacement
+    }
+
+    pub fn focus(&self) -> FindFocus {
+        self.focus
+    }
+
+    /// Flip between editing the query and editing the replacement.
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            FindFocus::Query => FindFocus::Replacement,
+            FindFocus::Replacement => FindFocus::Query,
+        };
     }
 
     /// Every match, in buffer order.
@@ -57,16 +87,29 @@ impl FindBar {
         self.matches.len()
     }
 
-    /// Append `c` to the query and recompute matches against `text`.
+    /// Append `c` to whichever input is focused. Only the query field
+    /// triggers a recompute.
     pub fn push_char(&mut self, c: char, text: &str) {
-        self.query.push(c);
-        self.recompute(text);
+        match self.focus {
+            FindFocus::Query => {
+                self.query.push(c);
+                self.recompute(text);
+            }
+            FindFocus::Replacement => self.replacement.push(c),
+        }
     }
 
-    /// Drop the last char of the query (no-op if empty) and recompute.
+    /// Drop the last char of the focused input.
     pub fn backspace(&mut self, text: &str) {
-        if self.query.pop().is_some() {
-            self.recompute(text);
+        match self.focus {
+            FindFocus::Query => {
+                if self.query.pop().is_some() {
+                    self.recompute(text);
+                }
+            }
+            FindFocus::Replacement => {
+                self.replacement.pop();
+            }
         }
     }
 
@@ -199,6 +242,52 @@ mod tests {
         f.prev_match();
         assert_eq!(f.current_index(), 0);
         assert!(f.current_match().is_none());
+    }
+
+    #[test]
+    fn focus_toggles_between_query_and_replacement() {
+        let mut f = FindBar::new();
+        assert_eq!(f.focus(), FindFocus::Query);
+        f.toggle_focus();
+        assert_eq!(f.focus(), FindFocus::Replacement);
+        f.toggle_focus();
+        assert_eq!(f.focus(), FindFocus::Query);
+    }
+
+    #[test]
+    fn push_char_routes_to_focused_input() {
+        let mut f = FindBar::new();
+        let text = "abc abc";
+        // Focus = Query (default).
+        f.push_char('a', text);
+        assert_eq!(f.query(), "a");
+        assert!(f.replacement().is_empty());
+        assert!(f.match_count() > 0);
+
+        // Switch to Replacement — pushing chars no longer touches the query.
+        f.toggle_focus();
+        f.push_char('X', text);
+        f.push_char('Y', text);
+        assert_eq!(f.query(), "a");
+        assert_eq!(f.replacement(), "XY");
+        // Matches were *not* recomputed by editing the replacement.
+        assert!(f.match_count() > 0);
+    }
+
+    #[test]
+    fn backspace_routes_to_focused_input() {
+        let mut f = FindBar::new();
+        f.push_char('a', "abc");
+        f.toggle_focus();
+        f.push_char('X', "abc");
+        f.push_char('Y', "abc");
+        f.backspace("abc");
+        assert_eq!(f.query(), "a");
+        assert_eq!(f.replacement(), "X");
+        f.toggle_focus();
+        f.backspace("abc");
+        assert!(f.query().is_empty());
+        assert_eq!(f.replacement(), "X");
     }
 
     #[test]
