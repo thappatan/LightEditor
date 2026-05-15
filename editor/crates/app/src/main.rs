@@ -23,7 +23,7 @@ use editor_config::Settings;
 use editor_core::{Position, Selection};
 use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Point, Rect, Scene, SceneNode};
-use editor_ui_text::glyphon::{Color, Resolution, TextArea, TextBounds};
+use editor_ui_text::glyphon::{Color, FontSystem, Resolution, SwashCache, TextArea, TextBounds};
 use editor_ui_text::TextStack;
 use find::FindBar;
 use palette::{Command, CommandPalette};
@@ -125,6 +125,13 @@ struct State {
     window: Arc<Window>,
     gpu: GpuContext,
     quads: QuadRenderer,
+    /// Shared across every `TextStack` (editor, palette, find, tabs, close).
+    /// `FontSystem::new()` walks the OS font directory once — ~80ms cold —
+    /// so building one and lending it out is much cheaper than five.
+    font_system: FontSystem,
+    /// Shared swash glyph cache. Per-stack `TextRenderer::prepare` borrows it
+    /// in turn (calls are sequential, so the single `&mut` rotates fine).
+    swash_cache: SwashCache,
     /// TextStack for the *active* document. Reshape happens on switch and on
     /// edit (`text_dirty`).
     text: TextStack,
@@ -215,11 +222,18 @@ impl State {
         let line_height_pt = settings.editor.line_height;
         let tab_spaces = " ".repeat(settings.editor.tab_size);
 
+        // One `FontSystem` shared by every `TextStack` — the OS font scan
+        // takes ~80ms cold, so paying it once and lending out a `&mut` keeps
+        // the editor under the 250ms hard limit.
+        let mut font_system = editor_ui_text::new_font_system();
+        let swash_cache = editor_ui_text::new_swash_cache();
+
         let text_padding = TEXT_PADDING_DIP * scale;
         let text = TextStack::new(
             &gpu.device,
             &gpu.queue,
             gpu.format(),
+            &mut font_system,
             size.width as f32 - text_padding,
             font_size_pt,
             line_height_pt,
@@ -232,13 +246,13 @@ impl State {
             None => Document::new_scratch(initial_text),
         };
 
-        // Palette and find each get their own TextStack so the editor's
-        // primary buffer doesn't have to swap content for overlay typing.
+        // Each overlay TextStack reuses the shared FontSystem above.
         let palette_width = (PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale;
         let palette_text = TextStack::new(
             &gpu.device,
             &gpu.queue,
             gpu.format(),
+            &mut font_system,
             palette_width,
             font_size_pt,
             line_height_pt,
@@ -251,6 +265,7 @@ impl State {
             &gpu.device,
             &gpu.queue,
             gpu.format(),
+            &mut font_system,
             find_width,
             font_size_pt,
             line_height_pt,
@@ -264,6 +279,7 @@ impl State {
             &gpu.device,
             &gpu.queue,
             gpu.format(),
+            &mut font_system,
             size.width as f32,
             font_size_pt,
             line_height_pt,
@@ -277,6 +293,7 @@ impl State {
             &gpu.device,
             &gpu.queue,
             gpu.format(),
+            &mut font_system,
             TAB_CLOSE_W_DIP * scale,
             font_size_pt,
             line_height_pt,
@@ -295,6 +312,8 @@ impl State {
             window,
             gpu,
             quads,
+            font_system,
+            swash_cache,
             text,
             docs: vec![doc],
             active: 0,
@@ -346,8 +365,10 @@ impl State {
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.gpu.resize(size.width, size.height);
-        self.text.set_width(size.width as f32 - self.text_padding);
-        self.tabs_text.set_width(size.width as f32);
+        self.text
+            .set_width(&mut self.font_system, size.width as f32 - self.text_padding);
+        self.tabs_text
+            .set_width(&mut self.font_system, size.width as f32);
         // Palette / find widths are fixed; nothing to update on a window resize.
         self.text_dirty = true;
         self.scene_dirty = true;
@@ -366,18 +387,19 @@ impl State {
         self.text_inset_y = (TAB_BAR_HEIGHT_DIP + TEXT_TOP_GAP_DIP) * scale;
         self.text_padding = TEXT_PADDING_DIP * scale;
         self.caret_width = CARET_WIDTH_DIP * scale;
-        self.text.set_scale(scale);
-        self.palette_text.set_scale(scale);
+        let fs = &mut self.font_system;
+        self.text.set_scale(fs, scale);
+        self.palette_text.set_scale(fs, scale);
         self.palette_text
-            .set_width((PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale);
-        self.find_text.set_scale(scale);
+            .set_width(fs, (PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale);
+        self.find_text.set_scale(fs, scale);
         self.find_text
-            .set_width((FIND_WIDTH_DIP - 2.0 * FIND_PAD_DIP) * scale);
-        self.tabs_text.set_scale(scale);
+            .set_width(fs, (FIND_WIDTH_DIP - 2.0 * FIND_PAD_DIP) * scale);
+        self.tabs_text.set_scale(fs, scale);
         self.tabs_text
-            .set_width(self.gpu.surface_config.width as f32);
-        self.close_text.set_scale(scale);
-        self.close_text.set_width(TAB_CLOSE_W_DIP * scale);
+            .set_width(fs, self.gpu.surface_config.width as f32);
+        self.close_text.set_scale(fs, scale);
+        self.close_text.set_width(fs, TAB_CLOSE_W_DIP * scale);
         self.text_dirty = true;
         self.scene_dirty = true;
         self.window.request_redraw();
@@ -816,7 +838,7 @@ impl State {
                 s.push(' ');
             }
         }
-        self.tabs_text.set_content(&s);
+        self.tabs_text.set_content(&mut self.font_system, &s);
     }
 
     // ── command palette ────────────────────────────────────────────────────
@@ -851,7 +873,7 @@ impl State {
             text.push_str(cmd.label());
             text.push('\n');
         }
-        self.palette_text.set_content(&text);
+        self.palette_text.set_content(&mut self.font_system, &text);
     }
 
     /// Route a key while the palette is open.
@@ -1001,7 +1023,7 @@ impl State {
 
     fn refresh_find_text(&mut self) {
         let Some(find) = self.doc().find.as_ref() else {
-            self.find_text.set_content("");
+            self.find_text.set_content(&mut self.font_system, "");
             return;
         };
         let count = find.match_count();
@@ -1011,7 +1033,7 @@ impl State {
             format!("{}/{}", find.current_index() + 1, count)
         };
         let caption = format!("Find: {}   {}", find.query(), suffix);
-        self.find_text.set_content(&caption);
+        self.find_text.set_content(&mut self.font_system, &caption);
     }
 
     /// Move the editor selection to the find bar's current match.
@@ -1457,7 +1479,7 @@ impl State {
 
         if self.text_dirty {
             let new_text = self.docs[self.active].editor.text();
-            self.text.set_content(&new_text);
+            self.text.set_content(&mut self.font_system, &new_text);
             self.text_dirty = false;
         }
         if self.scene_dirty {
@@ -1500,7 +1522,7 @@ impl State {
             .prepare(
                 &self.gpu.device,
                 &self.gpu.queue,
-                &mut self.text.font_system,
+                &mut self.font_system,
                 &mut self.text.atlas,
                 &self.text.viewport,
                 [TextArea {
@@ -1512,7 +1534,7 @@ impl State {
                     default_color: Color::rgb(238, 238, 238),
                     custom_glyphs: &[],
                 }],
-                &mut self.text.swash_cache,
+                &mut self.swash_cache,
             )
             .expect("text prepare failed");
 
@@ -1533,7 +1555,7 @@ impl State {
             .prepare(
                 &self.gpu.device,
                 &self.gpu.queue,
-                &mut self.tabs_text.font_system,
+                &mut self.font_system,
                 &mut self.tabs_text.atlas,
                 &self.tabs_text.viewport,
                 [TextArea {
@@ -1545,7 +1567,7 @@ impl State {
                     default_color: Color::rgb(220, 220, 220),
                     custom_glyphs: &[],
                 }],
-                &mut self.tabs_text.swash_cache,
+                &mut self.swash_cache,
             )
             .expect("tabs text prepare failed");
 
@@ -1565,7 +1587,7 @@ impl State {
             .prepare(
                 &self.gpu.device,
                 &self.gpu.queue,
-                &mut self.close_text.font_system,
+                &mut self.font_system,
                 &mut self.close_text.atlas,
                 &self.close_text.viewport,
                 (0..docs_len).map(|i| {
@@ -1581,7 +1603,7 @@ impl State {
                         custom_glyphs: &[],
                     }
                 }),
-                &mut self.close_text.swash_cache,
+                &mut self.swash_cache,
             )
             .expect("close text prepare failed");
 
@@ -1594,7 +1616,7 @@ impl State {
                 .prepare(
                     &self.gpu.device,
                     &self.gpu.queue,
-                    &mut self.find_text.font_system,
+                    &mut self.font_system,
                     &mut self.find_text.atlas,
                     &self.find_text.viewport,
                     [TextArea {
@@ -1606,7 +1628,7 @@ impl State {
                         default_color: Color::rgb(238, 238, 238),
                         custom_glyphs: &[],
                     }],
-                    &mut self.find_text.swash_cache,
+                    &mut self.swash_cache,
                 )
                 .expect("find text prepare failed");
         }
@@ -1622,7 +1644,7 @@ impl State {
                 .prepare(
                     &self.gpu.device,
                     &self.gpu.queue,
-                    &mut self.palette_text.font_system,
+                    &mut self.font_system,
                     &mut self.palette_text.atlas,
                     &self.palette_text.viewport,
                     [TextArea {
@@ -1634,7 +1656,7 @@ impl State {
                         default_color: Color::rgb(238, 238, 238),
                         custom_glyphs: &[],
                     }],
-                    &mut self.palette_text.swash_cache,
+                    &mut self.swash_cache,
                 )
                 .expect("palette text prepare failed");
         }
