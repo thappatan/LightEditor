@@ -53,6 +53,13 @@ const TEXT_TOP_GAP_DIP: f32 = 8.0;
 /// Caret width, in logical pixels.
 const CARET_WIDTH_DIP: f32 = 2.0;
 
+/// Status-bar dimensions, in logical pixels. The bar sits at the very bottom
+/// of the window and is opaque, so the editor viewport stops above it.
+const STATUS_BAR_HEIGHT_DIP: f32 = 22.0;
+/// Horizontal padding inside the status bar (left edge → text start), in
+/// logical pixels.
+const STATUS_PAD_X_DIP: f32 = 10.0;
+
 /// Tab strip dimensions, in logical pixels.
 const TAB_BAR_HEIGHT_DIP: f32 = 30.0;
 const TAB_WIDTH_DIP: f32 = 180.0;
@@ -148,6 +155,9 @@ struct State {
     /// separate TextAreas at each slot's close-button position; the buffer
     /// content never changes.
     close_text: TextStack,
+    /// TextStack for the bottom status bar — "Ln N, Col M  ·  L lines".
+    /// Reshaped whenever the caret or document changes.
+    status_text: TextStack,
 
     /// The scene rebuilt from `editor` whenever it changes.
     scene: Scene,
@@ -301,6 +311,19 @@ impl State {
             "×",
         );
 
+        // Status-bar TextStack — single-line caption at the bottom.
+        let status_text = TextStack::new(
+            &gpu.device,
+            &gpu.queue,
+            gpu.format(),
+            &mut font_system,
+            size.width as f32 - 2.0 * STATUS_PAD_X_DIP * scale,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "",
+        );
+
         let scene = Scene::new(SceneNode::group(Rect::new(
             0.0,
             0.0,
@@ -319,6 +342,7 @@ impl State {
             active: 0,
             tabs_text,
             close_text,
+            status_text,
             scene,
             scale,
             text_inset_x: TEXT_INSET_DIP * scale,
@@ -369,6 +393,10 @@ impl State {
             .set_width(&mut self.font_system, size.width as f32 - self.text_padding);
         self.tabs_text
             .set_width(&mut self.font_system, size.width as f32);
+        self.status_text.set_width(
+            &mut self.font_system,
+            size.width as f32 - 2.0 * STATUS_PAD_X_DIP * self.scale,
+        );
         // Palette / find widths are fixed; nothing to update on a window resize.
         self.text_dirty = true;
         self.scene_dirty = true;
@@ -400,6 +428,11 @@ impl State {
             .set_width(fs, self.gpu.surface_config.width as f32);
         self.close_text.set_scale(fs, scale);
         self.close_text.set_width(fs, TAB_CLOSE_W_DIP * scale);
+        self.status_text.set_scale(fs, scale);
+        self.status_text.set_width(
+            fs,
+            self.gpu.surface_config.width as f32 - 2.0 * STATUS_PAD_X_DIP * scale,
+        );
         self.text_dirty = true;
         self.scene_dirty = true;
         self.window.request_redraw();
@@ -829,6 +862,32 @@ impl State {
             return None;
         }
         Some(idx)
+    }
+
+    // ── status bar ─────────────────────────────────────────────────────────
+
+    /// Status bar backdrop rectangle, in physical pixels.
+    fn status_bar_rect(&self) -> Rect {
+        let surface_w = self.gpu.surface_config.width as f32;
+        let surface_h = self.gpu.surface_config.height as f32;
+        let h = STATUS_BAR_HEIGHT_DIP * self.scale;
+        Rect::new(0.0, surface_h - h, surface_w, h)
+    }
+
+    /// Re-shape the status caption to reflect the active document's caret
+    /// position and total line count: "Ln L, Col C  ·  N lines". The path is
+    /// already in the window title, so it stays out of the status bar.
+    fn refresh_status_text(&mut self) {
+        let head = self.doc().editor.selections().primary().head;
+        let pos = self.doc().editor.buffer().char_to_position(head);
+        let lines = self.doc().editor.buffer().len_lines();
+        let s = format!(
+            "Ln {}, Col {}  ·  {} lines",
+            pos.line + 1,
+            pos.column + 1,
+            lines
+        );
+        self.status_text.set_content(&mut self.font_system, &s);
     }
 
     /// Rebuild the tab-strip TextStack: one line, each label padded to
@@ -1308,13 +1367,17 @@ impl State {
             return;
         };
 
-        let surface_h = self.gpu.surface_config.height as f32;
+        // Bottom edge of the editor viewport — above the status bar so the
+        // drag-to-scroll trigger lines up with where the user can still see
+        // the caret.
+        let viewport_bottom =
+            self.gpu.surface_config.height as f32 - STATUS_BAR_HEIGHT_DIP * self.scale;
         let max = self.max_scroll();
         let scroll = self.doc().scroll_y;
         let new_scroll = if y < self.text_inset_y {
             (scroll - (self.text_inset_y - y)).clamp(0.0, max)
-        } else if y > surface_h {
-            (scroll + (y - surface_h)).clamp(0.0, max)
+        } else if y > viewport_bottom {
+            (scroll + (y - viewport_bottom)).clamp(0.0, max)
         } else {
             scroll
         };
@@ -1356,10 +1419,17 @@ impl State {
             .max(self.line_height())
     }
 
+    /// Visible height of the editor viewport in physical pixels — the surface
+    /// minus the tab strip on top and the status bar on the bottom.
+    fn visible_height(&self) -> f32 {
+        self.gpu.surface_config.height as f32
+            - self.text_inset_y
+            - STATUS_BAR_HEIGHT_DIP * self.scale
+    }
+
     /// The largest valid scroll offset — content height beyond the viewport.
     fn max_scroll(&self) -> f32 {
-        let visible = self.gpu.surface_config.height as f32 - self.text_inset_y;
-        (self.content_height() - visible).max(0.0)
+        (self.content_height() - self.visible_height()).max(0.0)
     }
 
     /// Scroll the viewport the minimum amount needed to bring the primary
@@ -1370,7 +1440,7 @@ impl State {
             return;
         };
         let caret_bottom = caret_top + self.line_height();
-        let visible = self.gpu.surface_config.height as f32 - self.text_inset_y;
+        let visible = self.visible_height();
         let max = self.max_scroll();
         let mut scroll = self.doc().scroll_y;
 
@@ -1458,6 +1528,13 @@ impl State {
         for rect in self.match_highlight_rects() {
             root.push_child(SceneNode::quad(rect, SceneColor::rgba(255, 200, 60, 64)));
         }
+
+        // Status bar backdrop — opaque so it covers any text that scrolled
+        // behind it (text bounds also clip, but defence in depth is cheap).
+        root.push_child(SceneNode::quad(
+            self.status_bar_rect(),
+            SceneColor::rgba(22, 22, 28, 255),
+        ));
 
         // Find bar panel.
         if self.doc().find.is_some() {
@@ -1610,6 +1687,7 @@ impl State {
                 self.ensure_caret_visible();
                 self.follow_caret = false;
             }
+            self.refresh_status_text();
             self.rebuild_scene();
             self.scene_dirty = false;
         }
@@ -1634,6 +1712,16 @@ impl State {
             right: surface_w as i32,
             bottom: surface_h as i32,
         };
+        // Editor text clips to the viewport between the tab strip and the
+        // status bar; otherwise scrolled glyphs would bleed into both bars
+        // (which are drawn as quads underneath the text pass).
+        let status_bar_h = STATUS_BAR_HEIGHT_DIP * self.scale;
+        let editor_text_bounds = TextBounds {
+            left: 0,
+            top: self.text_inset_y as i32,
+            right: surface_w as i32,
+            bottom: (surface_h as f32 - status_bar_h) as i32,
+        };
 
         // Editor text.
         let inset_x = self.text_inset_x;
@@ -1653,7 +1741,7 @@ impl State {
                     left: inset_x,
                     top: inset_y - scroll,
                     scale: 1.0,
-                    bounds: full_bounds,
+                    bounds: editor_text_bounds,
                     default_color: Color::rgb(238, 238, 238),
                     custom_glyphs: &[],
                 }],
@@ -1729,6 +1817,41 @@ impl State {
                 &mut self.swash_cache,
             )
             .expect("close text prepare failed");
+
+        // Status bar text — single line, centred vertically inside the bar.
+        let status_bar = self.status_bar_rect();
+        let status_text_y =
+            status_bar.min_y() + (status_bar.size.height - self.line_height()) * 0.5;
+        let status_text_x = status_bar.min_x() + STATUS_PAD_X_DIP * self.scale;
+        let status_bounds = TextBounds {
+            left: 0,
+            top: status_bar.min_y() as i32,
+            right: surface_w as i32,
+            bottom: surface_h as i32,
+        };
+        self.status_text
+            .viewport
+            .update(&self.gpu.queue, resolution);
+        self.status_text
+            .renderer
+            .prepare(
+                &self.gpu.device,
+                &self.gpu.queue,
+                &mut self.font_system,
+                &mut self.status_text.atlas,
+                &self.status_text.viewport,
+                [TextArea {
+                    buffer: &self.status_text.buffer,
+                    left: status_text_x,
+                    top: status_text_y,
+                    scale: 1.0,
+                    bounds: status_bounds,
+                    default_color: Color::rgb(180, 180, 190),
+                    custom_glyphs: &[],
+                }],
+                &mut self.swash_cache,
+            )
+            .expect("status text prepare failed");
 
         let find_open = self.doc().find.is_some();
         if find_open {
@@ -1827,6 +1950,14 @@ impl State {
                 .renderer
                 .render(&self.close_text.atlas, &self.close_text.viewport, &mut pass)
                 .expect("close text render failed");
+            self.status_text
+                .renderer
+                .render(
+                    &self.status_text.atlas,
+                    &self.status_text.viewport,
+                    &mut pass,
+                )
+                .expect("status text render failed");
             if find_open {
                 self.find_text
                     .renderer
@@ -1849,6 +1980,7 @@ impl State {
         self.text.atlas.trim();
         self.tabs_text.atlas.trim();
         self.close_text.atlas.trim();
+        self.status_text.atlas.trim();
         if palette_open {
             self.palette_text.atlas.trim();
         }
