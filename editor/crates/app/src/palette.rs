@@ -17,6 +17,8 @@ pub enum Command {
     SaveFile,
     SaveFileAs,
     SaveAll,
+    CloseOtherTabs,
+    CloseAllTabs,
 }
 
 impl Command {
@@ -28,6 +30,8 @@ impl Command {
             Command::SaveFile => "Save",
             Command::SaveFileAs => "Save As…",
             Command::SaveAll => "Save All",
+            Command::CloseOtherTabs => "Close Other Tabs",
+            Command::CloseAllTabs => "Close All Tabs",
         }
     }
 }
@@ -39,6 +43,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::SaveFile,
     Command::SaveFileAs,
     Command::SaveAll,
+    Command::CloseOtherTabs,
+    Command::CloseAllTabs,
 ];
 
 /// The popup's state.

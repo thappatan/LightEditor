@@ -639,14 +639,12 @@ impl State {
         }
     }
 
-    /// Prompt for a file with an Open dialog and load it. Replaces the active
-    /// document only when it is a pristine, never-saved, never-edited scratch
+    /// Read `path` and place it in the editor. If the active document is a
+    /// pristine, never-saved, never-edited scratch buffer, replace it in-place
     /// (matches VSCode's behaviour for untouched "Untitled-1"); otherwise
-    /// opens in a new tab. Cancel and read failure both keep state intact.
-    fn open_file_dialog(&mut self) {
-        let Some(path) = rfd::FileDialog::new().pick_file() else {
-            return;
-        };
+    /// push a new tab and activate it. I/O failure is logged and the state
+    /// is left intact.
+    fn open_path(&mut self, path: PathBuf) {
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 let new_doc = Document::from_file(path, &content);
@@ -666,6 +664,26 @@ impl State {
             }
             Err(e) => log::error!("could not read {}: {}", path.display(), e),
         }
+    }
+
+    /// Prompt for *one or more* files with an Open dialog and load each in a
+    /// tab. The first opened file may replace a pristine scratch (see
+    /// [`open_path`](Self::open_path)); subsequent ones always push a new tab.
+    /// Cancel is a no-op.
+    fn open_file_dialog(&mut self) {
+        let Some(paths) = rfd::FileDialog::new().pick_files() else {
+            return;
+        };
+        for path in paths {
+            self.open_path(path);
+        }
+    }
+
+    /// Handle a file dragged from Finder/Explorer and dropped on the window.
+    /// One DroppedFile event fires per file, so this opens exactly one tab
+    /// per call.
+    fn handle_dropped_file(&mut self, path: PathBuf) {
+        self.open_path(path);
     }
 
     /// Sync the window title with the active document.
@@ -941,7 +959,81 @@ impl State {
             Command::SaveFile => self.save_to_file(),
             Command::SaveFileAs => self.save_as(),
             Command::SaveAll => self.save_all(),
+            Command::CloseOtherTabs => self.close_other_tabs(),
+            Command::CloseAllTabs => self.close_all_tabs(),
         }
+    }
+
+    /// Close every tab except the active one. Each dirty non-active tab is
+    /// switched to and prompted; cancelling a prompt keeps that tab open and
+    /// the walk continues to the next dirty one.
+    fn close_other_tabs(&mut self) {
+        if self.docs.len() <= 1 {
+            return;
+        }
+        let keep = self.active;
+        // Range loop because the body mutably borrows self via
+        // `confirm_unsaved`, so iterating `self.docs` is awkward.
+        #[allow(clippy::needless_range_loop)]
+        let mut keep_flags: Vec<bool> = (0..self.docs.len()).map(|i| i == keep).collect();
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..self.docs.len() {
+            if i == keep || !self.docs[i].dirty {
+                continue;
+            }
+            self.active = i;
+            self.update_title();
+            if !self.confirm_unsaved("Close tab") {
+                keep_flags[i] = true;
+            }
+        }
+        self.retain_docs(&keep_flags, Some(keep));
+    }
+
+    /// Close every tab; replaced with a fresh scratch if all close. Each
+    /// dirty tab is prompted; cancel keeps that tab.
+    fn close_all_tabs(&mut self) {
+        let mut keep_flags: Vec<bool> = vec![false; self.docs.len()];
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..self.docs.len() {
+            if !self.docs[i].dirty {
+                continue;
+            }
+            self.active = i;
+            self.update_title();
+            if !self.confirm_unsaved("Close tab") {
+                keep_flags[i] = true;
+            }
+        }
+        self.retain_docs(&keep_flags, None);
+    }
+
+    /// Filter `docs` by `keep_flags`. If `preferred_active` is `Some(i)` and
+    /// the doc at index `i` survives, it becomes active; otherwise the first
+    /// surviving doc wins. An empty result is replaced by a fresh scratch.
+    fn retain_docs(&mut self, keep_flags: &[bool], preferred_active: Option<usize>) {
+        let mut new_docs = Vec::with_capacity(self.docs.len());
+        let mut new_active = 0;
+        for (i, doc) in self.docs.drain(..).enumerate() {
+            if keep_flags[i] {
+                if Some(i) == preferred_active {
+                    new_active = new_docs.len();
+                }
+                new_docs.push(doc);
+            }
+        }
+        if new_docs.is_empty() {
+            new_docs.push(Document::new_scratch(""));
+        }
+        self.docs = new_docs;
+        self.active = new_active.min(self.docs.len() - 1);
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = false;
+        self.update_title();
+        self.refresh_tabs_text();
+        self.refresh_find_text();
+        self.window.request_redraw();
     }
 
     /// Save every dirty document in turn. Documents without a path get a
@@ -1879,6 +1971,7 @@ impl ApplicationHandler for App {
                 };
                 state.handle_scroll(delta_y);
             }
+            WindowEvent::DroppedFile(path) => state.handle_dropped_file(path),
             WindowEvent::RedrawRequested => {
                 state.render();
             }
