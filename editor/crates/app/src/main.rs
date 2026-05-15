@@ -181,6 +181,40 @@ fn line_ending_label(le: LineEnding) -> &'static str {
     }
 }
 
+/// Find the next char-range in `haystack` where `needle` appears, starting
+/// at or after `from`. Wraps to the beginning if nothing matches past
+/// `from`. Returns `None` for an empty needle or when no occurrence exists.
+fn find_next_occurrence(
+    haystack: &str,
+    needle: &str,
+    from: usize,
+) -> Option<std::ops::Range<usize>> {
+    if needle.is_empty() {
+        return None;
+    }
+    let hay: Vec<char> = haystack.chars().collect();
+    let nee: Vec<char> = needle.chars().collect();
+    if nee.len() > hay.len() {
+        return None;
+    }
+    let from = from.min(hay.len());
+    let mut i = from;
+    while i + nee.len() <= hay.len() {
+        if hay[i..i + nee.len()] == nee[..] {
+            return Some(i..i + nee.len());
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while j + nee.len() <= from {
+        if hay[j..j + nee.len()] == nee[..] {
+            return Some(j..j + nee.len());
+        }
+        j += 1;
+    }
+    None
+}
+
 /// Build a copy of `text` with every space replaced by a middle dot and
 /// every tab by a rightwards-arrow. Both replacements are single chars, so
 /// char indices in the buffer line up exactly with char indices in the
@@ -755,6 +789,21 @@ impl State {
                 }
                 return;
             }
+            // Cmd-Alt-Up / Cmd-Alt-Down add a caret one line above / below
+            // the primary, at the same column. Matches VSCode.
+            if self.modifiers.alt_key() {
+                match &event.logical_key {
+                    Key::Named(NamedKey::ArrowUp) => {
+                        self.add_cursor_above();
+                        return;
+                    }
+                    Key::Named(NamedKey::ArrowDown) => {
+                        self.add_cursor_below();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             if let Key::Character(c) = &event.logical_key {
                 let lower = c.to_lowercase();
                 let alt = self.modifiers.alt_key();
@@ -800,7 +849,15 @@ impl State {
                         return;
                     }
                     "d" => {
-                        self.add_next_occurrence();
+                        if self.modifiers.shift_key() {
+                            self.skip_to_next_occurrence();
+                        } else {
+                            self.add_next_occurrence();
+                        }
+                        return;
+                    }
+                    "k" => {
+                        self.collapse_selection_to_primary();
                         return;
                     }
                     _ => {}
@@ -818,6 +875,11 @@ impl State {
 
         let mut text_changed = true;
         let handled = match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.collapse_selection_to_primary();
+                text_changed = false;
+                true
+            }
             Key::Named(NamedKey::Backspace) => {
                 self.doc_mut().editor.backspace();
                 true
@@ -1085,45 +1147,115 @@ impl State {
                 .editor
                 .set_selection(Selection::new(start, end));
         } else {
-            let needle: String = {
-                let buffer = self.doc().editor.buffer();
-                buffer.slice(primary.start()..primary.end())
-            };
-            let haystack = self.doc().editor.text();
-            let hay: Vec<char> = haystack.chars().collect();
-            let nee: Vec<char> = needle.chars().collect();
-            if nee.is_empty() || nee.len() > hay.len() {
-                return;
-            }
-            let from = primary.end();
-            let mut i = from;
-            let mut found = None;
-            while i + nee.len() <= hay.len() {
-                if hay[i..i + nee.len()] == nee[..] {
-                    found = Some(i);
-                    break;
-                }
-                i += 1;
-            }
-            // Wrap to start of buffer if no later match.
-            if found.is_none() {
-                let mut j = 0;
-                while j + nee.len() <= from {
-                    if hay[j..j + nee.len()] == nee[..] {
-                        found = Some(j);
-                        break;
-                    }
-                    j += 1;
-                }
-            }
-            let Some(start) = found else {
+            let needle: String = self
+                .doc()
+                .editor
+                .buffer()
+                .slice(primary.start()..primary.end());
+            let Some(range) =
+                find_next_occurrence(&self.doc().editor.text(), &needle, primary.end())
+            else {
                 return;
             };
             self.doc_mut()
                 .editor
-                .add_selection(Selection::new(start, start + nee.len()));
+                .add_selection(Selection::new(range.start, range.end));
         }
         self.text_dirty = false;
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.window.request_redraw();
+    }
+
+    /// Jump the primary caret to the next occurrence of its currently-
+    /// selected text, *without* keeping the old position as another cursor.
+    /// Useful when Cmd-D would have added a false positive that the user
+    /// wants to skip over. Wraps past the end of the buffer.
+    fn skip_to_next_occurrence(&mut self) {
+        let primary = self.doc().editor.selections().primary();
+        if primary.is_cursor() {
+            return;
+        }
+        let needle: String = self
+            .doc()
+            .editor
+            .buffer()
+            .slice(primary.start()..primary.end());
+        let Some(range) = find_next_occurrence(&self.doc().editor.text(), &needle, primary.end())
+        else {
+            return;
+        };
+        self.doc_mut()
+            .editor
+            .set_selection(Selection::new(range.start, range.end));
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.window.request_redraw();
+    }
+
+    /// Add a caret on the line above the primary at the same column.
+    /// No-op when the primary is already on the first line; clamps the
+    /// column to the new line's length.
+    fn add_cursor_above(&mut self) {
+        self.add_cursor_vertical(true);
+    }
+
+    /// Add a caret on the line below the primary at the same column.
+    fn add_cursor_below(&mut self) {
+        self.add_cursor_vertical(false);
+    }
+
+    fn add_cursor_vertical(&mut self, up: bool) {
+        let head = self.doc().editor.selections().primary().head;
+        let pos = self.doc().editor.buffer().char_to_position(head);
+        let buffer = self.doc().editor.buffer();
+        let new_line = if up {
+            if pos.line == 0 {
+                return;
+            }
+            pos.line - 1
+        } else {
+            let next = pos.line + 1;
+            if next >= buffer.len_lines() {
+                return;
+            }
+            next
+        };
+        let line_len = buffer
+            .line(new_line)
+            .map(|s| {
+                s.trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .chars()
+                    .count()
+            })
+            .unwrap_or(0);
+        let col = pos.column.min(line_len);
+        let Some(char_idx) = buffer.position_to_char(Position::new(new_line, col)) else {
+            return;
+        };
+        self.doc_mut()
+            .editor
+            .add_selection(Selection::cursor(char_idx));
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.window.request_redraw();
+    }
+
+    /// Esc / Cmd-K behavior: drop every cursor except the primary; if the
+    /// primary is a real range, collapse it to a cursor at the head.
+    fn collapse_selection_to_primary(&mut self) {
+        let multi = self.doc().editor.selections().has_multiple();
+        let primary = self.doc().editor.selections().primary();
+        if multi {
+            self.doc_mut().editor.collapse_to_primary();
+        } else if !primary.is_cursor() {
+            self.doc_mut()
+                .editor
+                .set_selection(Selection::cursor(primary.head));
+        } else {
+            return;
+        }
         self.scene_dirty = true;
         self.follow_caret = true;
         self.window.request_redraw();
