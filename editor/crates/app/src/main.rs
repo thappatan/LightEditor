@@ -242,6 +242,10 @@ impl State {
                     self.open_file_dialog();
                     return;
                 }
+                if c.as_str().eq_ignore_ascii_case("n") {
+                    self.new_file();
+                    return;
+                }
             }
         }
 
@@ -358,6 +362,9 @@ impl State {
     /// editor. The user can cancel; on read failure we log and keep the
     /// current buffer.
     fn open_file_dialog(&mut self) {
+        if !self.confirm_unsaved("Open") {
+            return;
+        }
         let Some(path) = rfd::FileDialog::new().pick_file() else {
             return;
         };
@@ -386,6 +393,55 @@ impl State {
             base
         };
         self.window.set_title(&title);
+    }
+
+    /// Reset the buffer to a blank scratch one with no file path. Asks first
+    /// if the current buffer has unsaved changes.
+    fn new_file(&mut self) {
+        if !self.confirm_unsaved("New file") {
+            return;
+        }
+        self.editor = Editor::from("");
+        self.file_path = None;
+        self.scroll_y = 0.0;
+        self.dirty = false;
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = false;
+        self.update_title();
+        self.window.request_redraw();
+    }
+
+    /// If the buffer is dirty, ask the user what to do. Returns `true` if the
+    /// caller may proceed (saved or discarded), `false` if it must abort
+    /// (Cancel, or a Save As that was cancelled / failed). Clean buffers
+    /// always return `true`.
+    fn confirm_unsaved(&mut self, reason: &str) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        let name = self
+            .file_path
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "this buffer".to_string());
+        let result = rfd::MessageDialog::new()
+            .set_title(format!("{reason}: unsaved changes"))
+            .set_description(format!("{name} has unsaved changes. Save them first?"))
+            .set_level(rfd::MessageLevel::Warning)
+            .set_buttons(rfd::MessageButtons::YesNoCancel)
+            .show();
+        match result {
+            rfd::MessageDialogResult::Yes => {
+                self.save_to_file();
+                // Save As dialog may have been cancelled, or write may have
+                // failed — both leave `dirty` true.
+                !self.dirty
+            }
+            rfd::MessageDialogResult::No => true, // discard
+            _ => false,                           // Cancel / closed dialog
+        }
     }
 
     /// Pointer moved. During a drag, extend the selection from the drag anchor
@@ -830,8 +886,10 @@ impl ApplicationHandler for App {
         };
         match event {
             WindowEvent::CloseRequested => {
-                log::info!("close requested — exiting");
-                event_loop.exit();
+                if state.confirm_unsaved("Close") {
+                    log::info!("close requested — exiting");
+                    event_loop.exit();
+                }
             }
             WindowEvent::Resized(size) => state.resize(size),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
