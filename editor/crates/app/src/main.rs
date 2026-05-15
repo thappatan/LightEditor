@@ -1206,16 +1206,37 @@ impl State {
     }
 
     fn add_cursor_vertical(&mut self, up: bool) {
-        let head = self.doc().editor.selections().primary().head;
-        let pos = self.doc().editor.buffer().char_to_position(head);
-        let buffer = self.doc().editor.buffer();
+        let editor = &self.doc().editor;
+        let buffer = editor.buffer();
+        // Stack from the *extreme* current cursor in the requested
+        // direction, not the primary — pressing Cmd-Alt-↓ N times should
+        // add N cursors below, not the same line N times. The primary's
+        // column anchors the stack so wandering caret positions don't
+        // drift the column from press to press.
+        let target_col = buffer
+            .char_to_position(editor.selections().primary().head)
+            .column;
+        let extreme_line = editor
+            .selections()
+            .iter()
+            .map(|s| buffer.char_to_position(s.head).line)
+            .fold(None, |acc: Option<usize>, line| {
+                Some(match acc {
+                    None => line,
+                    Some(prev) if up => prev.min(line),
+                    Some(prev) => prev.max(line),
+                })
+            });
+        let Some(extreme_line) = extreme_line else {
+            return;
+        };
         let new_line = if up {
-            if pos.line == 0 {
+            if extreme_line == 0 {
                 return;
             }
-            pos.line - 1
+            extreme_line - 1
         } else {
-            let next = pos.line + 1;
+            let next = extreme_line + 1;
             if next >= buffer.len_lines() {
                 return;
             }
@@ -1230,7 +1251,7 @@ impl State {
                     .count()
             })
             .unwrap_or(0);
-        let col = pos.column.min(line_len);
+        let col = target_col.min(line_len);
         let Some(char_idx) = buffer.position_to_char(Position::new(new_line, col)) else {
             return;
         };
