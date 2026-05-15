@@ -9,6 +9,7 @@
 // Still missing for a "real" editor: multiple buffers/panes, a proper widget
 // tree, find/replace, the file tree. Those are later M1 work.
 
+mod find;
 mod palette;
 
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{Color, Resolution, TextArea, TextBounds};
 use editor_ui_text::TextStack;
+use find::FindBar;
 use palette::{Command, CommandPalette};
 use wgpu::{
     LoadOp, Operations, RenderPassColorAttachment, RenderPassDescriptor, StoreOp,
@@ -50,6 +52,11 @@ const PALETTE_WIDTH_DIP: f32 = 600.0;
 const PALETTE_TOP_DIP: f32 = 80.0;
 /// Padding inside the palette panel, in logical pixels.
 const PALETTE_PAD_DIP: f32 = 12.0;
+
+/// Find-bar overlay dimensions (single-row), in logical pixels.
+const FIND_WIDTH_DIP: f32 = 480.0;
+const FIND_TOP_DIP: f32 = 16.0;
+const FIND_PAD_DIP: f32 = 8.0;
 
 /// A spaces-per-tab stand-in until config lands.
 const TAB_AS_SPACES: &str = "    ";
@@ -140,6 +147,11 @@ struct State {
     /// independently of the buffer.
     palette_text: TextStack,
 
+    /// Find-bar state when the bar is visible.
+    find: Option<FindBar>,
+    /// Third TextStack for the find-bar caption ("Find: query   3/12").
+    find_text: TextStack,
+
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
     /// Rolling 1-second frame-time window (spec §8).
@@ -183,6 +195,11 @@ impl State {
             scale,
             "",
         );
+
+        // Find-bar TextStack, same reasoning — single-row caption.
+        let find_width = (FIND_WIDTH_DIP - 2.0 * FIND_PAD_DIP) * scale;
+        let find_text =
+            TextStack::new(&gpu.device, &gpu.queue, gpu.format(), find_width, scale, "");
         let scene = Scene::new(SceneNode::group(Rect::new(
             0.0,
             0.0,
@@ -212,6 +229,8 @@ impl State {
             dirty: false,
             palette: None,
             palette_text,
+            find: None,
+            find_text,
             pending_keystroke: None,
             frame_count: 0,
             last_report: Instant::now(),
@@ -250,10 +269,13 @@ impl State {
         self.text_padding = TEXT_PADDING_DIP * scale;
         self.caret_width = CARET_WIDTH_DIP * scale;
         self.text.set_scale(scale);
-        // Palette has its own TextStack — keep its metrics + wrap width in sync.
+        // Overlays have their own TextStacks — keep them in sync too.
         self.palette_text.set_scale(scale);
-        let palette_width = (PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale;
-        self.palette_text.set_width(palette_width);
+        self.palette_text
+            .set_width((PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale);
+        self.find_text.set_scale(scale);
+        self.find_text
+            .set_width((FIND_WIDTH_DIP - 2.0 * FIND_PAD_DIP) * scale);
         self.text_dirty = true;
         self.scene_dirty = true;
         self.window.request_redraw();
@@ -290,6 +312,14 @@ impl State {
         // e.g. Cmd-S doesn't also try to insert "s".
         if is_cmd_or_ctrl(self.modifiers) {
             if let Key::Character(c) = &event.logical_key {
+                if c.as_str().eq_ignore_ascii_case("f") {
+                    if self.find.is_some() {
+                        self.close_find();
+                    } else {
+                        self.open_find();
+                    }
+                    return;
+                }
                 if c.as_str().eq_ignore_ascii_case("s") {
                     self.save_to_file();
                     return;
@@ -303,6 +333,12 @@ impl State {
                     return;
                 }
             }
+        }
+
+        // When the find bar is open it captures every other key.
+        if self.find.is_some() {
+            self.handle_find_key(event);
+            return;
         }
 
         let shift = self.modifiers.shift_key();
@@ -366,6 +402,14 @@ impl State {
             if text_changed && !self.dirty {
                 self.dirty = true;
                 self.update_title();
+            }
+            // If the find bar is open, the match list now reflects the old text.
+            if text_changed && self.find.is_some() {
+                let buffer_text = self.editor.text();
+                if let Some(f) = self.find.as_mut() {
+                    f.refresh(&buffer_text);
+                }
+                self.refresh_find_text();
             }
             self.pending_keystroke = Some(Instant::now());
             self.window.request_redraw();
@@ -615,6 +659,133 @@ impl State {
         ))
     }
 
+    // ── find bar ───────────────────────────────────────────────────────────
+
+    /// Open the find bar with an empty query.
+    fn open_find(&mut self) {
+        self.find = Some(FindBar::new());
+        self.refresh_find_text();
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Close the find bar (without changing the selection).
+    fn close_find(&mut self) {
+        self.find = None;
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Rebuild the find bar's caption "Find: query   3/12 / no matches".
+    fn refresh_find_text(&mut self) {
+        let Some(find) = self.find.as_ref() else {
+            return;
+        };
+        let count = find.match_count();
+        let suffix = if count == 0 {
+            "no matches".to_string()
+        } else {
+            format!("{}/{}", find.current_index() + 1, count)
+        };
+        let caption = format!("Find: {}   {}", find.query(), suffix);
+        self.find_text.set_content(&caption);
+    }
+
+    /// Move the editor selection to the find bar's current match, so the
+    /// caret follows along (and the regular caret-follow scrolls it in).
+    fn select_current_match(&mut self) {
+        let Some(range) = self.find.as_ref().and_then(|f| f.current_match()) else {
+            return;
+        };
+        self.editor
+            .set_selection(Selection::new(range.start, range.end));
+        self.scene_dirty = true;
+        self.follow_caret = true;
+    }
+
+    /// Route a key while the find bar is open.
+    fn handle_find_key(&mut self, event: KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_find(),
+            Key::Named(NamedKey::Enter) => {
+                if self.modifiers.shift_key() {
+                    if let Some(f) = self.find.as_mut() {
+                        f.prev_match();
+                    }
+                } else if let Some(f) = self.find.as_mut() {
+                    f.next_match();
+                }
+                self.refresh_find_text();
+                self.select_current_match();
+                self.scene_dirty = true;
+                self.window.request_redraw();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                let text = self.editor.text();
+                if let Some(f) = self.find.as_mut() {
+                    f.backspace(&text);
+                }
+                self.refresh_find_text();
+                self.select_current_match();
+                self.scene_dirty = true;
+                self.window.request_redraw();
+            }
+            _ => {
+                if is_cmd_or_ctrl(self.modifiers) {
+                    return;
+                }
+                if let Some(text) = &event.text {
+                    let buffer_text = self.editor.text();
+                    if let Some(f) = self.find.as_mut() {
+                        for c in text.chars() {
+                            f.push_char(c, &buffer_text);
+                        }
+                    }
+                    self.refresh_find_text();
+                    self.select_current_match();
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// The find bar's backdrop rectangle.
+    fn find_panel_rect(&self) -> Rect {
+        let pad = FIND_PAD_DIP * self.scale;
+        let width = FIND_WIDTH_DIP * self.scale;
+        let top = FIND_TOP_DIP * self.scale;
+        let height = self.line_height() + 2.0 * pad;
+        let surface_w = self.gpu.surface_config.width as f32;
+        // Right-aligned with a margin so it doesn't sit on top of the caret.
+        let left = surface_w - width - FIND_TOP_DIP * self.scale;
+        Rect::new(left.max(0.0), top, width, height)
+    }
+
+    /// Where the find bar's caption is drawn.
+    fn find_text_origin(&self) -> (f32, f32) {
+        let panel = self.find_panel_rect();
+        let pad = FIND_PAD_DIP * self.scale;
+        (panel.min_x() + pad, panel.min_y() + pad)
+    }
+
+    /// Highlight rectangles for every match the find bar found, in the
+    /// editor's coordinate system. Current match is omitted — the regular
+    /// selection highlight already covers it (and a brighter overlay is
+    /// added separately in `rebuild_scene`).
+    fn match_highlight_rects(&self) -> Vec<Rect> {
+        let Some(find) = self.find.as_ref() else {
+            return Vec::new();
+        };
+        let current = find.current_index();
+        find.matches()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != current)
+            .flat_map(|(_, r)| self.selection_rects(&Selection::new(r.start, r.end)))
+            .collect()
+    }
+
     /// Reset the buffer to a blank scratch one with no file path. Asks first
     /// if the current buffer has unsaved changes.
     fn new_file(&mut self) {
@@ -794,6 +965,22 @@ impl State {
                     SceneColor::rgb(120, 160, 255),
                 ));
             }
+        }
+
+        // Find-bar match highlights sit *behind* the editor's own selection
+        // highlight + caret so the current hit (which is the active selection)
+        // stays visually dominant.
+        for rect in self.match_highlight_rects() {
+            root.push_child(SceneNode::quad(rect, SceneColor::rgba(255, 200, 60, 64)));
+        }
+
+        // Find bar itself — a single-row panel near the top, on top of the
+        // editor surface.
+        if self.find.is_some() {
+            root.push_child(SceneNode::quad(
+                self.find_panel_rect(),
+                SceneColor::rgba(38, 38, 48, 240),
+            ));
         }
 
         // Palette overlay sits on top of everything else — a dim scrim over
@@ -1007,6 +1194,44 @@ impl State {
             )
             .expect("text prepare failed");
 
+        // Find bar caption — its own TextStack.
+        let find_open = self.find.is_some();
+        if find_open {
+            let (fx, fy) = self.find_text_origin();
+            self.find_text.viewport.update(
+                &self.gpu.queue,
+                Resolution {
+                    width: self.gpu.surface_config.width,
+                    height: self.gpu.surface_config.height,
+                },
+            );
+            self.find_text
+                .renderer
+                .prepare(
+                    &self.gpu.device,
+                    &self.gpu.queue,
+                    &mut self.find_text.font_system,
+                    &mut self.find_text.atlas,
+                    &self.find_text.viewport,
+                    [TextArea {
+                        buffer: &self.find_text.buffer,
+                        left: fx,
+                        top: fy,
+                        scale: 1.0,
+                        bounds: TextBounds {
+                            left: 0,
+                            top: 0,
+                            right: self.gpu.surface_config.width as i32,
+                            bottom: self.gpu.surface_config.height as i32,
+                        },
+                        default_color: Color::rgb(238, 238, 238),
+                        custom_glyphs: &[],
+                    }],
+                    &mut self.find_text.swash_cache,
+                )
+                .expect("find text prepare failed");
+        }
+
         // Palette text overlay — its own TextStack so it shapes independently.
         let palette_open = self.palette.is_some();
         if palette_open {
@@ -1072,13 +1297,19 @@ impl State {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            // Editor quads (highlights, carets, palette backdrop) first; then
-            // editor text; then palette text on top of everything.
+            // Editor quads first (highlights, carets, find/palette underlays
+            // + panels); then editor text; then overlay text on top.
             self.quads.render(&mut pass);
             self.text
                 .renderer
                 .render(&self.text.atlas, &self.text.viewport, &mut pass)
                 .expect("text render failed");
+            if find_open {
+                self.find_text
+                    .renderer
+                    .render(&self.find_text.atlas, &self.find_text.viewport, &mut pass)
+                    .expect("find text render failed");
+            }
             if palette_open {
                 self.palette_text
                     .renderer
@@ -1095,6 +1326,9 @@ impl State {
         self.text.atlas.trim();
         if palette_open {
             self.palette_text.atlas.trim();
+        }
+        if find_open {
+            self.find_text.atlas.trim();
         }
 
         self.last_frame_us = frame_start.elapsed().as_micros();
