@@ -16,6 +16,7 @@ pub enum Command {
     OpenFile,
     SaveFile,
     SaveFileAs,
+    SaveAll,
 }
 
 impl Command {
@@ -26,6 +27,7 @@ impl Command {
             Command::OpenFile => "Open File…",
             Command::SaveFile => "Save",
             Command::SaveFileAs => "Save As…",
+            Command::SaveAll => "Save All",
         }
     }
 }
@@ -36,6 +38,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::OpenFile,
     Command::SaveFile,
     Command::SaveFileAs,
+    Command::SaveAll,
 ];
 
 /// The popup's state.

@@ -457,7 +457,11 @@ impl State {
                         return;
                     }
                     "s" => {
-                        self.save_to_file();
+                        if self.modifiers.alt_key() {
+                            self.save_all();
+                        } else {
+                            self.save_to_file();
+                        }
                         return;
                     }
                     "o" => {
@@ -936,7 +940,34 @@ impl State {
             Command::OpenFile => self.open_file_dialog(),
             Command::SaveFile => self.save_to_file(),
             Command::SaveFileAs => self.save_as(),
+            Command::SaveAll => self.save_all(),
         }
+    }
+
+    /// Save every dirty document in turn. Documents without a path get a
+    /// Save As dialog each; the user may cancel any one of them, in which
+    /// case that document stays dirty and the rest still get saved. After
+    /// the walk we return to the document the user was on.
+    fn save_all(&mut self) {
+        let original_active = self.active;
+        for i in 0..self.docs.len() {
+            if !self.docs[i].dirty {
+                continue;
+            }
+            if i != self.active {
+                self.active = i;
+            }
+            self.save_to_file();
+        }
+        if original_active < self.docs.len() {
+            self.active = original_active;
+        }
+        self.update_title();
+        self.refresh_tabs_text();
+        self.refresh_find_text();
+        self.scene_dirty = true;
+        self.text_dirty = true;
+        self.window.request_redraw();
     }
 
     /// Save As: always prompt for a path, even if the buffer already has one.
