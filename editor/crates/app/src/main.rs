@@ -60,13 +60,25 @@ const WINDOW_HEIGHT: u32 = 720;
 /// Horizontal inset of the text block from the window's left edge, in logical
 /// pixels. Multiplied by the window scale factor to get physical pixels.
 const TEXT_INSET_DIP: f32 = 28.0;
-/// Total horizontal padding (inset on both sides), in logical pixels.
-const TEXT_PADDING_DIP: f32 = 2.0 * TEXT_INSET_DIP;
 /// Gap between the bottom of the tab strip and the top of the editor text,
 /// in logical pixels.
 const TEXT_TOP_GAP_DIP: f32 = 8.0;
 /// Caret width, in logical pixels.
 const CARET_WIDTH_DIP: f32 = 2.0;
+
+/// Gutter dimensions, in logical pixels. The gutter sits between the
+/// window's left edge and the editor text, showing right-aligned line
+/// numbers. Fixed digit width for v1 — files over 9999 lines spill past
+/// the reserved area but stay readable.
+const GUTTER_DIGITS: usize = 4;
+/// Margin between the window's left edge and the first digit, in logical pixels.
+const GUTTER_PAD_LEFT_DIP: f32 = 12.0;
+/// Gap between the gutter and the start of the editor text, in logical pixels.
+const GUTTER_PAD_RIGHT_DIP: f32 = 12.0;
+/// Monospace digit advance as a fraction of font size. Tuned for the
+/// `Family::Monospace` fallback our platform stack picks — close enough that
+/// the right-aligned numbers line up under each other.
+const MONOSPACE_CHAR_FACTOR: f32 = 0.6;
 
 /// Status-bar dimensions, in logical pixels. The bar sits at the very bottom
 /// of the window and is opaque, so the editor viewport stops above it.
@@ -182,6 +194,15 @@ fn shaped_width(stack: &TextStack) -> f32 {
         .fold(0.0_f32, f32::max)
 }
 
+/// Total gutter width in physical pixels, including the outer paddings.
+/// Approximated from `font_size_pt × scale × MONOSPACE_CHAR_FACTOR`, which
+/// is close enough to the real digit advance that the right-aligned numbers
+/// line up under each other for ASCII content.
+fn gutter_outer_width(font_size_pt: f32, scale: f32) -> f32 {
+    let char_w = font_size_pt * MONOSPACE_CHAR_FACTOR * scale;
+    (GUTTER_PAD_LEFT_DIP + GUTTER_PAD_RIGHT_DIP) * scale + GUTTER_DIGITS as f32 * char_w
+}
+
 /// A window title showing the file name when one is open, or the welcome
 /// label otherwise.
 fn window_title(path: Option<&Path>) -> String {
@@ -247,13 +268,21 @@ struct State {
     /// via a measurement of its shaped width so the right edge sits one
     /// `STATUS_PAD_X_DIP` from the window edge.
     status_right: TextStack,
+    /// Gutter TextStack — right-aligned line numbers, one per buffer line.
+    /// Reshape happens lazily: only when the line count changes or the
+    /// active document switches.
+    gutter_text: TextStack,
+    /// Line count the gutter was last reshaped for. Tracking this avoids
+    /// reshaping N digits/newlines on every keystroke.
+    gutter_lines: usize,
 
     /// The scene rebuilt from `editor` whenever it changes.
     scene: Scene,
 
     /// Window scale factor; physical = logical * scale.
     scale: f32,
-    /// `TEXT_INSET_DIP × scale` — left/right inset of the text block.
+    /// Left edge of the editor text in physical pixels. Includes the
+    /// gutter's outer width — text starts to its right.
     text_inset_x: f32,
     /// `(TAB_BAR_HEIGHT_DIP + TEXT_TOP_GAP_DIP) × scale` — top of the text
     /// block, accounting for the tab strip.
@@ -341,7 +370,11 @@ impl State {
         // through the single `prepare`/`render` call in `Self::render`.
         let text_gpu = TextGpu::new(&gpu.device, &gpu.queue, gpu.format());
 
-        let text_padding = TEXT_PADDING_DIP * scale;
+        // The gutter occupies the editor's left inset; the text's effective
+        // left padding is the gutter's outer width.
+        let gutter_width = gutter_outer_width(font_size_pt, scale);
+        let right_pad = TEXT_INSET_DIP * scale;
+        let text_padding = gutter_width + right_pad;
         let text = TextStack::new(
             &mut font_system,
             size.width as f32 - text_padding,
@@ -419,6 +452,16 @@ impl State {
             "",
         );
 
+        // Gutter TextStack — single column, no wrap.
+        let gutter_text = TextStack::new(
+            &mut font_system,
+            gutter_width,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "",
+        );
+
         let scene = Scene::new(SceneNode::group(Rect::new(
             0.0,
             0.0,
@@ -440,9 +483,11 @@ impl State {
             close_text,
             status_left,
             status_right,
+            gutter_text,
+            gutter_lines: 0,
             scene,
             scale,
-            text_inset_x: TEXT_INSET_DIP * scale,
+            text_inset_x: gutter_width,
             text_inset_y: (TAB_BAR_HEIGHT_DIP + TEXT_TOP_GAP_DIP) * scale,
             text_padding,
             caret_width: CARET_WIDTH_DIP * scale,
@@ -511,12 +556,16 @@ impl State {
             return;
         }
         self.scale = scale;
-        self.text_inset_x = TEXT_INSET_DIP * scale;
+        let font_size_pt = self.text.font_size_pt();
+        let gutter_width = gutter_outer_width(font_size_pt, scale);
+        self.text_inset_x = gutter_width;
         self.text_inset_y = (TAB_BAR_HEIGHT_DIP + TEXT_TOP_GAP_DIP) * scale;
-        self.text_padding = TEXT_PADDING_DIP * scale;
+        self.text_padding = gutter_width + TEXT_INSET_DIP * scale;
         self.caret_width = CARET_WIDTH_DIP * scale;
+        let surface_w = self.gpu.surface_config.width as f32;
         let fs = &mut self.font_system;
         self.text.set_scale(fs, scale);
+        self.text.set_width(fs, surface_w - self.text_padding);
         self.palette_text.set_scale(fs, scale);
         self.palette_text
             .set_width(fs, (PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale);
@@ -524,15 +573,18 @@ impl State {
         self.find_text
             .set_width(fs, (FIND_WIDTH_DIP - 2.0 * FIND_PAD_DIP) * scale);
         self.tabs_text.set_scale(fs, scale);
-        self.tabs_text
-            .set_width(fs, self.gpu.surface_config.width as f32);
+        self.tabs_text.set_width(fs, surface_w);
         self.close_text.set_scale(fs, scale);
         self.close_text.set_width(fs, TAB_CLOSE_W_DIP * scale);
-        let status_width = self.gpu.surface_config.width as f32 - 2.0 * STATUS_PAD_X_DIP * scale;
+        let status_width = surface_w - 2.0 * STATUS_PAD_X_DIP * scale;
         self.status_left.set_scale(fs, scale);
         self.status_left.set_width(fs, status_width);
         self.status_right.set_scale(fs, scale);
         self.status_right.set_width(fs, status_width);
+        self.gutter_text.set_scale(fs, scale);
+        self.gutter_text.set_width(fs, gutter_width);
+        // Gutter line count is fine; the cached `gutter_lines` is still
+        // valid (we're just rescaling existing shaped content).
         self.text_dirty = true;
         self.scene_dirty = true;
         self.window.request_redraw();
@@ -551,6 +603,15 @@ impl State {
         self.close_text.set_font_size(fs, font, lh);
         self.status_left.set_font_size(fs, font, lh);
         self.status_right.set_font_size(fs, font, lh);
+        self.gutter_text.set_font_size(fs, font, lh);
+        // Gutter width depends on font size — recompute and reflow the
+        // editor's wrap width accordingly.
+        let gutter_width = gutter_outer_width(font, self.scale);
+        self.text_inset_x = gutter_width;
+        self.text_padding = gutter_width + TEXT_INSET_DIP * self.scale;
+        let surface_w = self.gpu.surface_config.width as f32;
+        self.text.set_width(fs, surface_w - self.text_padding);
+        self.gutter_text.set_width(fs, gutter_width);
         self.tab_spaces = " ".repeat(settings.editor.tab_size);
         self.set_status_flash(format!(
             "settings reloaded · font {font} · line {lh} · tab {}",
@@ -761,7 +822,8 @@ impl State {
     }
 
     /// Left-button press: tab-strip click switches tabs (or closes the tab
-    /// when the press lands on its "×"); below the strip it places a caret
+    /// when the press lands on its "×"); gutter click selects the whole
+    /// logical line; below the strip in the editor area it places a caret
     /// and starts a potential drag.
     fn handle_mouse_press(&mut self) {
         let Some((mx, my)) = self.mouse_pos else {
@@ -775,6 +837,10 @@ impl State {
             self.switch_tab(idx);
             return;
         }
+        if self.in_gutter(mx, my) {
+            self.select_line_at_pixel(my);
+            return;
+        }
         let Some(char_idx) = self.char_at_pixel(mx, my) else {
             return;
         };
@@ -782,6 +848,41 @@ impl State {
         self.doc_mut()
             .editor
             .set_selection(Selection::cursor(char_idx));
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.window.request_redraw();
+    }
+
+    /// Is the physical-pixel point inside the gutter strip?
+    fn in_gutter(&self, x: f32, y: f32) -> bool {
+        let bottom = self.gpu.surface_config.height as f32 - STATUS_BAR_HEIGHT_DIP * self.scale;
+        x >= 0.0 && x < self.text_inset_x && y >= self.text_inset_y && y < bottom
+    }
+
+    /// Select the logical line under `y`. Reuses the editor's shaped layout
+    /// to find which line the click landed on so wraps map correctly. The
+    /// selection covers the line content plus its trailing newline.
+    fn select_line_at_pixel(&mut self, y: f32) {
+        let ty = y - self.text_inset_y + self.doc().scroll_y;
+        // Dummy x inside the editor area so `hit` always returns Some.
+        let line = match self.text.buffer.hit(1.0, ty) {
+            Some(c) => c.line,
+            None => return,
+        };
+        let buffer = self.doc().editor.buffer();
+        let Some(start) = buffer.position_to_char(Position::new(line, 0)) else {
+            return;
+        };
+        let end = if line + 1 < buffer.len_lines() {
+            buffer
+                .position_to_char(Position::new(line + 1, 0))
+                .unwrap_or(start)
+        } else {
+            buffer.len_chars()
+        };
+        self.doc_mut()
+            .editor
+            .set_selection(Selection::new(start, end));
         self.scene_dirty = true;
         self.follow_caret = true;
         self.window.request_redraw();
@@ -945,6 +1046,9 @@ impl State {
         self.active = idx;
         self.text_dirty = true;
         self.scene_dirty = true;
+        // No need to invalidate `gutter_lines` — the cache is keyed on
+        // line count, not document identity, and "1..N" is the same shape
+        // regardless of which document has N lines.
         // Keep the new tab's stored scroll position rather than recentering.
         self.follow_caret = false;
         self.update_title();
@@ -1050,6 +1154,26 @@ impl State {
         let surface_h = self.gpu.surface_config.height as f32;
         let h = STATUS_BAR_HEIGHT_DIP * self.scale;
         Rect::new(0.0, surface_h - h, surface_w, h)
+    }
+
+    /// Re-shape the gutter to cover every buffer line. A no-op when the
+    /// line count is unchanged since the last refresh — typing within an
+    /// existing line doesn't reshape thousands of digits.
+    fn refresh_gutter(&mut self) {
+        use std::fmt::Write;
+        let lines = self.doc().editor.buffer().len_lines();
+        if lines == self.gutter_lines {
+            return;
+        }
+        let mut s = String::with_capacity(lines * (GUTTER_DIGITS + 1));
+        for n in 1..=lines {
+            if n > 1 {
+                s.push('\n');
+            }
+            let _ = write!(s, "{:>width$}", n, width = GUTTER_DIGITS);
+        }
+        self.gutter_text.set_content(&mut self.font_system, &s);
+        self.gutter_lines = lines;
     }
 
     /// Re-shape both halves of the status bar.
@@ -1721,6 +1845,33 @@ impl State {
             }
         }
 
+        // Gutter backdrop — a slim column on the left, slightly darker than
+        // the editor surface so the line numbers read as belonging to a
+        // chrome region rather than the buffer.
+        let gutter_h = (h - self.text_inset_y - STATUS_BAR_HEIGHT_DIP * self.scale).max(0.0);
+        root.push_child(SceneNode::quad(
+            Rect::new(0.0, self.text_inset_y, self.text_inset_x, gutter_h),
+            SceneColor::rgba(14, 14, 20, 255),
+        ));
+
+        // Active line backdrop — a faint full-width row at every visual run
+        // of the logical line where the primary caret sits. Behind the
+        // selection so the selection's brighter blue still reads.
+        let active_logical = {
+            let head = self.doc().editor.selections().primary().head;
+            self.doc().editor.buffer().char_to_position(head).line
+        };
+        let scroll = self.doc().scroll_y;
+        let line_h = self.line_height();
+        let active_color = SceneColor::rgba(255, 255, 255, 12);
+        for run in self.text.buffer.layout_runs() {
+            if run.line_i != active_logical {
+                continue;
+            }
+            let y = self.text_inset_y + run.line_top - scroll;
+            root.push_child(SceneNode::quad(Rect::new(0.0, y, w, line_h), active_color));
+        }
+
         // Selection highlights sit behind text and carets.
         for selection in self.doc().editor.selections().iter() {
             for rect in self.selection_rects(selection) {
@@ -1729,8 +1880,6 @@ impl State {
         }
 
         // Carets on top of the highlights.
-        let line_height = self.line_height();
-        let scroll = self.doc().scroll_y;
         for selection in self.doc().editor.selections().iter() {
             if let Some((cx, cy)) = self.caret_pixel(selection.head) {
                 root.push_child(SceneNode::quad(
@@ -1738,7 +1887,7 @@ impl State {
                         self.text_inset_x + cx,
                         self.text_inset_y + cy - scroll,
                         self.caret_width,
-                        line_height,
+                        line_h,
                     ),
                     SceneColor::rgb(120, 160, 255),
                 ));
@@ -1908,6 +2057,7 @@ impl State {
                 self.ensure_caret_visible();
                 self.follow_caret = false;
             }
+            self.refresh_gutter();
             self.refresh_status();
             self.rebuild_scene();
             self.scene_dirty = false;
@@ -1953,6 +2103,13 @@ impl State {
         let editor_color = Color::rgb(238, 238, 238);
         let label_color = Color::rgb(220, 220, 220);
         let dim_color = Color::rgb(180, 180, 190);
+        // The line number for the line that has the primary caret on it
+        // gets the brighter colour. Computed once here so the gutter loop
+        // can skip emitting it dim.
+        let active_line = {
+            let head = self.doc().editor.selections().primary().head;
+            self.doc().editor.buffer().char_to_position(head).line
+        };
 
         let tab_strip_h = TAB_BAR_HEIGHT_DIP * self.scale;
         let tab_text_pad_x = TAB_PAD_X_DIP * self.scale;
@@ -1999,7 +2156,18 @@ impl State {
             None
         };
 
-        let mut text_areas: Vec<TextArea> = Vec::with_capacity(6 + docs_len);
+        // Gutter line numbers are emitted one TextArea per *visible logical
+        // buffer line*. We use the editor's own layout to find each line's
+        // first visual run, then position the gutter buffer (which contains
+        // every line stacked vertically) so the matching gutter row lines
+        // up with the editor row — clip-bounds to one row hide the rest of
+        // the buffer.
+        let gutter_left = GUTTER_PAD_LEFT_DIP * self.scale;
+        let line_height = self.line_height();
+        let viewport_top = self.text_inset_y;
+        let viewport_bottom = surface_h as f32 - status_bar_h;
+
+        let mut text_areas: Vec<TextArea> = Vec::with_capacity(8 + docs_len);
         text_areas.push(TextArea {
             buffer: &self.text.buffer,
             left: inset_x,
@@ -2009,6 +2177,54 @@ impl State {
             default_color: editor_color,
             custom_glyphs: &[],
         });
+        let mut prev_logical = usize::MAX;
+        let mut active_gutter_position: Option<(f32, TextBounds)> = None;
+        for run in self.text.buffer.layout_runs() {
+            // Only the first visual run of each logical line carries a
+            // number; wrapped continuations leave the gutter blank.
+            if run.line_i == prev_logical {
+                continue;
+            }
+            prev_logical = run.line_i;
+            let row_top = inset_y + run.line_top - scroll;
+            // Skip rows entirely outside the editor viewport.
+            if row_top + line_height < viewport_top || row_top > viewport_bottom {
+                continue;
+            }
+            let area_top = row_top - run.line_i as f32 * line_height;
+            let bounds = TextBounds {
+                left: 0,
+                top: row_top.max(viewport_top) as i32,
+                right: inset_x as i32,
+                bottom: (row_top + line_height).min(viewport_bottom) as i32,
+            };
+            if run.line_i == active_line {
+                // Defer the active line to a second TextArea drawn with the
+                // brighter colour; emitting it dim too would blend.
+                active_gutter_position = Some((area_top, bounds));
+                continue;
+            }
+            text_areas.push(TextArea {
+                buffer: &self.gutter_text.buffer,
+                left: gutter_left,
+                top: area_top,
+                scale: 1.0,
+                bounds,
+                default_color: dim_color,
+                custom_glyphs: &[],
+            });
+        }
+        if let Some((area_top, bounds)) = active_gutter_position {
+            text_areas.push(TextArea {
+                buffer: &self.gutter_text.buffer,
+                left: gutter_left,
+                top: area_top,
+                scale: 1.0,
+                bounds,
+                default_color: editor_color,
+                custom_glyphs: &[],
+            });
+        }
         text_areas.push(TextArea {
             buffer: &self.tabs_text.buffer,
             left: tab_text_pad_x,
