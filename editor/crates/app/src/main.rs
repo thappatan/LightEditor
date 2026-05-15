@@ -9,6 +9,7 @@
 // Still missing for a "real" editor: multiple buffers/panes, a proper widget
 // tree, find/replace, the file tree. Those are later M1 work.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -42,6 +43,26 @@ const CARET_WIDTH_DIP: f32 = 2.0;
 
 /// A spaces-per-tab stand-in until config lands.
 const TAB_AS_SPACES: &str = "    ";
+
+/// Whether the platform's "primary" modifier (Cmd on macOS, Ctrl on
+/// Linux/Windows) is held. Used to gate shortcuts like Cmd-S.
+fn is_cmd_or_ctrl(mods: ModifiersState) -> bool {
+    mods.super_key() || mods.control_key()
+}
+
+/// A window title showing the file name when one is open, or the welcome
+/// label otherwise.
+fn window_title(path: Option<&Path>) -> String {
+    match path {
+        Some(p) => format!(
+            "LightEditor — {}",
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string())
+        ),
+        None => "LightEditor — editable surface".to_string(),
+    }
+}
 
 /// Initial buffer content — the spec §3.4 multilingual matrix doubles as a
 /// smoke test that editing keeps complex scripts intact.
@@ -96,6 +117,10 @@ struct State {
     /// The editor state changed — the scene needs rebuilding before the next frame.
     scene_dirty: bool,
 
+    /// Path the buffer was loaded from / saves to. `None` for the welcome
+    /// scratch buffer.
+    file_path: Option<PathBuf>,
+
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
     /// Rolling 1-second frame-time window (spec §8).
@@ -106,7 +131,12 @@ struct State {
 }
 
 impl State {
-    fn new(window: Arc<Window>, cold_start: Instant) -> Self {
+    fn new(
+        window: Arc<Window>,
+        cold_start: Instant,
+        initial_text: &str,
+        file_path: Option<PathBuf>,
+    ) -> Self {
         let scale = window.scale_factor() as f32;
         let size = window.inner_size();
         let gpu = GpuContext::new(window.clone());
@@ -119,9 +149,9 @@ impl State {
             gpu.format(),
             size.width as f32 - text_padding,
             scale,
-            WELCOME_TEXT,
+            initial_text,
         );
-        let editor = Editor::from(WELCOME_TEXT);
+        let editor = Editor::from(initial_text);
         let scene = Scene::new(SceneNode::group(Rect::new(
             0.0,
             0.0,
@@ -147,6 +177,7 @@ impl State {
             follow_caret: false,
             text_dirty: false,
             scene_dirty: true,
+            file_path,
             pending_keystroke: None,
             frame_count: 0,
             last_report: Instant::now(),
@@ -194,6 +225,18 @@ impl State {
         if event.state != ElementState::Pressed {
             return;
         }
+
+        // Cmd/Ctrl shortcuts — checked before regular key handling so that
+        // e.g. Cmd-S doesn't also try to insert "s".
+        if is_cmd_or_ctrl(self.modifiers) {
+            if let Key::Character(c) = &event.logical_key {
+                if c.as_str().eq_ignore_ascii_case("s") {
+                    self.save_to_file();
+                    return;
+                }
+            }
+        }
+
         let shift = self.modifiers.shift_key();
 
         let mut text_changed = true;
@@ -276,6 +319,19 @@ impl State {
     /// Left-button release: end any drag.
     fn handle_mouse_release(&mut self) {
         self.drag_anchor = None;
+    }
+
+    /// Write the buffer to `file_path`. Logs a warning and does nothing if
+    /// there is no path (Save As is a follow-up).
+    fn save_to_file(&self) {
+        let Some(path) = self.file_path.as_ref() else {
+            log::warn!("save: no file path — Save As is a follow-up");
+            return;
+        };
+        match std::fs::write(path, self.editor.text()) {
+            Ok(()) => log::info!("saved {}", path.display()),
+            Err(e) => log::error!("save failed for {}: {}", path.display(), e),
+        }
     }
 
     /// Pointer moved. During a drag, extend the selection from the drag anchor
@@ -674,13 +730,17 @@ impl State {
 
 struct App {
     cold_start: Instant,
+    initial_text: String,
+    file_path: Option<PathBuf>,
     state: Option<State>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(initial_text: String, file_path: Option<PathBuf>) -> Self {
         Self {
             cold_start: Instant::now(),
+            initial_text,
+            file_path,
             state: None,
         }
     }
@@ -692,14 +752,19 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("LightEditor — editable surface")
+            .with_title(window_title(self.file_path.as_deref()))
             .with_inner_size(PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
                 .expect("failed to create window"),
         );
-        let state = State::new(window, self.cold_start);
+        let state = State::new(
+            window,
+            self.cold_start,
+            &self.initial_text,
+            self.file_path.clone(),
+        );
         // ControlFlow::Wait only draws on demand — kick off the first frame.
         state.window.request_redraw();
         self.state = Some(state);
@@ -756,8 +821,24 @@ fn main() {
     )
     .init();
 
+    // Optional file path as the first CLI arg; falls back to the welcome
+    // scratch buffer if absent or unreadable.
+    let (initial_text, file_path) = match std::env::args().nth(1) {
+        Some(arg) => {
+            let path = PathBuf::from(arg);
+            match std::fs::read_to_string(&path) {
+                Ok(content) => (content, Some(path)),
+                Err(e) => {
+                    log::error!("could not read {}: {}", path.display(), e);
+                    (WELCOME_TEXT.to_string(), None)
+                }
+            }
+        }
+        None => (WELCOME_TEXT.to_string(), None),
+    };
+
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new();
+    let mut app = App::new(initial_text, file_path);
     event_loop.run_app(&mut app).expect("event loop failed");
 }
