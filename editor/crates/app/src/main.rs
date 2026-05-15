@@ -120,6 +120,9 @@ struct State {
     /// Path the buffer was loaded from / saves to. `None` for the welcome
     /// scratch buffer.
     file_path: Option<PathBuf>,
+    /// Has the buffer changed since the last load or save? Shown as a "•"
+    /// prefix in the window title.
+    dirty: bool,
 
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
@@ -178,6 +181,7 @@ impl State {
             text_dirty: false,
             scene_dirty: true,
             file_path,
+            dirty: false,
             pending_keystroke: None,
             frame_count: 0,
             last_report: Instant::now(),
@@ -232,6 +236,10 @@ impl State {
             if let Key::Character(c) = &event.logical_key {
                 if c.as_str().eq_ignore_ascii_case("s") {
                     self.save_to_file();
+                    return;
+                }
+                if c.as_str().eq_ignore_ascii_case("o") {
+                    self.open_file_dialog();
                     return;
                 }
             }
@@ -295,6 +303,10 @@ impl State {
             self.text_dirty |= text_changed;
             self.scene_dirty = true;
             self.follow_caret = true;
+            if text_changed && !self.dirty {
+                self.dirty = true;
+                self.update_title();
+            }
             self.pending_keystroke = Some(Instant::now());
             self.window.request_redraw();
         }
@@ -321,17 +333,59 @@ impl State {
         self.drag_anchor = None;
     }
 
-    /// Write the buffer to `file_path`. Logs a warning and does nothing if
-    /// there is no path (Save As is a follow-up).
-    fn save_to_file(&self) {
-        let Some(path) = self.file_path.as_ref() else {
-            log::warn!("save: no file path — Save As is a follow-up");
-            return;
+    /// Write the buffer to `file_path`, or prompt for one with a Save As
+    /// dialog when there is none.
+    fn save_to_file(&mut self) {
+        let path = match self.file_path.clone() {
+            Some(p) => p,
+            None => match rfd::FileDialog::new().save_file() {
+                Some(p) => p,
+                None => return, // cancelled
+            },
         };
-        match std::fs::write(path, self.editor.text()) {
-            Ok(()) => log::info!("saved {}", path.display()),
+        match std::fs::write(&path, self.editor.text()) {
+            Ok(()) => {
+                log::info!("saved {}", path.display());
+                self.file_path = Some(path);
+                self.dirty = false;
+                self.update_title();
+            }
             Err(e) => log::error!("save failed for {}: {}", path.display(), e),
         }
+    }
+
+    /// Prompt for a file with an Open dialog and load it, replacing the
+    /// editor. The user can cancel; on read failure we log and keep the
+    /// current buffer.
+    fn open_file_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new().pick_file() else {
+            return;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                self.editor = Editor::from(content.as_str());
+                self.file_path = Some(path);
+                self.scroll_y = 0.0;
+                self.dirty = false;
+                self.text_dirty = true;
+                self.scene_dirty = true;
+                self.follow_caret = false;
+                self.update_title();
+                self.window.request_redraw();
+            }
+            Err(e) => log::error!("could not read {}: {}", path.display(), e),
+        }
+    }
+
+    /// Sync the window title with the file path and dirty state.
+    fn update_title(&self) {
+        let base = window_title(self.file_path.as_deref());
+        let title = if self.dirty {
+            format!("• {base}")
+        } else {
+            base
+        };
+        self.window.set_title(&title);
     }
 
     /// Pointer moved. During a drag, extend the selection from the drag anchor
