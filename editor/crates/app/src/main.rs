@@ -9,6 +9,7 @@
 // Still missing for a "real" editor: multiple buffers/panes, a proper widget
 // tree, find/replace, the file tree. Those are later M1 work.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -42,6 +43,26 @@ const CARET_WIDTH_DIP: f32 = 2.0;
 
 /// A spaces-per-tab stand-in until config lands.
 const TAB_AS_SPACES: &str = "    ";
+
+/// Whether the platform's "primary" modifier (Cmd on macOS, Ctrl on
+/// Linux/Windows) is held. Used to gate shortcuts like Cmd-S.
+fn is_cmd_or_ctrl(mods: ModifiersState) -> bool {
+    mods.super_key() || mods.control_key()
+}
+
+/// A window title showing the file name when one is open, or the welcome
+/// label otherwise.
+fn window_title(path: Option<&Path>) -> String {
+    match path {
+        Some(p) => format!(
+            "LightEditor — {}",
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string())
+        ),
+        None => "LightEditor — editable surface".to_string(),
+    }
+}
 
 /// Initial buffer content — the spec §3.4 multilingual matrix doubles as a
 /// smoke test that editing keeps complex scripts intact.
@@ -96,6 +117,13 @@ struct State {
     /// The editor state changed — the scene needs rebuilding before the next frame.
     scene_dirty: bool,
 
+    /// Path the buffer was loaded from / saves to. `None` for the welcome
+    /// scratch buffer.
+    file_path: Option<PathBuf>,
+    /// Has the buffer changed since the last load or save? Shown as a "•"
+    /// prefix in the window title.
+    dirty: bool,
+
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
     /// Rolling 1-second frame-time window (spec §8).
@@ -106,7 +134,12 @@ struct State {
 }
 
 impl State {
-    fn new(window: Arc<Window>, cold_start: Instant) -> Self {
+    fn new(
+        window: Arc<Window>,
+        cold_start: Instant,
+        initial_text: &str,
+        file_path: Option<PathBuf>,
+    ) -> Self {
         let scale = window.scale_factor() as f32;
         let size = window.inner_size();
         let gpu = GpuContext::new(window.clone());
@@ -119,9 +152,9 @@ impl State {
             gpu.format(),
             size.width as f32 - text_padding,
             scale,
-            WELCOME_TEXT,
+            initial_text,
         );
-        let editor = Editor::from(WELCOME_TEXT);
+        let editor = Editor::from(initial_text);
         let scene = Scene::new(SceneNode::group(Rect::new(
             0.0,
             0.0,
@@ -147,6 +180,8 @@ impl State {
             follow_caret: false,
             text_dirty: false,
             scene_dirty: true,
+            file_path,
+            dirty: false,
             pending_keystroke: None,
             frame_count: 0,
             last_report: Instant::now(),
@@ -194,6 +229,26 @@ impl State {
         if event.state != ElementState::Pressed {
             return;
         }
+
+        // Cmd/Ctrl shortcuts — checked before regular key handling so that
+        // e.g. Cmd-S doesn't also try to insert "s".
+        if is_cmd_or_ctrl(self.modifiers) {
+            if let Key::Character(c) = &event.logical_key {
+                if c.as_str().eq_ignore_ascii_case("s") {
+                    self.save_to_file();
+                    return;
+                }
+                if c.as_str().eq_ignore_ascii_case("o") {
+                    self.open_file_dialog();
+                    return;
+                }
+                if c.as_str().eq_ignore_ascii_case("n") {
+                    self.new_file();
+                    return;
+                }
+            }
+        }
+
         let shift = self.modifiers.shift_key();
 
         let mut text_changed = true;
@@ -252,6 +307,10 @@ impl State {
             self.text_dirty |= text_changed;
             self.scene_dirty = true;
             self.follow_caret = true;
+            if text_changed && !self.dirty {
+                self.dirty = true;
+                self.update_title();
+            }
             self.pending_keystroke = Some(Instant::now());
             self.window.request_redraw();
         }
@@ -276,6 +335,113 @@ impl State {
     /// Left-button release: end any drag.
     fn handle_mouse_release(&mut self) {
         self.drag_anchor = None;
+    }
+
+    /// Write the buffer to `file_path`, or prompt for one with a Save As
+    /// dialog when there is none.
+    fn save_to_file(&mut self) {
+        let path = match self.file_path.clone() {
+            Some(p) => p,
+            None => match rfd::FileDialog::new().save_file() {
+                Some(p) => p,
+                None => return, // cancelled
+            },
+        };
+        match std::fs::write(&path, self.editor.text()) {
+            Ok(()) => {
+                log::info!("saved {}", path.display());
+                self.file_path = Some(path);
+                self.dirty = false;
+                self.update_title();
+            }
+            Err(e) => log::error!("save failed for {}: {}", path.display(), e),
+        }
+    }
+
+    /// Prompt for a file with an Open dialog and load it, replacing the
+    /// editor. The user can cancel; on read failure we log and keep the
+    /// current buffer.
+    fn open_file_dialog(&mut self) {
+        if !self.confirm_unsaved("Open") {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new().pick_file() else {
+            return;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                self.editor = Editor::from(content.as_str());
+                self.file_path = Some(path);
+                self.scroll_y = 0.0;
+                self.dirty = false;
+                self.text_dirty = true;
+                self.scene_dirty = true;
+                self.follow_caret = false;
+                self.update_title();
+                self.window.request_redraw();
+            }
+            Err(e) => log::error!("could not read {}: {}", path.display(), e),
+        }
+    }
+
+    /// Sync the window title with the file path and dirty state.
+    fn update_title(&self) {
+        let base = window_title(self.file_path.as_deref());
+        let title = if self.dirty {
+            format!("• {base}")
+        } else {
+            base
+        };
+        self.window.set_title(&title);
+    }
+
+    /// Reset the buffer to a blank scratch one with no file path. Asks first
+    /// if the current buffer has unsaved changes.
+    fn new_file(&mut self) {
+        if !self.confirm_unsaved("New file") {
+            return;
+        }
+        self.editor = Editor::from("");
+        self.file_path = None;
+        self.scroll_y = 0.0;
+        self.dirty = false;
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = false;
+        self.update_title();
+        self.window.request_redraw();
+    }
+
+    /// If the buffer is dirty, ask the user what to do. Returns `true` if the
+    /// caller may proceed (saved or discarded), `false` if it must abort
+    /// (Cancel, or a Save As that was cancelled / failed). Clean buffers
+    /// always return `true`.
+    fn confirm_unsaved(&mut self, reason: &str) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        let name = self
+            .file_path
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "this buffer".to_string());
+        let result = rfd::MessageDialog::new()
+            .set_title(format!("{reason}: unsaved changes"))
+            .set_description(format!("{name} has unsaved changes. Save them first?"))
+            .set_level(rfd::MessageLevel::Warning)
+            .set_buttons(rfd::MessageButtons::YesNoCancel)
+            .show();
+        match result {
+            rfd::MessageDialogResult::Yes => {
+                self.save_to_file();
+                // Save As dialog may have been cancelled, or write may have
+                // failed — both leave `dirty` true.
+                !self.dirty
+            }
+            rfd::MessageDialogResult::No => true, // discard
+            _ => false,                           // Cancel / closed dialog
+        }
     }
 
     /// Pointer moved. During a drag, extend the selection from the drag anchor
@@ -674,13 +840,17 @@ impl State {
 
 struct App {
     cold_start: Instant,
+    initial_text: String,
+    file_path: Option<PathBuf>,
     state: Option<State>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(initial_text: String, file_path: Option<PathBuf>) -> Self {
         Self {
             cold_start: Instant::now(),
+            initial_text,
+            file_path,
             state: None,
         }
     }
@@ -692,14 +862,19 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("LightEditor — editable surface")
+            .with_title(window_title(self.file_path.as_deref()))
             .with_inner_size(PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
                 .expect("failed to create window"),
         );
-        let state = State::new(window, self.cold_start);
+        let state = State::new(
+            window,
+            self.cold_start,
+            &self.initial_text,
+            self.file_path.clone(),
+        );
         // ControlFlow::Wait only draws on demand — kick off the first frame.
         state.window.request_redraw();
         self.state = Some(state);
@@ -710,7 +885,7 @@ impl ApplicationHandler for App {
             return;
         };
         match event {
-            WindowEvent::CloseRequested => {
+            WindowEvent::CloseRequested if state.confirm_unsaved("Close") => {
                 log::info!("close requested — exiting");
                 event_loop.exit();
             }
@@ -756,8 +931,24 @@ fn main() {
     )
     .init();
 
+    // Optional file path as the first CLI arg; falls back to the welcome
+    // scratch buffer if absent or unreadable.
+    let (initial_text, file_path) = match std::env::args().nth(1) {
+        Some(arg) => {
+            let path = PathBuf::from(arg);
+            match std::fs::read_to_string(&path) {
+                Ok(content) => (content, Some(path)),
+                Err(e) => {
+                    log::error!("could not read {}: {}", path.display(), e);
+                    (WELCOME_TEXT.to_string(), None)
+                }
+            }
+        }
+        None => (WELCOME_TEXT.to_string(), None),
+    };
+
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new();
+    let mut app = App::new(initial_text, file_path);
     event_loop.run_app(&mut app).expect("event loop failed");
 }
