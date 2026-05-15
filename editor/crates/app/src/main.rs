@@ -9,6 +9,8 @@
 // Still missing for a "real" editor: multiple buffers/panes, a proper widget
 // tree, find/replace, the file tree. Those are later M1 work.
 
+mod palette;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,6 +20,7 @@ use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{Color, Resolution, TextArea, TextBounds};
 use editor_ui_text::TextStack;
+use palette::{Command, CommandPalette};
 use wgpu::{
     LoadOp, Operations, RenderPassColorAttachment, RenderPassDescriptor, StoreOp,
     TextureViewDescriptor,
@@ -40,6 +43,13 @@ const TEXT_INSET_DIP: f32 = 28.0;
 const TEXT_PADDING_DIP: f32 = 2.0 * TEXT_INSET_DIP;
 /// Caret width, in logical pixels.
 const CARET_WIDTH_DIP: f32 = 2.0;
+
+/// Command-palette overlay dimensions, in logical pixels.
+const PALETTE_WIDTH_DIP: f32 = 600.0;
+/// Distance from the window's top edge to the palette's top, in logical pixels.
+const PALETTE_TOP_DIP: f32 = 80.0;
+/// Padding inside the palette panel, in logical pixels.
+const PALETTE_PAD_DIP: f32 = 12.0;
 
 /// A spaces-per-tab stand-in until config lands.
 const TAB_AS_SPACES: &str = "    ";
@@ -124,6 +134,12 @@ struct State {
     /// prefix in the window title.
     dirty: bool,
 
+    /// Command-palette state when the popup is open.
+    palette: Option<CommandPalette>,
+    /// Second TextStack dedicated to the palette overlay so it can shape
+    /// independently of the buffer.
+    palette_text: TextStack,
+
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
     /// Rolling 1-second frame-time window (spec §8).
@@ -155,6 +171,18 @@ impl State {
             initial_text,
         );
         let editor = Editor::from(initial_text);
+
+        // The palette has its own TextStack so the editor's single shaped
+        // buffer doesn't have to swap content every keystroke in the palette.
+        let palette_width = (PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale;
+        let palette_text = TextStack::new(
+            &gpu.device,
+            &gpu.queue,
+            gpu.format(),
+            palette_width,
+            scale,
+            "",
+        );
         let scene = Scene::new(SceneNode::group(Rect::new(
             0.0,
             0.0,
@@ -182,6 +210,8 @@ impl State {
             scene_dirty: true,
             file_path,
             dirty: false,
+            palette: None,
+            palette_text,
             pending_keystroke: None,
             frame_count: 0,
             last_report: Instant::now(),
@@ -202,6 +232,7 @@ impl State {
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.gpu.resize(size.width, size.height);
         self.text.set_width(size.width as f32 - self.text_padding);
+        // Palette width is fixed; nothing to update on a window resize.
         self.text_dirty = true;
         self.scene_dirty = true;
         // ControlFlow::Wait won't redraw on its own — a resize must ask.
@@ -219,6 +250,10 @@ impl State {
         self.text_padding = TEXT_PADDING_DIP * scale;
         self.caret_width = CARET_WIDTH_DIP * scale;
         self.text.set_scale(scale);
+        // Palette has its own TextStack — keep its metrics + wrap width in sync.
+        self.palette_text.set_scale(scale);
+        let palette_width = (PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale;
+        self.palette_text.set_width(palette_width);
         self.text_dirty = true;
         self.scene_dirty = true;
         self.window.request_redraw();
@@ -227,6 +262,27 @@ impl State {
     /// Route a key press into `editor`.
     fn handle_key(&mut self, event: KeyEvent) {
         if event.state != ElementState::Pressed {
+            return;
+        }
+
+        // Cmd-Shift-P toggles the palette regardless of whether it is open,
+        // so it stays a single muscle-memory key combo.
+        if is_cmd_or_ctrl(self.modifiers) && self.modifiers.shift_key() {
+            if let Key::Character(c) = &event.logical_key {
+                if c.as_str().eq_ignore_ascii_case("p") {
+                    if self.palette.is_some() {
+                        self.close_palette();
+                    } else {
+                        self.open_palette();
+                    }
+                    return;
+                }
+            }
+        }
+
+        // When the palette is open it captures every other key.
+        if self.palette.is_some() {
+            self.handle_palette_key(event);
             return;
         }
 
@@ -393,6 +449,170 @@ impl State {
             base
         };
         self.window.set_title(&title);
+    }
+
+    // ── command palette ────────────────────────────────────────────────────
+
+    /// Open the command palette, populated with every registered command.
+    fn open_palette(&mut self) {
+        self.palette = Some(CommandPalette::new());
+        self.refresh_palette_text();
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Close the command palette (without firing anything).
+    fn close_palette(&mut self) {
+        self.palette = None;
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Reshape the secondary TextStack to reflect the palette's current
+    /// query + visible commands. Called after every palette mutation.
+    fn refresh_palette_text(&mut self) {
+        let Some(palette) = self.palette.as_ref() else {
+            return;
+        };
+        let mut text = String::with_capacity(128);
+        text.push_str("❯ ");
+        text.push_str(palette.query());
+        // blank row between the query and the list
+        text.push_str("\n\n");
+        for cmd in palette.visible() {
+            text.push_str("  ");
+            text.push_str(cmd.label());
+            text.push('\n');
+        }
+        self.palette_text.set_content(&text);
+    }
+
+    /// Route a key while the palette is open. Movement / edit keys are
+    /// captured by the palette instead of the buffer.
+    fn handle_palette_key(&mut self, event: KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_palette(),
+            Key::Named(NamedKey::ArrowUp) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.prev();
+                }
+                self.refresh_palette_text();
+                self.scene_dirty = true;
+                self.window.request_redraw();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.next();
+                }
+                self.refresh_palette_text();
+                self.scene_dirty = true;
+                self.window.request_redraw();
+            }
+            Key::Named(NamedKey::Enter) => {
+                if let Some(cmd) = self.palette.as_ref().and_then(|p| p.selected()) {
+                    self.execute_command(cmd);
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.backspace();
+                }
+                self.refresh_palette_text();
+                self.scene_dirty = true;
+                self.window.request_redraw();
+            }
+            _ => {
+                // Treat the resolved text (a character or two for IME) as
+                // query input. Drop control-modified key presses.
+                if is_cmd_or_ctrl(self.modifiers) {
+                    return;
+                }
+                if let Some(text) = &event.text {
+                    if let Some(p) = self.palette.as_mut() {
+                        for c in text.chars() {
+                            p.push_char(c);
+                        }
+                    }
+                    self.refresh_palette_text();
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// Run a palette-selected command. Closes the palette first so the
+    /// underlying handler sees a consistent state.
+    fn execute_command(&mut self, cmd: Command) {
+        self.close_palette();
+        match cmd {
+            Command::NewFile => self.new_file(),
+            Command::OpenFile => self.open_file_dialog(),
+            Command::SaveFile => self.save_to_file(),
+            Command::SaveFileAs => self.save_as(),
+        }
+    }
+
+    /// Save As: always prompt for a path, even if the buffer already has one.
+    fn save_as(&mut self) {
+        let Some(path) = rfd::FileDialog::new().save_file() else {
+            return;
+        };
+        match std::fs::write(&path, self.editor.text()) {
+            Ok(()) => {
+                log::info!("saved as {}", path.display());
+                self.file_path = Some(path);
+                self.dirty = false;
+                self.update_title();
+            }
+            Err(e) => log::error!("save failed: {}", e),
+        }
+    }
+
+    /// The palette's backdrop rectangle, in physical pixels.
+    fn palette_panel_rect(&self) -> Rect {
+        let pad = PALETTE_PAD_DIP * self.scale;
+        let width = PALETTE_WIDTH_DIP * self.scale;
+        let top = PALETTE_TOP_DIP * self.scale;
+        let lh = self.line_height();
+        // Header row (query) + blank row + one row per visible command.
+        let rows = self
+            .palette
+            .as_ref()
+            .map(|p| p.visible_count())
+            .unwrap_or(0);
+        let inner_height = (2 + rows) as f32 * lh;
+        let height = inner_height + 2.0 * pad;
+        let surface_w = self.gpu.surface_config.width as f32;
+        let left = (surface_w - width) * 0.5;
+        Rect::new(left, top, width, height)
+    }
+
+    /// Where the palette TextStack should be drawn (the inner padded area).
+    fn palette_text_origin(&self) -> (f32, f32) {
+        let panel = self.palette_panel_rect();
+        let pad = PALETTE_PAD_DIP * self.scale;
+        (panel.min_x() + pad, panel.min_y() + pad)
+    }
+
+    /// The highlight rectangle for the currently-selected palette row.
+    fn palette_selection_rect(&self) -> Option<Rect> {
+        let palette = self.palette.as_ref()?;
+        if palette.visible_count() == 0 {
+            return None;
+        }
+        let lh = self.line_height();
+        let (_ox, oy) = self.palette_text_origin();
+        // Header takes one row, then a blank row; the list starts at row 2.
+        let row_y = oy + (2 + palette.selected_row()) as f32 * lh;
+        let panel = self.palette_panel_rect();
+        let pad = PALETTE_PAD_DIP * self.scale;
+        Some(Rect::new(
+            panel.min_x() + pad * 0.5,
+            row_y,
+            panel.size.width - pad,
+            lh,
+        ))
     }
 
     /// Reset the buffer to a blank scratch one with no file path. Asks first
@@ -572,6 +792,25 @@ impl State {
                         line_height,
                     ),
                     SceneColor::rgb(120, 160, 255),
+                ));
+            }
+        }
+
+        // Palette overlay sits on top of everything else — a dim scrim over
+        // the editor, the panel itself, and a highlight on the selected row.
+        if self.palette.is_some() {
+            root.push_child(SceneNode::quad(
+                Rect::new(0.0, 0.0, w, h),
+                SceneColor::rgba(0, 0, 0, 96),
+            ));
+            root.push_child(SceneNode::quad(
+                self.palette_panel_rect(),
+                SceneColor::rgba(38, 38, 48, 240),
+            ));
+            if let Some(highlight) = self.palette_selection_rect() {
+                root.push_child(SceneNode::quad(
+                    highlight,
+                    SceneColor::rgba(120, 160, 255, 80),
                 ));
             }
         }
@@ -768,6 +1007,44 @@ impl State {
             )
             .expect("text prepare failed");
 
+        // Palette text overlay — its own TextStack so it shapes independently.
+        let palette_open = self.palette.is_some();
+        if palette_open {
+            let (px, py) = self.palette_text_origin();
+            self.palette_text.viewport.update(
+                &self.gpu.queue,
+                Resolution {
+                    width: self.gpu.surface_config.width,
+                    height: self.gpu.surface_config.height,
+                },
+            );
+            self.palette_text
+                .renderer
+                .prepare(
+                    &self.gpu.device,
+                    &self.gpu.queue,
+                    &mut self.palette_text.font_system,
+                    &mut self.palette_text.atlas,
+                    &self.palette_text.viewport,
+                    [TextArea {
+                        buffer: &self.palette_text.buffer,
+                        left: px,
+                        top: py,
+                        scale: 1.0,
+                        bounds: TextBounds {
+                            left: 0,
+                            top: 0,
+                            right: self.gpu.surface_config.width as i32,
+                            bottom: self.gpu.surface_config.height as i32,
+                        },
+                        default_color: Color::rgb(238, 238, 238),
+                        custom_glyphs: &[],
+                    }],
+                    &mut self.palette_text.swash_cache,
+                )
+                .expect("palette text prepare failed");
+        }
+
         let Some(frame) = self.gpu.acquire() else {
             return;
         };
@@ -795,16 +1072,30 @@ impl State {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            // Caret/highlight quads first, text on top.
+            // Editor quads (highlights, carets, palette backdrop) first; then
+            // editor text; then palette text on top of everything.
             self.quads.render(&mut pass);
             self.text
                 .renderer
                 .render(&self.text.atlas, &self.text.viewport, &mut pass)
                 .expect("text render failed");
+            if palette_open {
+                self.palette_text
+                    .renderer
+                    .render(
+                        &self.palette_text.atlas,
+                        &self.palette_text.viewport,
+                        &mut pass,
+                    )
+                    .expect("palette text render failed");
+            }
         }
         self.gpu.queue.submit(Some(encoder.finish()));
         frame.present();
         self.text.atlas.trim();
+        if palette_open {
+            self.palette_text.atlas.trim();
+        }
 
         self.last_frame_us = frame_start.elapsed().as_micros();
         self.frame_count += 1;
