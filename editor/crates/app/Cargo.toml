@@ -22,3 +22,4 @@ env_logger = { workspace = true }
 rfd = { workspace = true }
 nucleo-matcher = { workspace = true }
 dirs = { workspace = true }
+notify = { workspace = true }

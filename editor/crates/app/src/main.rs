@@ -16,16 +16,17 @@ mod palette;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use document::Document;
 use editor_config::Settings;
-use editor_core::{Position, Selection};
+use editor_core::{LineEnding, Position, Selection};
 use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Point, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{Color, FontSystem, Resolution, SwashCache, TextArea, TextBounds};
-use editor_ui_text::TextStack;
+use editor_ui_text::{TextGpu, TextStack};
 use find::FindBar;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use palette::{Command, CommandPalette};
 use wgpu::{
     LoadOp, Operations, RenderPassColorAttachment, RenderPassDescriptor, StoreOp,
@@ -34,9 +35,23 @@ use wgpu::{
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
+
+/// Cross-thread events posted into the winit event loop from background
+/// helpers — file watcher + flash-clear timer.
+#[derive(Debug, Clone, Copy)]
+enum AppEvent {
+    /// `settings.toml` (user or workspace) changed on disk; reload and reapply.
+    SettingsChanged,
+    /// `FLASH_DURATION` has elapsed since a transient status-bar message was
+    /// set — clear it.
+    ClearFlash,
+}
+
+/// How long a "settings reloaded" flash stays on the status bar.
+const FLASH_DURATION: Duration = Duration::from_millis(2000);
 
 /// Initial window size, in logical pixels.
 const WINDOW_WIDTH: u32 = 1280;
@@ -94,11 +109,77 @@ const FIND_PAD_DIP: f32 = 8.0;
 /// Subdirectory under the user's XDG config dir that holds settings.toml.
 const CONFIG_SUBDIR: &str = "lighteditor";
 const CONFIG_FILENAME: &str = "settings.toml";
+/// Subdirectory under the current working directory that may hold a
+/// workspace-scoped settings override (spec §4.1.5 — Workspace ranks above
+/// User in the precedence Default → User → Workspace).
+const WORKSPACE_CONFIG_SUBDIR: &str = ".lighteditor";
 
 /// Whether the platform's "primary" modifier (Cmd on macOS, Ctrl on
 /// Linux/Windows) is held. Used to gate shortcuts like Cmd-S.
 fn is_cmd_or_ctrl(mods: ModifiersState) -> bool {
     mods.super_key() || mods.control_key()
+}
+
+/// A short language label for the status bar, guessed from `path`'s file
+/// extension. Covers the languages M1 is targeting plus a few staples; an
+/// unknown extension or no path falls through to "Plain Text". A proper
+/// language registry is a later (syntax-highlighting) concern.
+fn language_for(path: Option<&Path>) -> &'static str {
+    let Some(ext) = path.and_then(|p| p.extension()).and_then(|e| e.to_str()) else {
+        return "Plain Text";
+    };
+    match ext.to_ascii_lowercase().as_str() {
+        "rs" => "Rust",
+        "ts" | "tsx" => "TypeScript",
+        "js" | "jsx" | "mjs" | "cjs" => "JavaScript",
+        "dart" => "Dart",
+        "py" => "Python",
+        "go" => "Go",
+        "c" | "h" => "C",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "C++",
+        "java" => "Java",
+        "kt" | "kts" => "Kotlin",
+        "swift" => "Swift",
+        "rb" => "Ruby",
+        "md" | "markdown" => "Markdown",
+        "toml" => "TOML",
+        "json" => "JSON",
+        "yaml" | "yml" => "YAML",
+        "html" | "htm" => "HTML",
+        "css" => "CSS",
+        "scss" | "sass" => "SCSS",
+        "sh" | "bash" | "zsh" => "Shell",
+        "sql" => "SQL",
+        _ => "Plain Text",
+    }
+}
+
+/// `"LF"` / `"CRLF"` for the buffer's dominant line-ending convention.
+fn line_ending_label(le: LineEnding) -> &'static str {
+    match le {
+        LineEnding::Lf => "LF",
+        LineEnding::CrLf => "CRLF",
+    }
+}
+
+/// Short label suitable for a status-bar flash — just the filename (with
+/// extension), falling back to the full path's stringified form for weird
+/// edge cases where there is no terminal component.
+fn filename_for_flash(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+/// Width of the text shaped into `stack` in physical pixels — the maximum
+/// `x + width` over every glyph in every layout run. Used to right-align
+/// short captions whose width depends on the content (e.g. "Ln L, Col C").
+fn shaped_width(stack: &TextStack) -> f32 {
+    stack
+        .buffer
+        .layout_runs()
+        .flat_map(|run| run.glyphs.iter().map(|g| g.x + g.w))
+        .fold(0.0_f32, f32::max)
 }
 
 /// A window title showing the file name when one is open, or the welcome
@@ -132,13 +213,18 @@ struct State {
     window: Arc<Window>,
     gpu: GpuContext,
     quads: QuadRenderer,
-    /// Shared across every `TextStack` (editor, palette, find, tabs, close).
-    /// `FontSystem::new()` walks the OS font directory once — ~80ms cold —
-    /// so building one and lending it out is much cheaper than five.
+    /// Shared across every `TextStack` (editor, palette, find, tabs, close,
+    /// status). `FontSystem::new()` walks the OS font directory once —
+    /// ~80ms cold — so building one and lending it out is much cheaper than
+    /// one per stack.
     font_system: FontSystem,
-    /// Shared swash glyph cache. Per-stack `TextRenderer::prepare` borrows it
-    /// in turn (calls are sequential, so the single `&mut` rotates fine).
+    /// Shared swash glyph cache.
     swash_cache: SwashCache,
+    /// Shared GPU text resources — one viewport, one atlas, one renderer.
+    /// Every per-frame TextArea (editor, tabs, close ×s, status, find,
+    /// palette) goes into a single `prepare` + `render` call, so adding a
+    /// stack is now cheap.
+    text_gpu: TextGpu,
     /// TextStack for the *active* document. Reshape happens on switch and on
     /// edit (`text_dirty`).
     text: TextStack,
@@ -155,9 +241,12 @@ struct State {
     /// separate TextAreas at each slot's close-button position; the buffer
     /// content never changes.
     close_text: TextStack,
-    /// TextStack for the bottom status bar — "Ln N, Col M  ·  L lines".
-    /// Reshaped whenever the caret or document changes.
-    status_text: TextStack,
+    /// Left half of the status bar — `path · language · LE`.
+    status_left: TextStack,
+    /// Right half of the status bar — `Ln L, Col C · N lines`. Positioned
+    /// via a measurement of its shaped width so the right edge sits one
+    /// `STATUS_PAD_X_DIP` from the window edge.
+    status_right: TextStack,
 
     /// The scene rebuilt from `editor` whenever it changes.
     scene: Scene,
@@ -206,6 +295,15 @@ struct State {
     /// Spaces inserted by the Tab key (pre-built from `settings.editor.tab_size`).
     tab_spaces: String,
 
+    /// Transient overlay for the status bar's left half — `Some((msg, t))`
+    /// while a flash is active. Cleared via `AppEvent::ClearFlash` after
+    /// [`FLASH_DURATION`]; the `Instant` is also used to gate the clear so
+    /// a later flash isn't wiped early by an earlier flash's timer.
+    status_flash: Option<(String, Instant)>,
+    /// Used by `set_status_flash` to schedule its own `ClearFlash` event
+    /// from a detached sleeper thread. Clone-cheap.
+    flash_proxy: EventLoopProxy<AppEvent>,
+
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
     /// Rolling 1-second frame-time window (spec §8).
@@ -222,6 +320,7 @@ impl State {
         initial_text: &str,
         file_path: Option<PathBuf>,
         settings: &Settings,
+        flash_proxy: EventLoopProxy<AppEvent>,
     ) -> Self {
         let scale = window.scale_factor() as f32;
         let size = window.inner_size();
@@ -238,11 +337,12 @@ impl State {
         let mut font_system = editor_ui_text::new_font_system();
         let swash_cache = editor_ui_text::new_swash_cache();
 
+        // One shared TextGpu — every stack below reuses these GPU resources
+        // through the single `prepare`/`render` call in `Self::render`.
+        let text_gpu = TextGpu::new(&gpu.device, &gpu.queue, gpu.format());
+
         let text_padding = TEXT_PADDING_DIP * scale;
         let text = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
             &mut font_system,
             size.width as f32 - text_padding,
             font_size_pt,
@@ -256,12 +356,8 @@ impl State {
             None => Document::new_scratch(initial_text),
         };
 
-        // Each overlay TextStack reuses the shared FontSystem above.
         let palette_width = (PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale;
         let palette_text = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
             &mut font_system,
             palette_width,
             font_size_pt,
@@ -272,9 +368,6 @@ impl State {
 
         let find_width = (FIND_WIDTH_DIP - 2.0 * FIND_PAD_DIP) * scale;
         let find_text = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
             &mut font_system,
             find_width,
             font_size_pt,
@@ -286,9 +379,6 @@ impl State {
         // Tab strip TextStack — one long single line of labels. Width spans
         // the whole window; no wrap.
         let tabs_text = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
             &mut font_system,
             size.width as f32,
             font_size_pt,
@@ -300,9 +390,6 @@ impl State {
         // Close-button TextStack — shapes the "×" glyph once and is then
         // drawn at every tab's close-button position via N TextAreas.
         let close_text = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
             &mut font_system,
             TAB_CLOSE_W_DIP * scale,
             font_size_pt,
@@ -311,13 +398,21 @@ impl State {
             "×",
         );
 
-        // Status-bar TextStack — single-line caption at the bottom.
-        let status_text = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
+        // Status-bar TextStacks — one for each side. Both span the whole
+        // strip width so a long left caption can still measure correctly
+        // before we decide whether to truncate.
+        let status_width = size.width as f32 - 2.0 * STATUS_PAD_X_DIP * scale;
+        let status_left = TextStack::new(
             &mut font_system,
-            size.width as f32 - 2.0 * STATUS_PAD_X_DIP * scale,
+            status_width,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "",
+        );
+        let status_right = TextStack::new(
+            &mut font_system,
+            status_width,
             font_size_pt,
             line_height_pt,
             scale,
@@ -337,12 +432,14 @@ impl State {
             quads,
             font_system,
             swash_cache,
+            text_gpu,
             text,
             docs: vec![doc],
             active: 0,
             tabs_text,
             close_text,
-            status_text,
+            status_left,
+            status_right,
             scene,
             scale,
             text_inset_x: TEXT_INSET_DIP * scale,
@@ -358,6 +455,8 @@ impl State {
             palette: None,
             palette_text,
             find_text,
+            status_flash: None,
+            flash_proxy,
             tab_spaces,
             pending_keystroke: None,
             frame_count: 0,
@@ -393,10 +492,11 @@ impl State {
             .set_width(&mut self.font_system, size.width as f32 - self.text_padding);
         self.tabs_text
             .set_width(&mut self.font_system, size.width as f32);
-        self.status_text.set_width(
-            &mut self.font_system,
-            size.width as f32 - 2.0 * STATUS_PAD_X_DIP * self.scale,
-        );
+        let status_width = size.width as f32 - 2.0 * STATUS_PAD_X_DIP * self.scale;
+        self.status_left
+            .set_width(&mut self.font_system, status_width);
+        self.status_right
+            .set_width(&mut self.font_system, status_width);
         // Palette / find widths are fixed; nothing to update on a window resize.
         self.text_dirty = true;
         self.scene_dirty = true;
@@ -428,14 +528,73 @@ impl State {
             .set_width(fs, self.gpu.surface_config.width as f32);
         self.close_text.set_scale(fs, scale);
         self.close_text.set_width(fs, TAB_CLOSE_W_DIP * scale);
-        self.status_text.set_scale(fs, scale);
-        self.status_text.set_width(
-            fs,
-            self.gpu.surface_config.width as f32 - 2.0 * STATUS_PAD_X_DIP * scale,
-        );
+        let status_width = self.gpu.surface_config.width as f32 - 2.0 * STATUS_PAD_X_DIP * scale;
+        self.status_left.set_scale(fs, scale);
+        self.status_left.set_width(fs, status_width);
+        self.status_right.set_scale(fs, scale);
+        self.status_right.set_width(fs, status_width);
         self.text_dirty = true;
         self.scene_dirty = true;
         self.window.request_redraw();
+    }
+
+    /// Pick up a fresh `Settings`: reapply font metrics to every TextStack
+    /// and rebuild the Tab-key spaces. Called from the settings file watcher.
+    fn reload_settings(&mut self, settings: &Settings) {
+        let fs = &mut self.font_system;
+        let font = settings.editor.font_size;
+        let lh = settings.editor.line_height;
+        self.text.set_font_size(fs, font, lh);
+        self.palette_text.set_font_size(fs, font, lh);
+        self.find_text.set_font_size(fs, font, lh);
+        self.tabs_text.set_font_size(fs, font, lh);
+        self.close_text.set_font_size(fs, font, lh);
+        self.status_left.set_font_size(fs, font, lh);
+        self.status_right.set_font_size(fs, font, lh);
+        self.tab_spaces = " ".repeat(settings.editor.tab_size);
+        self.set_status_flash(format!(
+            "settings reloaded · font {font} · line {lh} · tab {}",
+            settings.editor.tab_size
+        ));
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        log::info!(
+            "settings reloaded: font_size={font} line_height={lh} tab_size={}",
+            settings.editor.tab_size
+        );
+        self.window.request_redraw();
+    }
+
+    /// Show `msg` on the status bar's left half and schedule its own
+    /// `AppEvent::ClearFlash` after [`FLASH_DURATION`].
+    ///
+    /// Each call spawns a detached sleeper thread; if `msg` overwrites a
+    /// previous flash, both timers will fire, but `clear_status_flash`
+    /// gates on the stored timestamp so the *older* timer is a no-op once
+    /// the newer message has refreshed the deadline.
+    fn set_status_flash(&mut self, msg: String) {
+        self.status_flash = Some((msg, Instant::now()));
+        self.scene_dirty = true;
+        let proxy = self.flash_proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(FLASH_DURATION);
+            let _ = proxy.send_event(AppEvent::ClearFlash);
+        });
+        self.window.request_redraw();
+    }
+
+    /// Clear the flash if (and only if) it is genuinely expired — the timer
+    /// thread fires this; a stale fire from an earlier flash is dropped.
+    fn clear_status_flash(&mut self) {
+        let expired = self
+            .status_flash
+            .as_ref()
+            .is_some_and(|(_, t)| t.elapsed() >= FLASH_DURATION);
+        if expired {
+            self.status_flash = None;
+            self.scene_dirty = true;
+            self.window.request_redraw();
+        }
     }
 
     /// Route a key press into the active document or the open overlay.
@@ -658,6 +817,7 @@ impl State {
         match std::fs::write(&path, &text) {
             Ok(()) => {
                 log::info!("saved {}", path.display());
+                let label = filename_for_flash(&path);
                 {
                     let d = self.doc_mut();
                     d.file_path = Some(path);
@@ -665,19 +825,25 @@ impl State {
                 }
                 self.update_title();
                 self.refresh_tabs_text();
+                self.set_status_flash(format!("saved · {label}"));
                 self.scene_dirty = true;
                 self.window.request_redraw();
             }
-            Err(e) => log::error!("save failed for {}: {}", path.display(), e),
+            Err(e) => {
+                log::error!("save failed for {}: {}", path.display(), e);
+                let label = filename_for_flash(&path);
+                self.set_status_flash(format!("save failed · {label} · {e}"));
+            }
         }
     }
 
     /// Read `path` and place it in the editor. If the active document is a
     /// pristine, never-saved, never-edited scratch buffer, replace it in-place
     /// (matches VSCode's behaviour for untouched "Untitled-1"); otherwise
-    /// push a new tab and activate it. I/O failure is logged and the state
-    /// is left intact.
+    /// push a new tab and activate it. I/O failure is logged AND flashed on
+    /// the status bar — the editor's state is left intact.
     fn open_path(&mut self, path: PathBuf) {
+        let flash_label = filename_for_flash(&path);
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 let new_doc = Document::from_file(path, &content);
@@ -693,9 +859,13 @@ impl State {
                 self.update_title();
                 self.refresh_tabs_text();
                 self.refresh_find_text();
+                self.set_status_flash(format!("opened · {flash_label}"));
                 self.window.request_redraw();
             }
-            Err(e) => log::error!("could not read {}: {}", path.display(), e),
+            Err(e) => {
+                log::error!("could not read {}: {}", path.display(), e);
+                self.set_status_flash(format!("open failed · {flash_label} · {e}"));
+            }
         }
     }
 
@@ -780,6 +950,14 @@ impl State {
         self.update_title();
         self.refresh_tabs_text();
         self.refresh_find_text();
+        // Flash the full path (or the label) — useful when many tabs share a
+        // similar truncated label and the user wants confirmation of which
+        // file landed active.
+        let flash = match self.doc().file_path.as_deref() {
+            Some(p) => p.display().to_string(),
+            None => self.doc().label(),
+        };
+        self.set_status_flash(flash);
         self.window.request_redraw();
     }
 
@@ -874,20 +1052,38 @@ impl State {
         Rect::new(0.0, surface_h - h, surface_w, h)
     }
 
-    /// Re-shape the status caption to reflect the active document's caret
-    /// position and total line count: "Ln L, Col C  ·  N lines". The path is
-    /// already in the window title, so it stays out of the status bar.
-    fn refresh_status_text(&mut self) {
-        let head = self.doc().editor.selections().primary().head;
-        let pos = self.doc().editor.buffer().char_to_position(head);
-        let lines = self.doc().editor.buffer().len_lines();
-        let s = format!(
+    /// Re-shape both halves of the status bar.
+    ///
+    /// Left half: `path  ·  language  ·  Spaces: N  ·  LE` — or a transient
+    /// flash message while [`status_flash`](Self::status_flash) is active
+    /// and unexpired.
+    /// Right half: `Ln L, Col C  ·  N lines`.
+    fn refresh_status(&mut self) {
+        let doc = self.doc();
+        let label = doc.label();
+        let language = language_for(doc.file_path.as_deref());
+        let le = line_ending_label(doc.editor.buffer().line_ending());
+        let head = doc.editor.selections().primary().head;
+        let pos = doc.editor.buffer().char_to_position(head);
+        let lines = doc.editor.buffer().len_lines();
+        let indent = self.tab_spaces.len();
+
+        let flash = self
+            .status_flash
+            .as_ref()
+            .filter(|(_, t)| t.elapsed() < FLASH_DURATION)
+            .map(|(s, _)| s.clone());
+        let left = flash
+            .unwrap_or_else(|| format!("{label}  ·  {language}  ·  Spaces: {indent}  ·  {le}"));
+        let right = format!(
             "Ln {}, Col {}  ·  {} lines",
             pos.line + 1,
             pos.column + 1,
             lines
         );
-        self.status_text.set_content(&mut self.font_system, &s);
+
+        self.status_left.set_content(&mut self.font_system, &left);
+        self.status_right.set_content(&mut self.font_system, &right);
     }
 
     /// Rebuild the tab-strip TextStack: one line, each label padded to
@@ -1098,17 +1294,24 @@ impl State {
     /// Save every dirty document in turn. Documents without a path get a
     /// Save As dialog each; the user may cancel any one of them, in which
     /// case that document stays dirty and the rest still get saved. After
-    /// the walk we return to the document the user was on.
+    /// the walk we return to the document the user was on and flash an
+    /// aggregate count, overriding any per-file flash `save_to_file` set.
     fn save_all(&mut self) {
         let original_active = self.active;
+        let mut dirty_total = 0usize;
+        let mut saved = 0usize;
         for i in 0..self.docs.len() {
             if !self.docs[i].dirty {
                 continue;
             }
+            dirty_total += 1;
             if i != self.active {
                 self.active = i;
             }
             self.save_to_file();
+            if !self.docs[self.active].dirty {
+                saved += 1;
+            }
         }
         if original_active < self.docs.len() {
             self.active = original_active;
@@ -1118,6 +1321,18 @@ impl State {
         self.refresh_find_text();
         self.scene_dirty = true;
         self.text_dirty = true;
+        if dirty_total > 0 {
+            let msg = if saved == dirty_total {
+                if saved == 1 {
+                    "saved 1 file".to_string()
+                } else {
+                    format!("saved {saved} files")
+                }
+            } else {
+                format!("saved {saved} of {dirty_total} files")
+            };
+            self.set_status_flash(msg);
+        }
         self.window.request_redraw();
     }
 
@@ -1130,6 +1345,7 @@ impl State {
         match std::fs::write(&path, &text) {
             Ok(()) => {
                 log::info!("saved as {}", path.display());
+                let label = filename_for_flash(&path);
                 {
                     let d = self.doc_mut();
                     d.file_path = Some(path);
@@ -1137,10 +1353,15 @@ impl State {
                 }
                 self.update_title();
                 self.refresh_tabs_text();
+                self.set_status_flash(format!("saved · {label}"));
                 self.scene_dirty = true;
                 self.window.request_redraw();
             }
-            Err(e) => log::error!("save failed: {}", e),
+            Err(e) => {
+                log::error!("save failed: {}", e);
+                let label = filename_for_flash(&path);
+                self.set_status_flash(format!("save failed · {label} · {e}"));
+            }
         }
     }
 
@@ -1687,7 +1908,7 @@ impl State {
                 self.ensure_caret_visible();
                 self.follow_caret = false;
             }
-            self.refresh_status_text();
+            self.refresh_status();
             self.rebuild_scene();
             self.scene_dirty = false;
         }
@@ -1723,34 +1944,16 @@ impl State {
             bottom: (surface_h as f32 - status_bar_h) as i32,
         };
 
-        // Editor text.
+        // All text — editor / tabs / close ×s / status / find / palette —
+        // batched into a single `prepare` + `render`. The order TextAreas
+        // appear in the vec is the draw order, so overlays go last.
         let inset_x = self.text_inset_x;
         let inset_y = self.text_inset_y;
         let scroll = self.docs[self.active].scroll_y;
-        self.text.viewport.update(&self.gpu.queue, resolution);
-        self.text
-            .renderer
-            .prepare(
-                &self.gpu.device,
-                &self.gpu.queue,
-                &mut self.font_system,
-                &mut self.text.atlas,
-                &self.text.viewport,
-                [TextArea {
-                    buffer: &self.text.buffer,
-                    left: inset_x,
-                    top: inset_y - scroll,
-                    scale: 1.0,
-                    bounds: editor_text_bounds,
-                    default_color: Color::rgb(238, 238, 238),
-                    custom_glyphs: &[],
-                }],
-                &mut self.swash_cache,
-            )
-            .expect("text prepare failed");
+        let editor_color = Color::rgb(238, 238, 238);
+        let label_color = Color::rgb(220, 220, 220);
+        let dim_color = Color::rgb(180, 180, 190);
 
-        // Tab strip labels. Centred vertically inside the strip; one cell per
-        // label, sized roughly to TAB_LABEL_CHARS monospace chars.
         let tab_strip_h = TAB_BAR_HEIGHT_DIP * self.scale;
         let tab_text_pad_x = TAB_PAD_X_DIP * self.scale;
         let tab_text_y = (tab_strip_h - self.line_height()) * 0.5;
@@ -1760,152 +1963,128 @@ impl State {
             right: surface_w as i32,
             bottom: tab_strip_h as i32,
         };
-        self.tabs_text.viewport.update(&self.gpu.queue, resolution);
-        self.tabs_text
-            .renderer
-            .prepare(
-                &self.gpu.device,
-                &self.gpu.queue,
-                &mut self.font_system,
-                &mut self.tabs_text.atlas,
-                &self.tabs_text.viewport,
-                [TextArea {
-                    buffer: &self.tabs_text.buffer,
-                    left: tab_text_pad_x,
-                    top: tab_text_y,
-                    scale: 1.0,
-                    bounds: strip_bounds,
-                    default_color: Color::rgb(220, 220, 220),
-                    custom_glyphs: &[],
-                }],
-                &mut self.swash_cache,
-            )
-            .expect("tabs text prepare failed");
 
-        // Close "×" glyph — shaped once, drawn at every tab's close-button
-        // position via N TextAreas pointing at the same Buffer.
         let docs_len = self.docs.len();
-        let scale_factor = self.scale;
-        let slot_w = TAB_WIDTH_DIP * scale_factor;
-        let close_w = TAB_CLOSE_W_DIP * scale_factor;
-        let close_pad = TAB_CLOSE_PAD_DIP * scale_factor;
-        // Center the glyph horizontally inside the close-rect — the "×"
-        // glyph is narrower than the rect, so push it in by a quarter.
+        let slot_w = TAB_WIDTH_DIP * self.scale;
+        let close_w = TAB_CLOSE_W_DIP * self.scale;
+        let close_pad = TAB_CLOSE_PAD_DIP * self.scale;
         let close_glyph_offset_x = close_w * 0.25;
-        self.close_text.viewport.update(&self.gpu.queue, resolution);
-        self.close_text
-            .renderer
-            .prepare(
-                &self.gpu.device,
-                &self.gpu.queue,
-                &mut self.font_system,
-                &mut self.close_text.atlas,
-                &self.close_text.viewport,
-                (0..docs_len).map(|i| {
-                    let slot_x = i as f32 * slot_w;
-                    let close_x = slot_x + slot_w - close_w - close_pad + close_glyph_offset_x;
-                    TextArea {
-                        buffer: &self.close_text.buffer,
-                        left: close_x,
-                        top: tab_text_y,
-                        scale: 1.0,
-                        bounds: strip_bounds,
-                        default_color: Color::rgb(180, 180, 190),
-                        custom_glyphs: &[],
-                    }
-                }),
-                &mut self.swash_cache,
-            )
-            .expect("close text prepare failed");
 
-        // Status bar text — single line, centred vertically inside the bar.
         let status_bar = self.status_bar_rect();
-        let status_text_y =
-            status_bar.min_y() + (status_bar.size.height - self.line_height()) * 0.5;
-        let status_text_x = status_bar.min_x() + STATUS_PAD_X_DIP * self.scale;
+        let status_y = status_bar.min_y() + (status_bar.size.height - self.line_height()) * 0.5;
+        let status_pad_x = STATUS_PAD_X_DIP * self.scale;
+        let status_left_x = status_bar.min_x() + status_pad_x;
+        let status_right_x = (status_bar.min_x() + status_bar.size.width
+            - status_pad_x
+            - shaped_width(&self.status_right))
+        .max(status_left_x);
         let status_bounds = TextBounds {
             left: 0,
             top: status_bar.min_y() as i32,
             right: surface_w as i32,
             bottom: surface_h as i32,
         };
-        self.status_text
-            .viewport
-            .update(&self.gpu.queue, resolution);
-        self.status_text
+
+        let find_open = self.doc().find.is_some();
+        let find_xy = if find_open {
+            Some(self.find_text_origin())
+        } else {
+            None
+        };
+
+        let palette_open = self.palette.is_some();
+        let palette_xy = if palette_open {
+            Some(self.palette_text_origin())
+        } else {
+            None
+        };
+
+        let mut text_areas: Vec<TextArea> = Vec::with_capacity(6 + docs_len);
+        text_areas.push(TextArea {
+            buffer: &self.text.buffer,
+            left: inset_x,
+            top: inset_y - scroll,
+            scale: 1.0,
+            bounds: editor_text_bounds,
+            default_color: editor_color,
+            custom_glyphs: &[],
+        });
+        text_areas.push(TextArea {
+            buffer: &self.tabs_text.buffer,
+            left: tab_text_pad_x,
+            top: tab_text_y,
+            scale: 1.0,
+            bounds: strip_bounds,
+            default_color: label_color,
+            custom_glyphs: &[],
+        });
+        for i in 0..docs_len {
+            let slot_x = i as f32 * slot_w;
+            let close_x = slot_x + slot_w - close_w - close_pad + close_glyph_offset_x;
+            text_areas.push(TextArea {
+                buffer: &self.close_text.buffer,
+                left: close_x,
+                top: tab_text_y,
+                scale: 1.0,
+                bounds: strip_bounds,
+                default_color: dim_color,
+                custom_glyphs: &[],
+            });
+        }
+        text_areas.push(TextArea {
+            buffer: &self.status_left.buffer,
+            left: status_left_x,
+            top: status_y,
+            scale: 1.0,
+            bounds: status_bounds,
+            default_color: dim_color,
+            custom_glyphs: &[],
+        });
+        text_areas.push(TextArea {
+            buffer: &self.status_right.buffer,
+            left: status_right_x,
+            top: status_y,
+            scale: 1.0,
+            bounds: status_bounds,
+            default_color: dim_color,
+            custom_glyphs: &[],
+        });
+        if let Some((fx, fy)) = find_xy {
+            text_areas.push(TextArea {
+                buffer: &self.find_text.buffer,
+                left: fx,
+                top: fy,
+                scale: 1.0,
+                bounds: full_bounds,
+                default_color: editor_color,
+                custom_glyphs: &[],
+            });
+        }
+        if let Some((px, py)) = palette_xy {
+            text_areas.push(TextArea {
+                buffer: &self.palette_text.buffer,
+                left: px,
+                top: py,
+                scale: 1.0,
+                bounds: full_bounds,
+                default_color: editor_color,
+                custom_glyphs: &[],
+            });
+        }
+
+        self.text_gpu.viewport.update(&self.gpu.queue, resolution);
+        self.text_gpu
             .renderer
             .prepare(
                 &self.gpu.device,
                 &self.gpu.queue,
                 &mut self.font_system,
-                &mut self.status_text.atlas,
-                &self.status_text.viewport,
-                [TextArea {
-                    buffer: &self.status_text.buffer,
-                    left: status_text_x,
-                    top: status_text_y,
-                    scale: 1.0,
-                    bounds: status_bounds,
-                    default_color: Color::rgb(180, 180, 190),
-                    custom_glyphs: &[],
-                }],
+                &mut self.text_gpu.atlas,
+                &self.text_gpu.viewport,
+                text_areas,
                 &mut self.swash_cache,
             )
-            .expect("status text prepare failed");
-
-        let find_open = self.doc().find.is_some();
-        if find_open {
-            let (fx, fy) = self.find_text_origin();
-            self.find_text.viewport.update(&self.gpu.queue, resolution);
-            self.find_text
-                .renderer
-                .prepare(
-                    &self.gpu.device,
-                    &self.gpu.queue,
-                    &mut self.font_system,
-                    &mut self.find_text.atlas,
-                    &self.find_text.viewport,
-                    [TextArea {
-                        buffer: &self.find_text.buffer,
-                        left: fx,
-                        top: fy,
-                        scale: 1.0,
-                        bounds: full_bounds,
-                        default_color: Color::rgb(238, 238, 238),
-                        custom_glyphs: &[],
-                    }],
-                    &mut self.swash_cache,
-                )
-                .expect("find text prepare failed");
-        }
-
-        let palette_open = self.palette.is_some();
-        if palette_open {
-            let (px, py) = self.palette_text_origin();
-            self.palette_text
-                .viewport
-                .update(&self.gpu.queue, resolution);
-            self.palette_text
-                .renderer
-                .prepare(
-                    &self.gpu.device,
-                    &self.gpu.queue,
-                    &mut self.font_system,
-                    &mut self.palette_text.atlas,
-                    &self.palette_text.viewport,
-                    [TextArea {
-                        buffer: &self.palette_text.buffer,
-                        left: px,
-                        top: py,
-                        scale: 1.0,
-                        bounds: full_bounds,
-                        default_color: Color::rgb(238, 238, 238),
-                        custom_glyphs: &[],
-                    }],
-                    &mut self.swash_cache,
-                )
-                .expect("palette text prepare failed");
-        }
+            .expect("text prepare failed");
 
         let Some(frame) = self.gpu.acquire() else {
             return;
@@ -1935,58 +2114,16 @@ impl State {
                 multiview_mask: None,
             });
             // Editor quads first (tab strip backdrops + selection + carets +
-            // overlay panels); then editor text; then tab labels; then
-            // overlay text on top.
+            // overlay panels); then every text region in one render call.
             self.quads.render(&mut pass);
-            self.text
+            self.text_gpu
                 .renderer
-                .render(&self.text.atlas, &self.text.viewport, &mut pass)
+                .render(&self.text_gpu.atlas, &self.text_gpu.viewport, &mut pass)
                 .expect("text render failed");
-            self.tabs_text
-                .renderer
-                .render(&self.tabs_text.atlas, &self.tabs_text.viewport, &mut pass)
-                .expect("tabs text render failed");
-            self.close_text
-                .renderer
-                .render(&self.close_text.atlas, &self.close_text.viewport, &mut pass)
-                .expect("close text render failed");
-            self.status_text
-                .renderer
-                .render(
-                    &self.status_text.atlas,
-                    &self.status_text.viewport,
-                    &mut pass,
-                )
-                .expect("status text render failed");
-            if find_open {
-                self.find_text
-                    .renderer
-                    .render(&self.find_text.atlas, &self.find_text.viewport, &mut pass)
-                    .expect("find text render failed");
-            }
-            if palette_open {
-                self.palette_text
-                    .renderer
-                    .render(
-                        &self.palette_text.atlas,
-                        &self.palette_text.viewport,
-                        &mut pass,
-                    )
-                    .expect("palette text render failed");
-            }
         }
         self.gpu.queue.submit(Some(encoder.finish()));
         frame.present();
-        self.text.atlas.trim();
-        self.tabs_text.atlas.trim();
-        self.close_text.atlas.trim();
-        self.status_text.atlas.trim();
-        if palette_open {
-            self.palette_text.atlas.trim();
-        }
-        if find_open {
-            self.find_text.atlas.trim();
-        }
+        self.text_gpu.atlas.trim();
 
         self.last_frame_us = frame_start.elapsed().as_micros();
         self.frame_count += 1;
@@ -2023,22 +2160,83 @@ struct App {
     initial_text: String,
     file_path: Option<PathBuf>,
     settings: Settings,
+    settings_path: Option<PathBuf>,
+    /// Optional `.lighteditor/settings.toml` next to the cwd. Overlaid on top
+    /// of `settings_path` when both exist (workspace > user > default).
+    workspace_settings_path: Option<PathBuf>,
+    /// Used to schedule `AppEvent::ClearFlash` from a sleeper thread.
+    proxy: EventLoopProxy<AppEvent>,
+    /// Kept alive so the watcher threads don't shut down; consulted only
+    /// via the user-event proxy so the fields themselves are otherwise unused.
+    _user_watcher: Option<RecommendedWatcher>,
+    _workspace_watcher: Option<RecommendedWatcher>,
     state: Option<State>,
 }
 
 impl App {
-    fn new(initial_text: String, file_path: Option<PathBuf>, settings: Settings) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        initial_text: String,
+        file_path: Option<PathBuf>,
+        settings: Settings,
+        settings_path: Option<PathBuf>,
+        workspace_settings_path: Option<PathBuf>,
+        proxy: EventLoopProxy<AppEvent>,
+        user_watcher: Option<RecommendedWatcher>,
+        workspace_watcher: Option<RecommendedWatcher>,
+    ) -> Self {
         Self {
             cold_start: Instant::now(),
             initial_text,
             file_path,
             settings,
+            settings_path,
+            workspace_settings_path,
+            proxy,
+            _user_watcher: user_watcher,
+            _workspace_watcher: workspace_watcher,
             state: None,
         }
     }
+
+    /// Re-read user + workspace settings from disk and overlay them. The
+    /// user file ranks below workspace per spec §4.1.5.
+    fn current_settings(&self) -> Settings {
+        let mut s = match self.settings_path.as_deref() {
+            Some(p) => Settings::load_or_default(p),
+            None => Settings::default(),
+        };
+        if let Some(p) = self.workspace_settings_path.as_deref() {
+            s.merge(&Settings::load_partial(p));
+        }
+        s
+    }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::SettingsChanged => {
+                let new_settings = self.current_settings();
+                // macOS fsevent fires several events for one save (write
+                // tmp, rename, attribute change) — bail when the merged
+                // contents haven't actually changed so the log isn't N×.
+                if new_settings == self.settings {
+                    return;
+                }
+                if let Some(state) = self.state.as_mut() {
+                    state.reload_settings(&new_settings);
+                }
+                self.settings = new_settings;
+            }
+            AppEvent::ClearFlash => {
+                if let Some(state) = self.state.as_mut() {
+                    state.clear_status_flash();
+                }
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -2057,6 +2255,7 @@ impl ApplicationHandler for App {
             &self.initial_text,
             self.file_path.clone(),
             &self.settings,
+            self.proxy.clone(),
         );
         state.window.request_redraw();
         self.state = Some(state);
@@ -2132,16 +2331,87 @@ fn main() {
         None => (WELCOME_TEXT.to_string(), None),
     };
 
-    let settings = match dirs::config_dir() {
-        Some(dir) => Settings::load_or_default(&dir.join(CONFIG_SUBDIR).join(CONFIG_FILENAME)),
+    let settings_path = dirs::config_dir().map(|d| d.join(CONFIG_SUBDIR).join(CONFIG_FILENAME));
+    let workspace_settings_path = std::env::current_dir()
+        .ok()
+        .map(|d| d.join(WORKSPACE_CONFIG_SUBDIR).join(CONFIG_FILENAME));
+
+    // Default → User → Workspace per spec §4.1.5.
+    let mut settings = match settings_path.as_deref() {
+        Some(p) => Settings::load_or_default(p),
         None => {
             log::warn!("no XDG config dir; using default settings");
             Settings::default()
         }
     };
+    if let Some(p) = workspace_settings_path.as_deref() {
+        settings.merge(&Settings::load_partial(p));
+    }
 
-    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
+        .build()
+        .expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(initial_text, file_path, settings);
+
+    // Watch both settings.toml paths so font_size / line_height / tab_size
+    // hot-reload without a restart. Either watcher firing triggers a full
+    // re-merge, so the precedence rules stay consistent.
+    let user_watcher = settings_path
+        .as_deref()
+        .and_then(|p| spawn_settings_watcher(p, event_loop.create_proxy()));
+    let workspace_watcher = workspace_settings_path
+        .as_deref()
+        .and_then(|p| spawn_settings_watcher(p, event_loop.create_proxy()));
+
+    let mut app = App::new(
+        initial_text,
+        file_path,
+        settings,
+        settings_path,
+        workspace_settings_path,
+        event_loop.create_proxy(),
+        user_watcher,
+        workspace_watcher,
+    );
     event_loop.run_app(&mut app).expect("event loop failed");
+}
+
+/// Spawn a file watcher that fires `AppEvent::SettingsChanged` on the
+/// event-loop proxy every time `settings_path`'s filename gets touched.
+/// Returns `None` if anything along the way fails — the editor still runs
+/// with the loaded settings, just without hot-reload.
+fn spawn_settings_watcher(
+    settings_path: &Path,
+    proxy: EventLoopProxy<AppEvent>,
+) -> Option<RecommendedWatcher> {
+    let parent = settings_path.parent()?;
+    if !parent.exists() {
+        // Create the dir so the watcher has something to attach to — the
+        // user might write settings.toml *after* launch.
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("could not create settings dir {}: {}", parent.display(), e);
+            return None;
+        }
+    }
+    let target = settings_path.file_name()?.to_os_string();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let Ok(event) = event else { return };
+        if event
+            .paths
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n == target))
+        {
+            // Loop has gone away if this errors; the watcher is about to be
+            // dropped anyway.
+            let _ = proxy.send_event(AppEvent::SettingsChanged);
+        }
+    })
+    .map_err(|e| log::warn!("settings watcher init failed: {e}"))
+    .ok()?;
+    watcher
+        .watch(parent, RecursiveMode::NonRecursive)
+        .map_err(|e| log::warn!("settings watcher attach failed: {e}"))
+        .ok()?;
+    log::info!("watching {} for settings changes", parent.display());
+    Some(watcher)
 }

@@ -18,5 +18,6 @@ pub use selection_set::SelectionSet;
 pub use undo::UndoTree;
 
 // Re-exported: callers placing selections from pixel coordinates (mouse input)
-// need `Position` to talk to the buffer.
-pub use editor_buffer::Position;
+// need `Position` to talk to the buffer; `LineEnding` is exposed so status-bar
+// UI can name the dominant convention without depending on `editor-buffer`.
+pub use editor_buffer::{LineEnding, Position};
