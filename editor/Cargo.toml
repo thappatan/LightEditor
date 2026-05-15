@@ -33,7 +33,7 @@ members = [
     # "crates/ai/mcp",         # MCP client
 
     # ── Application ───────────────────────────────────────
-    # "crates/config",         # settings + keymaps
+    "crates/config",           # settings + keymaps (TOML, ADR-009)
     # "crates/workspace",      # project management
     # "crates/theme",          # theme engine
     "crates/app",              # main binary (entry point)
@@ -51,6 +51,7 @@ rust-version = "1.75"       # adjust per Claude Code recommendation
 [workspace.dependencies]
 # Internal crates (path deps).
 editor-buffer = { path = "crates/buffer" }
+editor-config = { path = "crates/config" }
 editor-core = { path = "crates/editor-core" }
 editor-ui-render = { path = "crates/ui/render" }
 editor-ui-scene = { path = "crates/ui/scene" }
@@ -68,6 +69,9 @@ unicode-segmentation = "1"
 bytemuck = { version = "1", features = ["derive"] }
 rfd = "0.15"
 nucleo-matcher = "0.3"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+dirs = "5"
 # tree-sitter = "0.22"
 # tokio = { version = "1", features = ["full"] }
 # lsp-types = "0.95"

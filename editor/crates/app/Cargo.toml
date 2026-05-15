@@ -10,6 +10,7 @@ name = "app"
 path = "src/main.rs"
 
 [dependencies]
+editor-config = { workspace = true }
 editor-core = { workspace = true }
 editor-ui-render = { workspace = true }
 editor-ui-scene = { workspace = true }
@@ -20,3 +21,4 @@ log = { workspace = true }
 env_logger = { workspace = true }
 rfd = { workspace = true }
 nucleo-matcher = { workspace = true }
+dirs = { workspace = true }
