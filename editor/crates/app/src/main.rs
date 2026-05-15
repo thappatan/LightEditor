@@ -885,11 +885,9 @@ impl ApplicationHandler for App {
             return;
         };
         match event {
-            WindowEvent::CloseRequested => {
-                if state.confirm_unsaved("Close") {
-                    log::info!("close requested — exiting");
-                    event_loop.exit();
-                }
+            WindowEvent::CloseRequested if state.confirm_unsaved("Close") => {
+                log::info!("close requested — exiting");
+                event_loop.exit();
             }
             WindowEvent::Resized(size) => state.resize(size),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
