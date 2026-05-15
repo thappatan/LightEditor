@@ -25,6 +25,13 @@ pub struct FindBar {
     replacement: String,
     /// Which input row keys go to. `Tab` toggles.
     focus: FindFocus,
+    /// When `true`, matches must match the query's case. Default `false`
+    /// (case-insensitive) matches VSCode's default.
+    case_sensitive: bool,
+    /// When `true`, matches are only accepted when both edges land on a
+    /// word boundary (the char before / after the match is non-word or the
+    /// buffer edge).
+    whole_word: bool,
     /// Char-index ranges (half-open) of every literal match against the
     /// buffer text the bar was last updated against. In buffer order.
     matches: Vec<Range<usize>>,
@@ -35,11 +42,14 @@ pub struct FindBar {
 
 impl FindBar {
     /// A find bar with no query, no matches, focus on the query input.
+    /// Case-insensitive and any-position by default.
     pub fn new() -> Self {
         Self {
             query: String::new(),
             replacement: String::new(),
             focus: FindFocus::Query,
+            case_sensitive: false,
+            whole_word: false,
             matches: Vec::new(),
             current: 0,
         }
@@ -63,6 +73,26 @@ impl FindBar {
             FindFocus::Query => FindFocus::Replacement,
             FindFocus::Replacement => FindFocus::Query,
         };
+    }
+
+    pub fn case_sensitive(&self) -> bool {
+        self.case_sensitive
+    }
+
+    pub fn whole_word(&self) -> bool {
+        self.whole_word
+    }
+
+    /// Flip case-sensitivity and recompute the match list against `text`.
+    pub fn toggle_case_sensitive(&mut self, text: &str) {
+        self.case_sensitive = !self.case_sensitive;
+        self.recompute(text);
+    }
+
+    /// Flip whole-word matching and recompute the match list against `text`.
+    pub fn toggle_whole_word(&mut self, text: &str) {
+        self.whole_word = !self.whole_word;
+        self.recompute(text);
     }
 
     /// Every match, in buffer order.
@@ -138,25 +168,33 @@ impl FindBar {
     }
 
     /// Walk `text` and collect non-overlapping matches of `self.query` as
-    /// half-open char ranges. Resets `current` to 0.
+    /// half-open char ranges. Resets `current` to 0. Honours
+    /// `case_sensitive` and `whole_word`.
     fn recompute(&mut self, text: &str) {
         self.matches.clear();
         self.current = 0;
         if self.query.is_empty() {
             return;
         }
-        // Char-based scan so the recorded ranges are char indices, matching
-        // editor-core's `Selection` model. `chars().collect()` is O(n) for
-        // the buffer; for a real editor this would shape against the rope
-        // directly, but it's fine for M1.
         let haystack: Vec<char> = text.chars().collect();
         let needle: Vec<char> = self.query.chars().collect();
         if needle.is_empty() || needle.len() > haystack.len() {
             return;
         }
+        let cs = self.case_sensitive;
+        let ww = self.whole_word;
         let mut i = 0;
         while i + needle.len() <= haystack.len() {
-            if haystack[i..i + needle.len()] == needle[..] {
+            let candidate = &haystack[i..i + needle.len()];
+            let matches_here = if cs {
+                candidate.iter().eq(needle.iter())
+            } else {
+                candidate
+                    .iter()
+                    .zip(needle.iter())
+                    .all(|(h, n)| chars_eq_ignore_case(*h, *n))
+            };
+            if matches_here && (!ww || is_whole_word(&haystack, i, i + needle.len())) {
                 self.matches.push(i..i + needle.len());
                 i += needle.len(); // non-overlapping
             } else {
@@ -164,6 +202,27 @@ impl FindBar {
             }
         }
     }
+}
+
+/// Compare two chars ignoring case. Uses `char::to_lowercase` so common
+/// Latin / Greek / Cyrillic case pairs work; multi-char foldings like
+/// German ß → "ss" only match the first char and are a known limitation.
+fn chars_eq_ignore_case(a: char, b: char) -> bool {
+    if a == b {
+        return true;
+    }
+    a.to_lowercase().next() == b.to_lowercase().next()
+}
+
+/// `true` when `start..end` in `haystack` sits between word boundaries: the
+/// char immediately before `start` (if any) and the char at `end` (if any)
+/// must both be non-word — where "word" is alphanumeric or underscore, the
+/// same definition the double-click selection uses.
+fn is_whole_word(haystack: &[char], start: usize, end: usize) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let prev_ok = start == 0 || !is_word(haystack[start - 1]);
+    let next_ok = end == haystack.len() || !is_word(haystack[end]);
+    prev_ok && next_ok
 }
 
 impl Default for FindBar {
@@ -288,6 +347,66 @@ mod tests {
         f.backspace("abc");
         assert!(f.query().is_empty());
         assert_eq!(f.replacement(), "X");
+    }
+
+    #[test]
+    fn case_insensitive_is_default_and_finds_mixed_case() {
+        let mut f = FindBar::new();
+        for c in "abc".chars() {
+            f.push_char(c, "ABC abc Abc");
+        }
+        // 3 case-insensitive matches.
+        assert_eq!(f.match_count(), 3);
+    }
+
+    #[test]
+    fn toggling_case_sensitive_filters_to_exact_case() {
+        let text = "ABC abc Abc";
+        let mut f = FindBar::new();
+        for c in "abc".chars() {
+            f.push_char(c, text);
+        }
+        f.toggle_case_sensitive(text);
+        // Only the lowercase "abc" remains.
+        assert_eq!(ranges(&f), vec![4..7]);
+        // Flip back — all three matches return.
+        f.toggle_case_sensitive(text);
+        assert_eq!(f.match_count(), 3);
+    }
+
+    #[test]
+    fn whole_word_rejects_inner_matches() {
+        let text = "foo foobar barfoo foo_bar baz foo";
+        let mut f = FindBar::new();
+        for c in "foo".chars() {
+            f.push_char(c, text);
+        }
+        // Substring: every occurrence including inside "foobar", "barfoo",
+        // "foo_bar".
+        assert_eq!(f.match_count(), 5);
+        f.toggle_whole_word(text);
+        // Only the standalone "foo" tokens remain — the start of "foo bar"
+        // and the very last one.
+        assert_eq!(ranges(&f), vec![0..3, 30..33]);
+    }
+
+    #[test]
+    fn case_and_whole_word_combine() {
+        let text = "Foo foo foo Foo";
+        let mut f = FindBar::new();
+        for c in "foo".chars() {
+            f.push_char(c, text);
+        }
+        assert_eq!(f.match_count(), 4);
+        f.toggle_case_sensitive(text);
+        // Case-sensitive — only lowercase tokens, but with substring rules
+        // they're at positions 4 and 8 (and not "Foo"); whole-word is OFF
+        // here so any positions match.
+        assert_eq!(ranges(&f), vec![4..7, 8..11]);
+        f.toggle_whole_word(text);
+        // Now both case-sensitive AND whole-word — same matches survive
+        // because the inner-match cases are also whole-word boundaries.
+        assert_eq!(ranges(&f), vec![4..7, 8..11]);
     }
 
     #[test]

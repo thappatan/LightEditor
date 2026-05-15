@@ -1690,8 +1690,15 @@ impl State {
             FindFocus::Query => ("❯", " "),
             FindFocus::Replacement => (" ", "❯"),
         };
+        let mut flags = String::new();
+        if find.case_sensitive() {
+            flags.push_str(" · Aa");
+        }
+        if find.whole_word() {
+            flags.push_str(" · ab|");
+        }
         let caption = format!(
-            "{q_mark} Find:    {query}   {count_label}\n{r_mark} Replace: {replacement}",
+            "{q_mark} Find:    {query}   {count_label}{flags}\n{r_mark} Replace: {replacement}",
             query = find.query(),
             replacement = find.replacement(),
         );
@@ -1712,6 +1719,37 @@ impl State {
 
     /// Route a key while the find bar is open.
     fn handle_find_key(&mut self, event: KeyEvent) {
+        // Cmd-Alt-C / Cmd-Alt-W toggle match-case / whole-word — checked
+        // before the regular character branch so the chord doesn't insert
+        // 'c' or 'w' into the query.
+        if is_cmd_or_ctrl(self.modifiers) && self.modifiers.alt_key() {
+            if let Key::Character(c) = &event.logical_key {
+                let buffer_text = self.doc().editor.text();
+                match c.to_lowercase().as_str() {
+                    "c" => {
+                        if let Some(f) = self.doc_mut().find.as_mut() {
+                            f.toggle_case_sensitive(&buffer_text);
+                        }
+                        self.refresh_find_text();
+                        self.select_current_match();
+                        self.scene_dirty = true;
+                        self.window.request_redraw();
+                        return;
+                    }
+                    "w" => {
+                        if let Some(f) = self.doc_mut().find.as_mut() {
+                            f.toggle_whole_word(&buffer_text);
+                        }
+                        self.refresh_find_text();
+                        self.select_current_match();
+                        self.scene_dirty = true;
+                        self.window.request_redraw();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_find(),
             Key::Named(NamedKey::Tab) => {
