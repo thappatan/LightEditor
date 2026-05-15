@@ -134,6 +134,20 @@ impl Editor {
         self.selections = SelectionSet::single(clamped);
     }
 
+    /// Add a selection alongside the existing ones (multi-cursor). The
+    /// [`SelectionSet`] sorts and merges overlapping ranges; the new
+    /// selection becomes the primary if it does not get merged away.
+    pub fn add_selection(&mut self, selection: Selection) {
+        let len = self.buffer.len_chars();
+        let clamped = Selection::new(selection.anchor.min(len), selection.head.min(len));
+        self.selections.push(clamped);
+    }
+
+    /// Drop every selection except the primary.
+    pub fn collapse_to_primary(&mut self) {
+        self.selections.collapse_to_primary();
+    }
+
     // ── undo / redo ───────────────────────────────────────────────────────
 
     /// Whether [`undo`](Editor::undo) would do anything.
