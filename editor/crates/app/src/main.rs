@@ -162,6 +162,15 @@ fn line_ending_label(le: LineEnding) -> &'static str {
     }
 }
 
+/// Short label suitable for a status-bar flash — just the filename (with
+/// extension), falling back to the full path's stringified form for weird
+/// edge cases where there is no terminal component.
+fn filename_for_flash(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
 /// Width of the text shaped into `stack` in physical pixels — the maximum
 /// `x + width` over every glyph in every layout run. Used to right-align
 /// short captions whose width depends on the content (e.g. "Ln L, Col C").
@@ -288,9 +297,12 @@ struct State {
 
     /// Transient overlay for the status bar's left half — `Some((msg, t))`
     /// while a flash is active. Cleared via `AppEvent::ClearFlash` after
-    /// [`FLASH_DURATION`]; the `Instant` is a safety net in case the timer
-    /// event is lost.
+    /// [`FLASH_DURATION`]; the `Instant` is also used to gate the clear so
+    /// a later flash isn't wiped early by an earlier flash's timer.
     status_flash: Option<(String, Instant)>,
+    /// Used by `set_status_flash` to schedule its own `ClearFlash` event
+    /// from a detached sleeper thread. Clone-cheap.
+    flash_proxy: EventLoopProxy<AppEvent>,
 
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
@@ -308,6 +320,7 @@ impl State {
         initial_text: &str,
         file_path: Option<PathBuf>,
         settings: &Settings,
+        flash_proxy: EventLoopProxy<AppEvent>,
     ) -> Self {
         let scale = window.scale_factor() as f32;
         let size = window.inner_size();
@@ -443,6 +456,7 @@ impl State {
             palette_text,
             find_text,
             status_flash: None,
+            flash_proxy,
             tab_spaces,
             pending_keystroke: None,
             frame_count: 0,
@@ -551,17 +565,33 @@ impl State {
         self.window.request_redraw();
     }
 
-    /// Show `msg` on the status bar's left half until `FLASH_DURATION`
-    /// elapses (the App schedules an `AppEvent::ClearFlash` to fire it
-    /// off).
+    /// Show `msg` on the status bar's left half and schedule its own
+    /// `AppEvent::ClearFlash` after [`FLASH_DURATION`].
+    ///
+    /// Each call spawns a detached sleeper thread; if `msg` overwrites a
+    /// previous flash, both timers will fire, but `clear_status_flash`
+    /// gates on the stored timestamp so the *older* timer is a no-op once
+    /// the newer message has refreshed the deadline.
     fn set_status_flash(&mut self, msg: String) {
         self.status_flash = Some((msg, Instant::now()));
         self.scene_dirty = true;
+        let proxy = self.flash_proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(FLASH_DURATION);
+            let _ = proxy.send_event(AppEvent::ClearFlash);
+        });
+        self.window.request_redraw();
     }
 
-    /// Clear any flash and redraw — fired by the App's timer thread.
+    /// Clear the flash if (and only if) it is genuinely expired — the timer
+    /// thread fires this; a stale fire from an earlier flash is dropped.
     fn clear_status_flash(&mut self) {
-        if self.status_flash.take().is_some() {
+        let expired = self
+            .status_flash
+            .as_ref()
+            .is_some_and(|(_, t)| t.elapsed() >= FLASH_DURATION);
+        if expired {
+            self.status_flash = None;
             self.scene_dirty = true;
             self.window.request_redraw();
         }
@@ -787,6 +817,7 @@ impl State {
         match std::fs::write(&path, &text) {
             Ok(()) => {
                 log::info!("saved {}", path.display());
+                let label = filename_for_flash(&path);
                 {
                     let d = self.doc_mut();
                     d.file_path = Some(path);
@@ -794,6 +825,7 @@ impl State {
                 }
                 self.update_title();
                 self.refresh_tabs_text();
+                self.set_status_flash(format!("saved · {label}"));
                 self.scene_dirty = true;
                 self.window.request_redraw();
             }
@@ -909,6 +941,14 @@ impl State {
         self.update_title();
         self.refresh_tabs_text();
         self.refresh_find_text();
+        // Flash the full path (or the label) — useful when many tabs share a
+        // similar truncated label and the user wants confirmation of which
+        // file landed active.
+        let flash = match self.doc().file_path.as_deref() {
+            Some(p) => p.display().to_string(),
+            None => self.doc().label(),
+        };
+        self.set_status_flash(flash);
         self.window.request_redraw();
     }
 
@@ -1005,8 +1045,9 @@ impl State {
 
     /// Re-shape both halves of the status bar.
     ///
-    /// Left half: `path  ·  language  ·  LE` — or a transient flash message
-    /// while [`status_flash`](Self::status_flash) is active and unexpired.
+    /// Left half: `path  ·  language  ·  Spaces: N  ·  LE` — or a transient
+    /// flash message while [`status_flash`](Self::status_flash) is active
+    /// and unexpired.
     /// Right half: `Ln L, Col C  ·  N lines`.
     fn refresh_status(&mut self) {
         let doc = self.doc();
@@ -1016,13 +1057,15 @@ impl State {
         let head = doc.editor.selections().primary().head;
         let pos = doc.editor.buffer().char_to_position(head);
         let lines = doc.editor.buffer().len_lines();
+        let indent = self.tab_spaces.len();
 
         let flash = self
             .status_flash
             .as_ref()
             .filter(|(_, t)| t.elapsed() < FLASH_DURATION)
             .map(|(s, _)| s.clone());
-        let left = flash.unwrap_or_else(|| format!("{label}  ·  {language}  ·  {le}"));
+        let left = flash
+            .unwrap_or_else(|| format!("{label}  ·  {language}  ·  Spaces: {indent}  ·  {le}"));
         let right = format!(
             "Ln {}, Col {}  ·  {} lines",
             pos.line + 1,
@@ -1274,6 +1317,7 @@ impl State {
         match std::fs::write(&path, &text) {
             Ok(()) => {
                 log::info!("saved as {}", path.display());
+                let label = filename_for_flash(&path);
                 {
                     let d = self.doc_mut();
                     d.file_path = Some(path);
@@ -1281,6 +1325,7 @@ impl State {
                 }
                 self.update_title();
                 self.refresh_tabs_text();
+                self.set_status_flash(format!("saved · {label}"));
                 self.scene_dirty = true;
                 self.window.request_redraw();
             }
@@ -2151,13 +2196,6 @@ impl ApplicationHandler<AppEvent> for App {
                     state.reload_settings(&new_settings);
                 }
                 self.settings = new_settings;
-                // Schedule clearing the flash after FLASH_DURATION. Detaching
-                // a thread (vs a winit timer) keeps the event loop generic.
-                let proxy = self.proxy.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(FLASH_DURATION);
-                    let _ = proxy.send_event(AppEvent::ClearFlash);
-                });
             }
             AppEvent::ClearFlash => {
                 if let Some(state) = self.state.as_mut() {
@@ -2185,6 +2223,7 @@ impl ApplicationHandler<AppEvent> for App {
             &self.initial_text,
             self.file_path.clone(),
             &self.settings,
+            self.proxy.clone(),
         );
         state.window.request_redraw();
         self.state = Some(state);
