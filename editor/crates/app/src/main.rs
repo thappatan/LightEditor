@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use document::Document;
 use editor_config::Settings;
-use editor_core::{Position, Selection};
+use editor_core::{LineEnding, Position, Selection};
 use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Point, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{Color, FontSystem, Resolution, SwashCache, TextArea, TextBounds};
@@ -101,6 +101,59 @@ fn is_cmd_or_ctrl(mods: ModifiersState) -> bool {
     mods.super_key() || mods.control_key()
 }
 
+/// A short language label for the status bar, guessed from `path`'s file
+/// extension. Covers the languages M1 is targeting plus a few staples; an
+/// unknown extension or no path falls through to "Plain Text". A proper
+/// language registry is a later (syntax-highlighting) concern.
+fn language_for(path: Option<&Path>) -> &'static str {
+    let Some(ext) = path.and_then(|p| p.extension()).and_then(|e| e.to_str()) else {
+        return "Plain Text";
+    };
+    match ext.to_ascii_lowercase().as_str() {
+        "rs" => "Rust",
+        "ts" | "tsx" => "TypeScript",
+        "js" | "jsx" | "mjs" | "cjs" => "JavaScript",
+        "dart" => "Dart",
+        "py" => "Python",
+        "go" => "Go",
+        "c" | "h" => "C",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "C++",
+        "java" => "Java",
+        "kt" | "kts" => "Kotlin",
+        "swift" => "Swift",
+        "rb" => "Ruby",
+        "md" | "markdown" => "Markdown",
+        "toml" => "TOML",
+        "json" => "JSON",
+        "yaml" | "yml" => "YAML",
+        "html" | "htm" => "HTML",
+        "css" => "CSS",
+        "scss" | "sass" => "SCSS",
+        "sh" | "bash" | "zsh" => "Shell",
+        "sql" => "SQL",
+        _ => "Plain Text",
+    }
+}
+
+/// `"LF"` / `"CRLF"` for the buffer's dominant line-ending convention.
+fn line_ending_label(le: LineEnding) -> &'static str {
+    match le {
+        LineEnding::Lf => "LF",
+        LineEnding::CrLf => "CRLF",
+    }
+}
+
+/// Width of the text shaped into `stack` in physical pixels — the maximum
+/// `x + width` over every glyph in every layout run. Used to right-align
+/// short captions whose width depends on the content (e.g. "Ln L, Col C").
+fn shaped_width(stack: &TextStack) -> f32 {
+    stack
+        .buffer
+        .layout_runs()
+        .flat_map(|run| run.glyphs.iter().map(|g| g.x + g.w))
+        .fold(0.0_f32, f32::max)
+}
+
 /// A window title showing the file name when one is open, or the welcome
 /// label otherwise.
 fn window_title(path: Option<&Path>) -> String {
@@ -155,9 +208,12 @@ struct State {
     /// separate TextAreas at each slot's close-button position; the buffer
     /// content never changes.
     close_text: TextStack,
-    /// TextStack for the bottom status bar — "Ln N, Col M  ·  L lines".
-    /// Reshaped whenever the caret or document changes.
-    status_text: TextStack,
+    /// Left half of the status bar — `path · language · LE`.
+    status_left: TextStack,
+    /// Right half of the status bar — `Ln L, Col C · N lines`. Positioned
+    /// via a measurement of its shaped width so the right edge sits one
+    /// `STATUS_PAD_X_DIP` from the window edge.
+    status_right: TextStack,
 
     /// The scene rebuilt from `editor` whenever it changes.
     scene: Scene,
@@ -311,13 +367,27 @@ impl State {
             "×",
         );
 
-        // Status-bar TextStack — single-line caption at the bottom.
-        let status_text = TextStack::new(
+        // Status-bar TextStacks — one for each side. Both span the whole
+        // strip width so a long left caption can still measure correctly
+        // before we decide whether to truncate.
+        let status_width = size.width as f32 - 2.0 * STATUS_PAD_X_DIP * scale;
+        let status_left = TextStack::new(
             &gpu.device,
             &gpu.queue,
             gpu.format(),
             &mut font_system,
-            size.width as f32 - 2.0 * STATUS_PAD_X_DIP * scale,
+            status_width,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "",
+        );
+        let status_right = TextStack::new(
+            &gpu.device,
+            &gpu.queue,
+            gpu.format(),
+            &mut font_system,
+            status_width,
             font_size_pt,
             line_height_pt,
             scale,
@@ -342,7 +412,8 @@ impl State {
             active: 0,
             tabs_text,
             close_text,
-            status_text,
+            status_left,
+            status_right,
             scene,
             scale,
             text_inset_x: TEXT_INSET_DIP * scale,
@@ -393,10 +464,11 @@ impl State {
             .set_width(&mut self.font_system, size.width as f32 - self.text_padding);
         self.tabs_text
             .set_width(&mut self.font_system, size.width as f32);
-        self.status_text.set_width(
-            &mut self.font_system,
-            size.width as f32 - 2.0 * STATUS_PAD_X_DIP * self.scale,
-        );
+        let status_width = size.width as f32 - 2.0 * STATUS_PAD_X_DIP * self.scale;
+        self.status_left
+            .set_width(&mut self.font_system, status_width);
+        self.status_right
+            .set_width(&mut self.font_system, status_width);
         // Palette / find widths are fixed; nothing to update on a window resize.
         self.text_dirty = true;
         self.scene_dirty = true;
@@ -428,11 +500,11 @@ impl State {
             .set_width(fs, self.gpu.surface_config.width as f32);
         self.close_text.set_scale(fs, scale);
         self.close_text.set_width(fs, TAB_CLOSE_W_DIP * scale);
-        self.status_text.set_scale(fs, scale);
-        self.status_text.set_width(
-            fs,
-            self.gpu.surface_config.width as f32 - 2.0 * STATUS_PAD_X_DIP * scale,
-        );
+        let status_width = self.gpu.surface_config.width as f32 - 2.0 * STATUS_PAD_X_DIP * scale;
+        self.status_left.set_scale(fs, scale);
+        self.status_left.set_width(fs, status_width);
+        self.status_right.set_scale(fs, scale);
+        self.status_right.set_width(fs, status_width);
         self.text_dirty = true;
         self.scene_dirty = true;
         self.window.request_redraw();
@@ -874,20 +946,29 @@ impl State {
         Rect::new(0.0, surface_h - h, surface_w, h)
     }
 
-    /// Re-shape the status caption to reflect the active document's caret
-    /// position and total line count: "Ln L, Col C  ·  N lines". The path is
-    /// already in the window title, so it stays out of the status bar.
-    fn refresh_status_text(&mut self) {
-        let head = self.doc().editor.selections().primary().head;
-        let pos = self.doc().editor.buffer().char_to_position(head);
-        let lines = self.doc().editor.buffer().len_lines();
-        let s = format!(
+    /// Re-shape both halves of the status bar.
+    ///
+    /// Left half: `path  ·  language  ·  LE`.
+    /// Right half: `Ln L, Col C  ·  N lines`.
+    fn refresh_status(&mut self) {
+        let doc = self.doc();
+        let label = doc.label();
+        let language = language_for(doc.file_path.as_deref());
+        let le = line_ending_label(doc.editor.buffer().line_ending());
+        let head = doc.editor.selections().primary().head;
+        let pos = doc.editor.buffer().char_to_position(head);
+        let lines = doc.editor.buffer().len_lines();
+
+        let left = format!("{label}  ·  {language}  ·  {le}");
+        let right = format!(
             "Ln {}, Col {}  ·  {} lines",
             pos.line + 1,
             pos.column + 1,
             lines
         );
-        self.status_text.set_content(&mut self.font_system, &s);
+
+        self.status_left.set_content(&mut self.font_system, &left);
+        self.status_right.set_content(&mut self.font_system, &right);
     }
 
     /// Rebuild the tab-strip TextStack: one line, each label padded to
@@ -1687,7 +1768,7 @@ impl State {
                 self.ensure_caret_visible();
                 self.follow_caret = false;
             }
-            self.refresh_status_text();
+            self.refresh_status();
             self.rebuild_scene();
             self.scene_dirty = false;
         }
@@ -1818,40 +1899,72 @@ impl State {
             )
             .expect("close text prepare failed");
 
-        // Status bar text — single line, centred vertically inside the bar.
+        // Status bar text — left half is `path · lang · LE`, right half is
+        // `Ln L, Col C · N lines`. Both are single-line and centred
+        // vertically inside the bar; the right half is positioned by the
+        // measured width of its shaped buffer so the caption ends one
+        // STATUS_PAD_X from the window's right edge.
         let status_bar = self.status_bar_rect();
-        let status_text_y =
-            status_bar.min_y() + (status_bar.size.height - self.line_height()) * 0.5;
-        let status_text_x = status_bar.min_x() + STATUS_PAD_X_DIP * self.scale;
+        let status_y = status_bar.min_y() + (status_bar.size.height - self.line_height()) * 0.5;
+        let status_pad_x = STATUS_PAD_X_DIP * self.scale;
+        let status_left_x = status_bar.min_x() + status_pad_x;
+        let status_right_x = (status_bar.min_x() + status_bar.size.width
+            - status_pad_x
+            - shaped_width(&self.status_right))
+        .max(status_left_x);
+        let status_color = Color::rgb(180, 180, 190);
         let status_bounds = TextBounds {
             left: 0,
             top: status_bar.min_y() as i32,
             right: surface_w as i32,
             bottom: surface_h as i32,
         };
-        self.status_text
+        self.status_left
             .viewport
             .update(&self.gpu.queue, resolution);
-        self.status_text
+        self.status_left
             .renderer
             .prepare(
                 &self.gpu.device,
                 &self.gpu.queue,
                 &mut self.font_system,
-                &mut self.status_text.atlas,
-                &self.status_text.viewport,
+                &mut self.status_left.atlas,
+                &self.status_left.viewport,
                 [TextArea {
-                    buffer: &self.status_text.buffer,
-                    left: status_text_x,
-                    top: status_text_y,
+                    buffer: &self.status_left.buffer,
+                    left: status_left_x,
+                    top: status_y,
                     scale: 1.0,
                     bounds: status_bounds,
-                    default_color: Color::rgb(180, 180, 190),
+                    default_color: status_color,
                     custom_glyphs: &[],
                 }],
                 &mut self.swash_cache,
             )
-            .expect("status text prepare failed");
+            .expect("status-left prepare failed");
+        self.status_right
+            .viewport
+            .update(&self.gpu.queue, resolution);
+        self.status_right
+            .renderer
+            .prepare(
+                &self.gpu.device,
+                &self.gpu.queue,
+                &mut self.font_system,
+                &mut self.status_right.atlas,
+                &self.status_right.viewport,
+                [TextArea {
+                    buffer: &self.status_right.buffer,
+                    left: status_right_x,
+                    top: status_y,
+                    scale: 1.0,
+                    bounds: status_bounds,
+                    default_color: status_color,
+                    custom_glyphs: &[],
+                }],
+                &mut self.swash_cache,
+            )
+            .expect("status-right prepare failed");
 
         let find_open = self.doc().find.is_some();
         if find_open {
@@ -1950,14 +2063,22 @@ impl State {
                 .renderer
                 .render(&self.close_text.atlas, &self.close_text.viewport, &mut pass)
                 .expect("close text render failed");
-            self.status_text
+            self.status_left
                 .renderer
                 .render(
-                    &self.status_text.atlas,
-                    &self.status_text.viewport,
+                    &self.status_left.atlas,
+                    &self.status_left.viewport,
                     &mut pass,
                 )
-                .expect("status text render failed");
+                .expect("status-left render failed");
+            self.status_right
+                .renderer
+                .render(
+                    &self.status_right.atlas,
+                    &self.status_right.viewport,
+                    &mut pass,
+                )
+                .expect("status-right render failed");
             if find_open {
                 self.find_text
                     .renderer
@@ -1980,7 +2101,8 @@ impl State {
         self.text.atlas.trim();
         self.tabs_text.atlas.trim();
         self.close_text.atlas.trim();
-        self.status_text.atlas.trim();
+        self.status_left.atlas.trim();
+        self.status_right.atlas.trim();
         if palette_open {
             self.palette_text.atlas.trim();
         }
