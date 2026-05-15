@@ -829,16 +829,21 @@ impl State {
                 self.scene_dirty = true;
                 self.window.request_redraw();
             }
-            Err(e) => log::error!("save failed for {}: {}", path.display(), e),
+            Err(e) => {
+                log::error!("save failed for {}: {}", path.display(), e);
+                let label = filename_for_flash(&path);
+                self.set_status_flash(format!("save failed · {label} · {e}"));
+            }
         }
     }
 
     /// Read `path` and place it in the editor. If the active document is a
     /// pristine, never-saved, never-edited scratch buffer, replace it in-place
     /// (matches VSCode's behaviour for untouched "Untitled-1"); otherwise
-    /// push a new tab and activate it. I/O failure is logged and the state
-    /// is left intact.
+    /// push a new tab and activate it. I/O failure is logged AND flashed on
+    /// the status bar — the editor's state is left intact.
     fn open_path(&mut self, path: PathBuf) {
+        let flash_label = filename_for_flash(&path);
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 let new_doc = Document::from_file(path, &content);
@@ -854,9 +859,13 @@ impl State {
                 self.update_title();
                 self.refresh_tabs_text();
                 self.refresh_find_text();
+                self.set_status_flash(format!("opened · {flash_label}"));
                 self.window.request_redraw();
             }
-            Err(e) => log::error!("could not read {}: {}", path.display(), e),
+            Err(e) => {
+                log::error!("could not read {}: {}", path.display(), e);
+                self.set_status_flash(format!("open failed · {flash_label} · {e}"));
+            }
         }
     }
 
@@ -1285,17 +1294,24 @@ impl State {
     /// Save every dirty document in turn. Documents without a path get a
     /// Save As dialog each; the user may cancel any one of them, in which
     /// case that document stays dirty and the rest still get saved. After
-    /// the walk we return to the document the user was on.
+    /// the walk we return to the document the user was on and flash an
+    /// aggregate count, overriding any per-file flash `save_to_file` set.
     fn save_all(&mut self) {
         let original_active = self.active;
+        let mut dirty_total = 0usize;
+        let mut saved = 0usize;
         for i in 0..self.docs.len() {
             if !self.docs[i].dirty {
                 continue;
             }
+            dirty_total += 1;
             if i != self.active {
                 self.active = i;
             }
             self.save_to_file();
+            if !self.docs[self.active].dirty {
+                saved += 1;
+            }
         }
         if original_active < self.docs.len() {
             self.active = original_active;
@@ -1305,6 +1321,18 @@ impl State {
         self.refresh_find_text();
         self.scene_dirty = true;
         self.text_dirty = true;
+        if dirty_total > 0 {
+            let msg = if saved == dirty_total {
+                if saved == 1 {
+                    "saved 1 file".to_string()
+                } else {
+                    format!("saved {saved} files")
+                }
+            } else {
+                format!("saved {saved} of {dirty_total} files")
+            };
+            self.set_status_flash(msg);
+        }
         self.window.request_redraw();
     }
 
@@ -1329,7 +1357,11 @@ impl State {
                 self.scene_dirty = true;
                 self.window.request_redraw();
             }
-            Err(e) => log::error!("save failed: {}", e),
+            Err(e) => {
+                log::error!("save failed: {}", e);
+                let label = filename_for_flash(&path);
+                self.set_status_flash(format!("save failed · {label} · {e}"));
+            }
         }
     }
 
