@@ -105,6 +105,12 @@ impl TextStack {
         self.line_height_pt * self.scale
     }
 
+    /// Logical font size (points / DIP). Multiply by the current window scale
+    /// for the physical-pixel size.
+    pub fn font_size_pt(&self) -> f32 {
+        self.font_size_pt
+    }
+
     /// Reshape the buffer to `text`, using the stack's standard font attributes
     /// and `Shaping::Advanced`. This is the only path that shapes text — `new`
     /// uses it too — so the font can never drift between the initial render
