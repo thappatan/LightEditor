@@ -22,7 +22,7 @@ use document::Document;
 use editor_config::Settings;
 use editor_core::{Position, Selection};
 use editor_ui_render::{GpuContext, QuadRenderer};
-use editor_ui_scene::{Color as SceneColor, Rect, Scene, SceneNode};
+use editor_ui_scene::{Color as SceneColor, Point, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{Color, Resolution, TextArea, TextBounds};
 use editor_ui_text::TextStack;
 use find::FindBar;
@@ -58,6 +58,11 @@ const TAB_BAR_HEIGHT_DIP: f32 = 30.0;
 const TAB_WIDTH_DIP: f32 = 180.0;
 /// Padding inside one tab slot (left edge → start of label), in logical pixels.
 const TAB_PAD_X_DIP: f32 = 10.0;
+/// Width/height of the close-button "×" hit area at the right edge of each
+/// tab slot, in logical pixels.
+const TAB_CLOSE_W_DIP: f32 = 18.0;
+/// Padding between the close button and the slot's right edge, in logical pixels.
+const TAB_CLOSE_PAD_DIP: f32 = 6.0;
 /// Approximate number of monospace characters that fit in one tab slot's
 /// labelled area. Tuned at `font_size_pt = 16` and `TAB_WIDTH_DIP = 180`;
 /// `Family::Monospace` puts ASCII at ~9.6 dip wide, so a 160 dip label
@@ -132,6 +137,10 @@ struct State {
     /// TextStack dedicated to the tab strip labels. Rebuilt whenever the
     /// tab list, a label, or a dirty flag changes — *not* on every keystroke.
     tabs_text: TextStack,
+    /// TextStack holding a single "×" glyph. Rendered once per tab via
+    /// separate TextAreas at each slot's close-button position; the buffer
+    /// content never changes.
+    close_text: TextStack,
 
     /// The scene rebuilt from `editor` whenever it changes.
     scene: Scene,
@@ -262,6 +271,19 @@ impl State {
             "",
         );
 
+        // Close-button TextStack — shapes the "×" glyph once and is then
+        // drawn at every tab's close-button position via N TextAreas.
+        let close_text = TextStack::new(
+            &gpu.device,
+            &gpu.queue,
+            gpu.format(),
+            TAB_CLOSE_W_DIP * scale,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "×",
+        );
+
         let scene = Scene::new(SceneNode::group(Rect::new(
             0.0,
             0.0,
@@ -277,6 +299,7 @@ impl State {
             docs: vec![doc],
             active: 0,
             tabs_text,
+            close_text,
             scene,
             scale,
             text_inset_x: TEXT_INSET_DIP * scale,
@@ -353,6 +376,8 @@ impl State {
         self.tabs_text.set_scale(scale);
         self.tabs_text
             .set_width(self.gpu.surface_config.width as f32);
+        self.close_text.set_scale(scale);
+        self.close_text.set_width(TAB_CLOSE_W_DIP * scale);
         self.text_dirty = true;
         self.scene_dirty = true;
         self.window.request_redraw();
@@ -517,12 +542,17 @@ impl State {
         }
     }
 
-    /// Left-button press: tab-strip click switches tabs; below it places a
-    /// caret and starts a potential drag.
+    /// Left-button press: tab-strip click switches tabs (or closes the tab
+    /// when the press lands on its "×"); below the strip it places a caret
+    /// and starts a potential drag.
     fn handle_mouse_press(&mut self) {
         let Some((mx, my)) = self.mouse_pos else {
             return;
         };
+        if let Some(idx) = self.tab_close_at_pixel(mx, my) {
+            self.close_tab_at(idx);
+            return;
+        }
         if let Some(idx) = self.tab_at_pixel(mx, my) {
             self.switch_tab(idx);
             return;
@@ -537,6 +567,17 @@ impl State {
         self.scene_dirty = true;
         self.follow_caret = true;
         self.window.request_redraw();
+    }
+
+    /// Middle-button press inside the tab strip closes the tab under the
+    /// cursor (common browser-tab convention). Below the strip it is ignored.
+    fn handle_mouse_middle(&mut self) {
+        let Some((mx, my)) = self.mouse_pos else {
+            return;
+        };
+        if let Some(idx) = self.tab_at_pixel(mx, my) {
+            self.close_tab_at(idx);
+        }
     }
 
     /// Left-button release: end any drag.
@@ -700,6 +741,32 @@ impl State {
         let w = TAB_WIDTH_DIP * self.scale;
         let h = TAB_BAR_HEIGHT_DIP * self.scale;
         Rect::new(idx as f32 * w, 0.0, w, h)
+    }
+
+    /// Square close-button hit/draw region at the right edge of tab `idx`.
+    fn tab_close_rect(&self, idx: usize) -> Rect {
+        let slot = self.tab_slot_rect(idx);
+        let w = TAB_CLOSE_W_DIP * self.scale;
+        let pad = TAB_CLOSE_PAD_DIP * self.scale;
+        let cy = slot.min_y() + slot.size.height * 0.5;
+        Rect::new(slot.min_x() + slot.size.width - w - pad, cy - w * 0.5, w, w)
+    }
+
+    /// Tab whose close button is under a physical-pixel point.
+    fn tab_close_at_pixel(&self, x: f32, y: f32) -> Option<usize> {
+        (0..self.docs.len()).find(|&i| self.tab_close_rect(i).contains(Point::new(x, y)))
+    }
+
+    /// Close the tab at `idx`. Switches to it first so the unsaved-changes
+    /// prompt (if any) is unambiguous about which document it's asking about.
+    fn close_tab_at(&mut self, idx: usize) {
+        if idx >= self.docs.len() {
+            return;
+        }
+        if idx != self.active {
+            self.switch_tab(idx);
+        }
+        self.close_active_tab();
     }
 
     /// Tab index under a physical-pixel point, or `None` if the point is not
@@ -1454,6 +1521,12 @@ impl State {
         let tab_strip_h = TAB_BAR_HEIGHT_DIP * self.scale;
         let tab_text_pad_x = TAB_PAD_X_DIP * self.scale;
         let tab_text_y = (tab_strip_h - self.line_height()) * 0.5;
+        let strip_bounds = TextBounds {
+            left: 0,
+            top: 0,
+            right: surface_w as i32,
+            bottom: tab_strip_h as i32,
+        };
         self.tabs_text.viewport.update(&self.gpu.queue, resolution);
         self.tabs_text
             .renderer
@@ -1468,18 +1541,49 @@ impl State {
                     left: tab_text_pad_x,
                     top: tab_text_y,
                     scale: 1.0,
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: surface_w as i32,
-                        bottom: tab_strip_h as i32,
-                    },
+                    bounds: strip_bounds,
                     default_color: Color::rgb(220, 220, 220),
                     custom_glyphs: &[],
                 }],
                 &mut self.tabs_text.swash_cache,
             )
             .expect("tabs text prepare failed");
+
+        // Close "×" glyph — shaped once, drawn at every tab's close-button
+        // position via N TextAreas pointing at the same Buffer.
+        let docs_len = self.docs.len();
+        let scale_factor = self.scale;
+        let slot_w = TAB_WIDTH_DIP * scale_factor;
+        let close_w = TAB_CLOSE_W_DIP * scale_factor;
+        let close_pad = TAB_CLOSE_PAD_DIP * scale_factor;
+        // Center the glyph horizontally inside the close-rect — the "×"
+        // glyph is narrower than the rect, so push it in by a quarter.
+        let close_glyph_offset_x = close_w * 0.25;
+        self.close_text.viewport.update(&self.gpu.queue, resolution);
+        self.close_text
+            .renderer
+            .prepare(
+                &self.gpu.device,
+                &self.gpu.queue,
+                &mut self.close_text.font_system,
+                &mut self.close_text.atlas,
+                &self.close_text.viewport,
+                (0..docs_len).map(|i| {
+                    let slot_x = i as f32 * slot_w;
+                    let close_x = slot_x + slot_w - close_w - close_pad + close_glyph_offset_x;
+                    TextArea {
+                        buffer: &self.close_text.buffer,
+                        left: close_x,
+                        top: tab_text_y,
+                        scale: 1.0,
+                        bounds: strip_bounds,
+                        default_color: Color::rgb(180, 180, 190),
+                        custom_glyphs: &[],
+                    }
+                }),
+                &mut self.close_text.swash_cache,
+            )
+            .expect("close text prepare failed");
 
         let find_open = self.doc().find.is_some();
         if find_open {
@@ -1574,6 +1678,10 @@ impl State {
                 .renderer
                 .render(&self.tabs_text.atlas, &self.tabs_text.viewport, &mut pass)
                 .expect("tabs text render failed");
+            self.close_text
+                .renderer
+                .render(&self.close_text.atlas, &self.close_text.viewport, &mut pass)
+                .expect("close text render failed");
             if find_open {
                 self.find_text
                     .renderer
@@ -1595,6 +1703,7 @@ impl State {
         frame.present();
         self.text.atlas.trim();
         self.tabs_text.atlas.trim();
+        self.close_text.atlas.trim();
         if palette_open {
             self.palette_text.atlas.trim();
         }
@@ -1705,6 +1814,11 @@ impl ApplicationHandler for App {
                 ElementState::Pressed => state.handle_mouse_press(),
                 ElementState::Released => state.handle_mouse_release(),
             },
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } => state.handle_mouse_middle(),
             WindowEvent::MouseWheel { delta, .. } => {
                 let delta_y = match delta {
                     MouseScrollDelta::LineDelta(_, lines) => lines * state.line_height(),
