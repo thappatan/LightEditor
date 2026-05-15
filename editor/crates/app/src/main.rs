@@ -16,7 +16,7 @@ mod palette;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use document::Document;
 use editor_config::Settings;
@@ -40,12 +40,18 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 /// Cross-thread events posted into the winit event loop from background
-/// helpers — currently just the settings file watcher.
+/// helpers — file watcher + flash-clear timer.
 #[derive(Debug, Clone, Copy)]
 enum AppEvent {
-    /// `settings.toml` changed on disk; reload and reapply.
+    /// `settings.toml` (user or workspace) changed on disk; reload and reapply.
     SettingsChanged,
+    /// `FLASH_DURATION` has elapsed since a transient status-bar message was
+    /// set — clear it.
+    ClearFlash,
 }
+
+/// How long a "settings reloaded" flash stays on the status bar.
+const FLASH_DURATION: Duration = Duration::from_millis(2000);
 
 /// Initial window size, in logical pixels.
 const WINDOW_WIDTH: u32 = 1280;
@@ -280,6 +286,12 @@ struct State {
     /// Spaces inserted by the Tab key (pre-built from `settings.editor.tab_size`).
     tab_spaces: String,
 
+    /// Transient overlay for the status bar's left half — `Some((msg, t))`
+    /// while a flash is active. Cleared via `AppEvent::ClearFlash` after
+    /// [`FLASH_DURATION`]; the `Instant` is a safety net in case the timer
+    /// event is lost.
+    status_flash: Option<(String, Instant)>,
+
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
     /// Rolling 1-second frame-time window (spec §8).
@@ -430,6 +442,7 @@ impl State {
             palette: None,
             palette_text,
             find_text,
+            status_flash: None,
             tab_spaces,
             pending_keystroke: None,
             frame_count: 0,
@@ -525,6 +538,10 @@ impl State {
         self.status_left.set_font_size(fs, font, lh);
         self.status_right.set_font_size(fs, font, lh);
         self.tab_spaces = " ".repeat(settings.editor.tab_size);
+        self.set_status_flash(format!(
+            "settings reloaded · font {font} · line {lh} · tab {}",
+            settings.editor.tab_size
+        ));
         self.text_dirty = true;
         self.scene_dirty = true;
         log::info!(
@@ -532,6 +549,22 @@ impl State {
             settings.editor.tab_size
         );
         self.window.request_redraw();
+    }
+
+    /// Show `msg` on the status bar's left half until `FLASH_DURATION`
+    /// elapses (the App schedules an `AppEvent::ClearFlash` to fire it
+    /// off).
+    fn set_status_flash(&mut self, msg: String) {
+        self.status_flash = Some((msg, Instant::now()));
+        self.scene_dirty = true;
+    }
+
+    /// Clear any flash and redraw — fired by the App's timer thread.
+    fn clear_status_flash(&mut self) {
+        if self.status_flash.take().is_some() {
+            self.scene_dirty = true;
+            self.window.request_redraw();
+        }
     }
 
     /// Route a key press into the active document or the open overlay.
@@ -972,7 +1005,8 @@ impl State {
 
     /// Re-shape both halves of the status bar.
     ///
-    /// Left half: `path  ·  language  ·  LE`.
+    /// Left half: `path  ·  language  ·  LE` — or a transient flash message
+    /// while [`status_flash`](Self::status_flash) is active and unexpired.
     /// Right half: `Ln L, Col C  ·  N lines`.
     fn refresh_status(&mut self) {
         let doc = self.doc();
@@ -983,7 +1017,12 @@ impl State {
         let pos = doc.editor.buffer().char_to_position(head);
         let lines = doc.editor.buffer().len_lines();
 
-        let left = format!("{label}  ·  {language}  ·  {le}");
+        let flash = self
+            .status_flash
+            .as_ref()
+            .filter(|(_, t)| t.elapsed() < FLASH_DURATION)
+            .map(|(s, _)| s.clone());
+        let left = flash.unwrap_or_else(|| format!("{label}  ·  {language}  ·  {le}"));
         let right = format!(
             "Ln {}, Col {}  ·  {} lines",
             pos.line + 1,
@@ -2048,6 +2087,8 @@ struct App {
     /// Optional `.lighteditor/settings.toml` next to the cwd. Overlaid on top
     /// of `settings_path` when both exist (workspace > user > default).
     workspace_settings_path: Option<PathBuf>,
+    /// Used to schedule `AppEvent::ClearFlash` from a sleeper thread.
+    proxy: EventLoopProxy<AppEvent>,
     /// Kept alive so the watcher threads don't shut down; consulted only
     /// via the user-event proxy so the fields themselves are otherwise unused.
     _user_watcher: Option<RecommendedWatcher>,
@@ -2063,6 +2104,7 @@ impl App {
         settings: Settings,
         settings_path: Option<PathBuf>,
         workspace_settings_path: Option<PathBuf>,
+        proxy: EventLoopProxy<AppEvent>,
         user_watcher: Option<RecommendedWatcher>,
         workspace_watcher: Option<RecommendedWatcher>,
     ) -> Self {
@@ -2073,6 +2115,7 @@ impl App {
             settings,
             settings_path,
             workspace_settings_path,
+            proxy,
             _user_watcher: user_watcher,
             _workspace_watcher: workspace_watcher,
             state: None,
@@ -2108,6 +2151,18 @@ impl ApplicationHandler<AppEvent> for App {
                     state.reload_settings(&new_settings);
                 }
                 self.settings = new_settings;
+                // Schedule clearing the flash after FLASH_DURATION. Detaching
+                // a thread (vs a winit timer) keeps the event loop generic.
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(FLASH_DURATION);
+                    let _ = proxy.send_event(AppEvent::ClearFlash);
+                });
+            }
+            AppEvent::ClearFlash => {
+                if let Some(state) = self.state.as_mut() {
+                    state.clear_status_flash();
+                }
             }
         }
     }
@@ -2243,6 +2298,7 @@ fn main() {
         settings,
         settings_path,
         workspace_settings_path,
+        event_loop.create_proxy(),
         user_watcher,
         workspace_watcher,
     );
