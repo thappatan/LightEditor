@@ -3,12 +3,14 @@
 // An editable text surface: keyboard and mouse input drive editor-core, the
 // editor state is turned into a scene-graph each change, and the scene is
 // rendered — selection highlights + caret quads via QuadRenderer, buffer text
-// via TextStack. The viewport scrolls (wheel, caret-follow, drag-past-edge)
-// and everything is sized in physical pixels scaled by the window's DPI.
+// via TextStack. The viewport scrolls (wheel, caret-follow, drag-past-edge),
+// multiple documents are stacked behind a tab strip, and everything is sized
+// in physical pixels scaled by the window's DPI.
 //
-// Still missing for a "real" editor: multiple buffers/panes, a proper widget
-// tree, find/replace, the file tree. Those are later M1 work.
+// Still missing for a "real" editor: split panes, a proper widget tree,
+// find/replace, the file tree. Those are later M1 / M2 work.
 
+mod document;
 mod find;
 mod palette;
 
@@ -16,11 +18,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use document::Document;
 use editor_config::Settings;
-use editor_core::{Editor, Position, Selection};
+use editor_core::{Position, Selection};
 use editor_ui_render::{GpuContext, QuadRenderer};
-use editor_ui_scene::{Color as SceneColor, Rect, Scene, SceneNode};
-use editor_ui_text::glyphon::{Color, Resolution, TextArea, TextBounds};
+use editor_ui_scene::{Color as SceneColor, Point, Rect, Scene, SceneNode};
+use editor_ui_text::glyphon::{Color, FontSystem, Resolution, SwashCache, TextArea, TextBounds};
 use editor_ui_text::TextStack;
 use find::FindBar;
 use palette::{Command, CommandPalette};
@@ -39,13 +42,35 @@ use winit::window::{Window, WindowId};
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
 
-/// Inset of the text block from the window's top-left, in *logical* pixels.
-/// Multiplied by the window scale factor to get physical pixels.
+/// Horizontal inset of the text block from the window's left edge, in logical
+/// pixels. Multiplied by the window scale factor to get physical pixels.
 const TEXT_INSET_DIP: f32 = 28.0;
 /// Total horizontal padding (inset on both sides), in logical pixels.
 const TEXT_PADDING_DIP: f32 = 2.0 * TEXT_INSET_DIP;
+/// Gap between the bottom of the tab strip and the top of the editor text,
+/// in logical pixels.
+const TEXT_TOP_GAP_DIP: f32 = 8.0;
 /// Caret width, in logical pixels.
 const CARET_WIDTH_DIP: f32 = 2.0;
+
+/// Tab strip dimensions, in logical pixels.
+const TAB_BAR_HEIGHT_DIP: f32 = 30.0;
+const TAB_WIDTH_DIP: f32 = 180.0;
+/// Padding inside one tab slot (left edge → start of label), in logical pixels.
+const TAB_PAD_X_DIP: f32 = 10.0;
+/// Width/height of the close-button "×" hit area at the right edge of each
+/// tab slot, in logical pixels.
+const TAB_CLOSE_W_DIP: f32 = 18.0;
+/// Padding between the close button and the slot's right edge, in logical pixels.
+const TAB_CLOSE_PAD_DIP: f32 = 6.0;
+/// Approximate number of monospace characters that fit in one tab slot's
+/// labelled area. Tuned at `font_size_pt = 16` and `TAB_WIDTH_DIP = 180`;
+/// `Family::Monospace` puts ASCII at ~9.6 dip wide, so a 160 dip label
+/// region (slot minus the two padding strips) holds ~16 chars. The figure is
+/// used to pad each label so the next one lines up with the next slot — it is
+/// approximate by design, complex-script fallback fonts won't always honour
+/// the cell.
+const TAB_LABEL_CHARS: usize = 16;
 
 /// Command-palette overlay dimensions, in logical pixels.
 const PALETTE_WIDTH_DIP: f32 = 600.0;
@@ -100,19 +125,43 @@ struct State {
     window: Arc<Window>,
     gpu: GpuContext,
     quads: QuadRenderer,
+    /// Shared across every `TextStack` (editor, palette, find, tabs, close).
+    /// `FontSystem::new()` walks the OS font directory once — ~80ms cold —
+    /// so building one and lending it out is much cheaper than five.
+    font_system: FontSystem,
+    /// Shared swash glyph cache. Per-stack `TextRenderer::prepare` borrows it
+    /// in turn (calls are sequential, so the single `&mut` rotates fine).
+    swash_cache: SwashCache,
+    /// TextStack for the *active* document. Reshape happens on switch and on
+    /// edit (`text_dirty`).
     text: TextStack,
 
-    /// Editing model — buffer, multi-cursor selections, undo tree.
-    editor: Editor,
+    /// Open documents, oldest-first. There is always at least one — closing
+    /// the last document opens a fresh scratch one.
+    docs: Vec<Document>,
+    /// Index of the active document into `docs`. Always valid.
+    active: usize,
+    /// TextStack dedicated to the tab strip labels. Rebuilt whenever the
+    /// tab list, a label, or a dirty flag changes — *not* on every keystroke.
+    tabs_text: TextStack,
+    /// TextStack holding a single "×" glyph. Rendered once per tab via
+    /// separate TextAreas at each slot's close-button position; the buffer
+    /// content never changes.
+    close_text: TextStack,
+
     /// The scene rebuilt from `editor` whenever it changes.
     scene: Scene,
 
     /// Window scale factor; physical = logical * scale.
     scale: f32,
-    /// `TEXT_INSET_DIP` / `TEXT_PADDING_DIP` / `CARET_WIDTH_DIP`, in physical
-    /// pixels for the current scale.
-    text_inset: f32,
+    /// `TEXT_INSET_DIP × scale` — left/right inset of the text block.
+    text_inset_x: f32,
+    /// `(TAB_BAR_HEIGHT_DIP + TEXT_TOP_GAP_DIP) × scale` — top of the text
+    /// block, accounting for the tab strip.
+    text_inset_y: f32,
+    /// Total horizontal padding (left + right), in physical pixels.
     text_padding: f32,
+    /// Caret width, in physical pixels.
     caret_width: f32,
 
     /// Latched keyboard modifiers (Shift for selection-extending movement).
@@ -124,24 +173,15 @@ struct State {
     /// While a left-button drag is in progress, the `char` index where it
     /// started (the selection's anchor).
     drag_anchor: Option<usize>,
-    /// Vertical scroll offset, in physical pixels. The text and everything
-    /// positioned against it is drawn shifted up by this much.
-    scroll_y: f32,
     /// Set when the change that dirtied the scene moved the caret (an edit,
     /// arrow key, or click) — the next rebuild scrolls it into view. Wheel
-    /// scrolling and drag-scrolling leave this `false` so they aren't undone.
+    /// scrolling, drag-scrolling, and tab switches leave this `false` so they
+    /// aren't undone.
     follow_caret: bool,
     /// The buffer text changed — TextStack needs a reshape before the next frame.
     text_dirty: bool,
     /// The editor state changed — the scene needs rebuilding before the next frame.
     scene_dirty: bool,
-
-    /// Path the buffer was loaded from / saves to. `None` for the welcome
-    /// scratch buffer.
-    file_path: Option<PathBuf>,
-    /// Has the buffer changed since the last load or save? Shown as a "•"
-    /// prefix in the window title.
-    dirty: bool,
 
     /// Command-palette state when the popup is open.
     palette: Option<CommandPalette>,
@@ -149,9 +189,8 @@ struct State {
     /// independently of the buffer.
     palette_text: TextStack,
 
-    /// Find-bar state when the bar is visible.
-    find: Option<FindBar>,
-    /// Third TextStack for the find-bar caption ("Find: query   3/12").
+    /// Third TextStack for the find-bar caption ("Find: query   3/12"). The
+    /// `FindBar` itself lives on the active document.
     find_text: TextStack,
 
     /// Spaces inserted by the Tab key (pre-built from `settings.editor.tab_size`).
@@ -183,26 +222,37 @@ impl State {
         let line_height_pt = settings.editor.line_height;
         let tab_spaces = " ".repeat(settings.editor.tab_size);
 
+        // One `FontSystem` shared by every `TextStack` — the OS font scan
+        // takes ~80ms cold, so paying it once and lending out a `&mut` keeps
+        // the editor under the 250ms hard limit.
+        let mut font_system = editor_ui_text::new_font_system();
+        let swash_cache = editor_ui_text::new_swash_cache();
+
         let text_padding = TEXT_PADDING_DIP * scale;
         let text = TextStack::new(
             &gpu.device,
             &gpu.queue,
             gpu.format(),
+            &mut font_system,
             size.width as f32 - text_padding,
             font_size_pt,
             line_height_pt,
             scale,
             initial_text,
         );
-        let editor = Editor::from(initial_text);
 
-        // The palette has its own TextStack so the editor's single shaped
-        // buffer doesn't have to swap content every keystroke in the palette.
+        let doc = match file_path {
+            Some(p) => Document::from_file(p, initial_text),
+            None => Document::new_scratch(initial_text),
+        };
+
+        // Each overlay TextStack reuses the shared FontSystem above.
         let palette_width = (PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale;
         let palette_text = TextStack::new(
             &gpu.device,
             &gpu.queue,
             gpu.format(),
+            &mut font_system,
             palette_width,
             font_size_pt,
             line_height_pt,
@@ -210,18 +260,47 @@ impl State {
             "",
         );
 
-        // Find-bar TextStack, same reasoning — single-row caption.
         let find_width = (FIND_WIDTH_DIP - 2.0 * FIND_PAD_DIP) * scale;
         let find_text = TextStack::new(
             &gpu.device,
             &gpu.queue,
             gpu.format(),
+            &mut font_system,
             find_width,
             font_size_pt,
             line_height_pt,
             scale,
             "",
         );
+
+        // Tab strip TextStack — one long single line of labels. Width spans
+        // the whole window; no wrap.
+        let tabs_text = TextStack::new(
+            &gpu.device,
+            &gpu.queue,
+            gpu.format(),
+            &mut font_system,
+            size.width as f32,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "",
+        );
+
+        // Close-button TextStack — shapes the "×" glyph once and is then
+        // drawn at every tab's close-button position via N TextAreas.
+        let close_text = TextStack::new(
+            &gpu.device,
+            &gpu.queue,
+            gpu.format(),
+            &mut font_system,
+            TAB_CLOSE_W_DIP * scale,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "×",
+        );
+
         let scene = Scene::new(SceneNode::group(Rect::new(
             0.0,
             0.0,
@@ -233,25 +312,27 @@ impl State {
             window,
             gpu,
             quads,
+            font_system,
+            swash_cache,
             text,
-            editor,
+            docs: vec![doc],
+            active: 0,
+            tabs_text,
+            close_text,
             scene,
             scale,
-            text_inset: TEXT_INSET_DIP * scale,
+            text_inset_x: TEXT_INSET_DIP * scale,
+            text_inset_y: (TAB_BAR_HEIGHT_DIP + TEXT_TOP_GAP_DIP) * scale,
             text_padding,
             caret_width: CARET_WIDTH_DIP * scale,
             modifiers: ModifiersState::empty(),
             mouse_pos: None,
             drag_anchor: None,
-            scroll_y: 0.0,
             follow_caret: false,
             text_dirty: false,
             scene_dirty: true,
-            file_path,
-            dirty: false,
             palette: None,
             palette_text,
-            find: None,
             find_text,
             tab_spaces,
             pending_keystroke: None,
@@ -260,8 +341,19 @@ impl State {
             last_frame_us: 0,
             cold_start: Some(cold_start),
         };
+        state.refresh_tabs_text();
         state.rebuild_scene();
         state
+    }
+
+    /// Borrow the active document.
+    fn doc(&self) -> &Document {
+        &self.docs[self.active]
+    }
+
+    /// Mutably borrow the active document.
+    fn doc_mut(&mut self) -> &mut Document {
+        &mut self.docs[self.active]
     }
 
     /// Line height in physical pixels — the single unit carets, highlights,
@@ -273,8 +365,11 @@ impl State {
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.gpu.resize(size.width, size.height);
-        self.text.set_width(size.width as f32 - self.text_padding);
-        // Palette width is fixed; nothing to update on a window resize.
+        self.text
+            .set_width(&mut self.font_system, size.width as f32 - self.text_padding);
+        self.tabs_text
+            .set_width(&mut self.font_system, size.width as f32);
+        // Palette / find widths are fixed; nothing to update on a window resize.
         self.text_dirty = true;
         self.scene_dirty = true;
         // ControlFlow::Wait won't redraw on its own — a resize must ask.
@@ -288,23 +383,29 @@ impl State {
             return;
         }
         self.scale = scale;
-        self.text_inset = TEXT_INSET_DIP * scale;
+        self.text_inset_x = TEXT_INSET_DIP * scale;
+        self.text_inset_y = (TAB_BAR_HEIGHT_DIP + TEXT_TOP_GAP_DIP) * scale;
         self.text_padding = TEXT_PADDING_DIP * scale;
         self.caret_width = CARET_WIDTH_DIP * scale;
-        self.text.set_scale(scale);
-        // Overlays have their own TextStacks — keep them in sync too.
-        self.palette_text.set_scale(scale);
+        let fs = &mut self.font_system;
+        self.text.set_scale(fs, scale);
+        self.palette_text.set_scale(fs, scale);
         self.palette_text
-            .set_width((PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale);
-        self.find_text.set_scale(scale);
+            .set_width(fs, (PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale);
+        self.find_text.set_scale(fs, scale);
         self.find_text
-            .set_width((FIND_WIDTH_DIP - 2.0 * FIND_PAD_DIP) * scale);
+            .set_width(fs, (FIND_WIDTH_DIP - 2.0 * FIND_PAD_DIP) * scale);
+        self.tabs_text.set_scale(fs, scale);
+        self.tabs_text
+            .set_width(fs, self.gpu.surface_config.width as f32);
+        self.close_text.set_scale(fs, scale);
+        self.close_text.set_width(fs, TAB_CLOSE_W_DIP * scale);
         self.text_dirty = true;
         self.scene_dirty = true;
         self.window.request_redraw();
     }
 
-    /// Route a key press into `editor`.
+    /// Route a key press into the active document or the open overlay.
     fn handle_key(&mut self, event: KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
@@ -334,32 +435,58 @@ impl State {
         // Cmd/Ctrl shortcuts — checked before regular key handling so that
         // e.g. Cmd-S doesn't also try to insert "s".
         if is_cmd_or_ctrl(self.modifiers) {
+            // Ctrl-Tab / Ctrl-Shift-Tab cycle tabs. Cmd-Tab on macOS is the
+            // OS-level app switcher; Ctrl-Tab is the conventional in-app one.
+            if let Key::Named(NamedKey::Tab) = &event.logical_key {
+                if self.modifiers.shift_key() {
+                    self.prev_tab();
+                } else {
+                    self.next_tab();
+                }
+                return;
+            }
             if let Key::Character(c) = &event.logical_key {
-                if c.as_str().eq_ignore_ascii_case("f") {
-                    if self.find.is_some() {
-                        self.close_find();
-                    } else {
-                        self.open_find();
+                let lower = c.to_lowercase();
+                match lower.as_str() {
+                    "f" => {
+                        if self.doc().find.is_some() {
+                            self.close_find();
+                        } else {
+                            self.open_find();
+                        }
+                        return;
                     }
-                    return;
-                }
-                if c.as_str().eq_ignore_ascii_case("s") {
-                    self.save_to_file();
-                    return;
-                }
-                if c.as_str().eq_ignore_ascii_case("o") {
-                    self.open_file_dialog();
-                    return;
-                }
-                if c.as_str().eq_ignore_ascii_case("n") {
-                    self.new_file();
-                    return;
+                    "s" => {
+                        if self.modifiers.alt_key() {
+                            self.save_all();
+                        } else {
+                            self.save_to_file();
+                        }
+                        return;
+                    }
+                    "o" => {
+                        self.open_file_dialog();
+                        return;
+                    }
+                    "n" => {
+                        self.new_file();
+                        return;
+                    }
+                    "t" => {
+                        self.open_new_tab();
+                        return;
+                    }
+                    "w" => {
+                        self.close_active_tab();
+                        return;
+                    }
+                    _ => {}
                 }
             }
         }
 
         // When the find bar is open it captures every other key.
-        if self.find.is_some() {
+        if self.doc().find.is_some() {
             self.handle_find_key(event);
             return;
         }
@@ -369,50 +496,50 @@ impl State {
         let mut text_changed = true;
         let handled = match &event.logical_key {
             Key::Named(NamedKey::Backspace) => {
-                self.editor.backspace();
+                self.doc_mut().editor.backspace();
                 true
             }
             Key::Named(NamedKey::Delete) => {
-                self.editor.delete_forward();
+                self.doc_mut().editor.delete_forward();
                 true
             }
             Key::Named(NamedKey::Enter) => {
-                self.editor.insert_newline();
+                self.doc_mut().editor.insert_newline();
                 true
             }
             Key::Named(NamedKey::Space) => {
-                self.editor.insert(" ");
+                self.doc_mut().editor.insert(" ");
                 true
             }
             Key::Named(NamedKey::Tab) => {
                 let spaces = self.tab_spaces.clone();
-                self.editor.insert(&spaces);
+                self.doc_mut().editor.insert(&spaces);
                 true
             }
             Key::Named(NamedKey::ArrowLeft) => {
-                self.editor.move_left(shift);
+                self.doc_mut().editor.move_left(shift);
                 text_changed = false;
                 true
             }
             Key::Named(NamedKey::ArrowRight) => {
-                self.editor.move_right(shift);
+                self.doc_mut().editor.move_right(shift);
                 text_changed = false;
                 true
             }
             Key::Named(NamedKey::ArrowUp) => {
-                self.editor.move_up(shift);
+                self.doc_mut().editor.move_up(shift);
                 text_changed = false;
                 true
             }
             Key::Named(NamedKey::ArrowDown) => {
-                self.editor.move_down(shift);
+                self.doc_mut().editor.move_down(shift);
                 text_changed = false;
                 true
             }
             // Printable character input — winit gives us the resolved text.
             _ => match &event.text {
                 Some(text) if !text.is_empty() => {
-                    self.editor.insert(text);
+                    self.doc_mut().editor.insert(text);
                     true
                 }
                 _ => false,
@@ -423,14 +550,15 @@ impl State {
             self.text_dirty |= text_changed;
             self.scene_dirty = true;
             self.follow_caret = true;
-            if text_changed && !self.dirty {
-                self.dirty = true;
+            if text_changed && !self.doc().dirty {
+                self.doc_mut().dirty = true;
                 self.update_title();
+                self.refresh_tabs_text();
             }
             // If the find bar is open, the match list now reflects the old text.
-            if text_changed && self.find.is_some() {
-                let buffer_text = self.editor.text();
-                if let Some(f) = self.find.as_mut() {
+            if text_changed && self.doc().find.is_some() {
+                let buffer_text = self.doc().editor.text();
+                if let Some(f) = self.doc_mut().find.as_mut() {
                     f.refresh(&buffer_text);
                 }
                 self.refresh_find_text();
@@ -440,20 +568,42 @@ impl State {
         }
     }
 
-    /// Left-button press: place a single cursor where the pointer is and start
-    /// a potential drag (the anchor stays here while the head follows).
+    /// Left-button press: tab-strip click switches tabs (or closes the tab
+    /// when the press lands on its "×"); below the strip it places a caret
+    /// and starts a potential drag.
     fn handle_mouse_press(&mut self) {
         let Some((mx, my)) = self.mouse_pos else {
             return;
         };
+        if let Some(idx) = self.tab_close_at_pixel(mx, my) {
+            self.close_tab_at(idx);
+            return;
+        }
+        if let Some(idx) = self.tab_at_pixel(mx, my) {
+            self.switch_tab(idx);
+            return;
+        }
         let Some(char_idx) = self.char_at_pixel(mx, my) else {
             return;
         };
         self.drag_anchor = Some(char_idx);
-        self.editor.set_selection(Selection::cursor(char_idx));
+        self.doc_mut()
+            .editor
+            .set_selection(Selection::cursor(char_idx));
         self.scene_dirty = true;
         self.follow_caret = true;
         self.window.request_redraw();
+    }
+
+    /// Middle-button press inside the tab strip closes the tab under the
+    /// cursor (common browser-tab convention). Below the strip it is ignored.
+    fn handle_mouse_middle(&mut self) {
+        let Some((mx, my)) = self.mouse_pos else {
+            return;
+        };
+        if let Some(idx) = self.tab_at_pixel(mx, my) {
+            self.close_tab_at(idx);
+        }
     }
 
     /// Left-button release: end any drag.
@@ -461,62 +611,256 @@ impl State {
         self.drag_anchor = None;
     }
 
-    /// Write the buffer to `file_path`, or prompt for one with a Save As
+    /// Write the active document to its path, or prompt for one with a Save As
     /// dialog when there is none.
     fn save_to_file(&mut self) {
-        let path = match self.file_path.clone() {
+        let path = match self.doc().file_path.clone() {
             Some(p) => p,
             None => match rfd::FileDialog::new().save_file() {
                 Some(p) => p,
-                None => return, // cancelled
+                None => return,
             },
         };
-        match std::fs::write(&path, self.editor.text()) {
+        let text = self.doc().editor.text();
+        match std::fs::write(&path, &text) {
             Ok(()) => {
                 log::info!("saved {}", path.display());
-                self.file_path = Some(path);
-                self.dirty = false;
+                {
+                    let d = self.doc_mut();
+                    d.file_path = Some(path);
+                    d.dirty = false;
+                }
                 self.update_title();
+                self.refresh_tabs_text();
+                self.scene_dirty = true;
+                self.window.request_redraw();
             }
             Err(e) => log::error!("save failed for {}: {}", path.display(), e),
         }
     }
 
-    /// Prompt for a file with an Open dialog and load it, replacing the
-    /// editor. The user can cancel; on read failure we log and keep the
-    /// current buffer.
-    fn open_file_dialog(&mut self) {
-        if !self.confirm_unsaved("Open") {
-            return;
-        }
-        let Some(path) = rfd::FileDialog::new().pick_file() else {
-            return;
-        };
+    /// Read `path` and place it in the editor. If the active document is a
+    /// pristine, never-saved, never-edited scratch buffer, replace it in-place
+    /// (matches VSCode's behaviour for untouched "Untitled-1"); otherwise
+    /// push a new tab and activate it. I/O failure is logged and the state
+    /// is left intact.
+    fn open_path(&mut self, path: PathBuf) {
         match std::fs::read_to_string(&path) {
             Ok(content) => {
-                self.editor = Editor::from(content.as_str());
-                self.file_path = Some(path);
-                self.scroll_y = 0.0;
-                self.dirty = false;
+                let new_doc = Document::from_file(path, &content);
+                if self.doc().is_pristine_scratch() {
+                    self.docs[self.active] = new_doc;
+                } else {
+                    self.docs.push(new_doc);
+                    self.active = self.docs.len() - 1;
+                }
                 self.text_dirty = true;
                 self.scene_dirty = true;
                 self.follow_caret = false;
                 self.update_title();
+                self.refresh_tabs_text();
+                self.refresh_find_text();
                 self.window.request_redraw();
             }
             Err(e) => log::error!("could not read {}: {}", path.display(), e),
         }
     }
 
-    /// Sync the window title with the file path and dirty state.
+    /// Prompt for *one or more* files with an Open dialog and load each in a
+    /// tab. The first opened file may replace a pristine scratch (see
+    /// [`open_path`](Self::open_path)); subsequent ones always push a new tab.
+    /// Cancel is a no-op.
+    fn open_file_dialog(&mut self) {
+        let Some(paths) = rfd::FileDialog::new().pick_files() else {
+            return;
+        };
+        for path in paths {
+            self.open_path(path);
+        }
+    }
+
+    /// Handle a file dragged from Finder/Explorer and dropped on the window.
+    /// One DroppedFile event fires per file, so this opens exactly one tab
+    /// per call.
+    fn handle_dropped_file(&mut self, path: PathBuf) {
+        self.open_path(path);
+    }
+
+    /// Sync the window title with the active document.
     fn update_title(&self) {
-        let base = window_title(self.file_path.as_deref());
-        let title = if self.dirty {
+        let base = window_title(self.doc().file_path.as_deref());
+        let title = if self.doc().dirty {
             format!("• {base}")
         } else {
             base
         };
         self.window.set_title(&title);
+    }
+
+    // ── tab strip ──────────────────────────────────────────────────────────
+
+    /// Add a new empty document and make it active.
+    fn open_new_tab(&mut self) {
+        self.docs.push(Document::new_scratch(""));
+        self.active = self.docs.len() - 1;
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = false;
+        self.update_title();
+        self.refresh_tabs_text();
+        self.refresh_find_text();
+        self.window.request_redraw();
+    }
+
+    /// Close the active tab. Prompts on unsaved changes; if it is the only
+    /// tab, a fresh scratch tab replaces it (the window never becomes empty).
+    fn close_active_tab(&mut self) {
+        if !self.confirm_unsaved("Close tab") {
+            return;
+        }
+        self.docs.remove(self.active);
+        if self.docs.is_empty() {
+            self.docs.push(Document::new_scratch(""));
+        }
+        if self.active >= self.docs.len() {
+            self.active = self.docs.len() - 1;
+        }
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = false;
+        self.update_title();
+        self.refresh_tabs_text();
+        self.refresh_find_text();
+        self.window.request_redraw();
+    }
+
+    /// Activate tab `idx`. No-op if it's already active or out of range.
+    fn switch_tab(&mut self, idx: usize) {
+        if idx == self.active || idx >= self.docs.len() {
+            return;
+        }
+        self.active = idx;
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        // Keep the new tab's stored scroll position rather than recentering.
+        self.follow_caret = false;
+        self.update_title();
+        self.refresh_tabs_text();
+        self.refresh_find_text();
+        self.window.request_redraw();
+    }
+
+    fn next_tab(&mut self) {
+        if self.docs.len() <= 1 {
+            return;
+        }
+        let next = (self.active + 1) % self.docs.len();
+        self.switch_tab(next);
+    }
+
+    fn prev_tab(&mut self) {
+        if self.docs.len() <= 1 {
+            return;
+        }
+        let prev = if self.active == 0 {
+            self.docs.len() - 1
+        } else {
+            self.active - 1
+        };
+        self.switch_tab(prev);
+    }
+
+    /// Tab strip rectangle (the whole strip, not one slot).
+    fn tab_strip_rect(&self) -> Rect {
+        Rect::new(
+            0.0,
+            0.0,
+            self.gpu.surface_config.width as f32,
+            TAB_BAR_HEIGHT_DIP * self.scale,
+        )
+    }
+
+    /// Rectangle for tab `idx`, in physical pixels.
+    fn tab_slot_rect(&self, idx: usize) -> Rect {
+        let w = TAB_WIDTH_DIP * self.scale;
+        let h = TAB_BAR_HEIGHT_DIP * self.scale;
+        Rect::new(idx as f32 * w, 0.0, w, h)
+    }
+
+    /// Square close-button hit/draw region at the right edge of tab `idx`.
+    fn tab_close_rect(&self, idx: usize) -> Rect {
+        let slot = self.tab_slot_rect(idx);
+        let w = TAB_CLOSE_W_DIP * self.scale;
+        let pad = TAB_CLOSE_PAD_DIP * self.scale;
+        let cy = slot.min_y() + slot.size.height * 0.5;
+        Rect::new(slot.min_x() + slot.size.width - w - pad, cy - w * 0.5, w, w)
+    }
+
+    /// Tab whose close button is under a physical-pixel point.
+    fn tab_close_at_pixel(&self, x: f32, y: f32) -> Option<usize> {
+        (0..self.docs.len()).find(|&i| self.tab_close_rect(i).contains(Point::new(x, y)))
+    }
+
+    /// Close the tab at `idx`. Switches to it first so the unsaved-changes
+    /// prompt (if any) is unambiguous about which document it's asking about.
+    fn close_tab_at(&mut self, idx: usize) {
+        if idx >= self.docs.len() {
+            return;
+        }
+        if idx != self.active {
+            self.switch_tab(idx);
+        }
+        self.close_active_tab();
+    }
+
+    /// Tab index under a physical-pixel point, or `None` if the point is not
+    /// in the strip area (or past the last tab).
+    fn tab_at_pixel(&self, x: f32, y: f32) -> Option<usize> {
+        let strip_h = TAB_BAR_HEIGHT_DIP * self.scale;
+        if !(0.0..strip_h).contains(&y) {
+            return None;
+        }
+        let slot_w = TAB_WIDTH_DIP * self.scale;
+        if x < 0.0 {
+            return None;
+        }
+        let idx = (x / slot_w) as usize;
+        if idx >= self.docs.len() {
+            return None;
+        }
+        Some(idx)
+    }
+
+    /// Rebuild the tab-strip TextStack: one line, each label padded to
+    /// `TAB_LABEL_CHARS` slots so the next label starts near the next slot
+    /// boundary. Monospace-assumed; complex-script labels will drift slightly
+    /// but stay within their slot's backdrop.
+    fn refresh_tabs_text(&mut self) {
+        let mut s = String::with_capacity(self.docs.len() * (TAB_LABEL_CHARS + 4));
+        for d in &self.docs {
+            let prefix = if d.dirty { "• " } else { "  " };
+            let prefix_chars = prefix.chars().count();
+            let label = d.label();
+            // Reserve one trailing space so the cell never butts straight up
+            // against the next slot's start.
+            let max_label = TAB_LABEL_CHARS
+                .saturating_sub(prefix_chars)
+                .saturating_sub(1);
+            let label_chars = label.chars().count();
+            let truncated = if label_chars > max_label && max_label > 1 {
+                let head: String = label.chars().take(max_label - 1).collect();
+                format!("{head}…")
+            } else {
+                label
+            };
+            let cell = format!("{prefix}{truncated}");
+            let cell_chars = cell.chars().count();
+            s.push_str(&cell);
+            for _ in cell_chars..TAB_LABEL_CHARS {
+                s.push(' ');
+            }
+        }
+        self.tabs_text.set_content(&mut self.font_system, &s);
     }
 
     // ── command palette ────────────────────────────────────────────────────
@@ -545,18 +889,16 @@ impl State {
         let mut text = String::with_capacity(128);
         text.push_str("❯ ");
         text.push_str(palette.query());
-        // blank row between the query and the list
         text.push_str("\n\n");
         for cmd in palette.visible() {
             text.push_str("  ");
             text.push_str(cmd.label());
             text.push('\n');
         }
-        self.palette_text.set_content(&text);
+        self.palette_text.set_content(&mut self.font_system, &text);
     }
 
-    /// Route a key while the palette is open. Movement / edit keys are
-    /// captured by the palette instead of the buffer.
+    /// Route a key while the palette is open.
     fn handle_palette_key(&mut self, event: KeyEvent) {
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_palette(),
@@ -590,8 +932,6 @@ impl State {
                 self.window.request_redraw();
             }
             _ => {
-                // Treat the resolved text (a character or two for IME) as
-                // query input. Drop control-modified key presses.
                 if is_cmd_or_ctrl(self.modifiers) {
                     return;
                 }
@@ -618,7 +958,108 @@ impl State {
             Command::OpenFile => self.open_file_dialog(),
             Command::SaveFile => self.save_to_file(),
             Command::SaveFileAs => self.save_as(),
+            Command::SaveAll => self.save_all(),
+            Command::CloseOtherTabs => self.close_other_tabs(),
+            Command::CloseAllTabs => self.close_all_tabs(),
         }
+    }
+
+    /// Close every tab except the active one. Each dirty non-active tab is
+    /// switched to and prompted; cancelling a prompt keeps that tab open and
+    /// the walk continues to the next dirty one.
+    fn close_other_tabs(&mut self) {
+        if self.docs.len() <= 1 {
+            return;
+        }
+        let keep = self.active;
+        // Range loop because the body mutably borrows self via
+        // `confirm_unsaved`, so iterating `self.docs` is awkward.
+        #[allow(clippy::needless_range_loop)]
+        let mut keep_flags: Vec<bool> = (0..self.docs.len()).map(|i| i == keep).collect();
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..self.docs.len() {
+            if i == keep || !self.docs[i].dirty {
+                continue;
+            }
+            self.active = i;
+            self.update_title();
+            if !self.confirm_unsaved("Close tab") {
+                keep_flags[i] = true;
+            }
+        }
+        self.retain_docs(&keep_flags, Some(keep));
+    }
+
+    /// Close every tab; replaced with a fresh scratch if all close. Each
+    /// dirty tab is prompted; cancel keeps that tab.
+    fn close_all_tabs(&mut self) {
+        let mut keep_flags: Vec<bool> = vec![false; self.docs.len()];
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..self.docs.len() {
+            if !self.docs[i].dirty {
+                continue;
+            }
+            self.active = i;
+            self.update_title();
+            if !self.confirm_unsaved("Close tab") {
+                keep_flags[i] = true;
+            }
+        }
+        self.retain_docs(&keep_flags, None);
+    }
+
+    /// Filter `docs` by `keep_flags`. If `preferred_active` is `Some(i)` and
+    /// the doc at index `i` survives, it becomes active; otherwise the first
+    /// surviving doc wins. An empty result is replaced by a fresh scratch.
+    fn retain_docs(&mut self, keep_flags: &[bool], preferred_active: Option<usize>) {
+        let mut new_docs = Vec::with_capacity(self.docs.len());
+        let mut new_active = 0;
+        for (i, doc) in self.docs.drain(..).enumerate() {
+            if keep_flags[i] {
+                if Some(i) == preferred_active {
+                    new_active = new_docs.len();
+                }
+                new_docs.push(doc);
+            }
+        }
+        if new_docs.is_empty() {
+            new_docs.push(Document::new_scratch(""));
+        }
+        self.docs = new_docs;
+        self.active = new_active.min(self.docs.len() - 1);
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = false;
+        self.update_title();
+        self.refresh_tabs_text();
+        self.refresh_find_text();
+        self.window.request_redraw();
+    }
+
+    /// Save every dirty document in turn. Documents without a path get a
+    /// Save As dialog each; the user may cancel any one of them, in which
+    /// case that document stays dirty and the rest still get saved. After
+    /// the walk we return to the document the user was on.
+    fn save_all(&mut self) {
+        let original_active = self.active;
+        for i in 0..self.docs.len() {
+            if !self.docs[i].dirty {
+                continue;
+            }
+            if i != self.active {
+                self.active = i;
+            }
+            self.save_to_file();
+        }
+        if original_active < self.docs.len() {
+            self.active = original_active;
+        }
+        self.update_title();
+        self.refresh_tabs_text();
+        self.refresh_find_text();
+        self.scene_dirty = true;
+        self.text_dirty = true;
+        self.window.request_redraw();
     }
 
     /// Save As: always prompt for a path, even if the buffer already has one.
@@ -626,12 +1067,19 @@ impl State {
         let Some(path) = rfd::FileDialog::new().save_file() else {
             return;
         };
-        match std::fs::write(&path, self.editor.text()) {
+        let text = self.doc().editor.text();
+        match std::fs::write(&path, &text) {
             Ok(()) => {
                 log::info!("saved as {}", path.display());
-                self.file_path = Some(path);
-                self.dirty = false;
+                {
+                    let d = self.doc_mut();
+                    d.file_path = Some(path);
+                    d.dirty = false;
+                }
                 self.update_title();
+                self.refresh_tabs_text();
+                self.scene_dirty = true;
+                self.window.request_redraw();
             }
             Err(e) => log::error!("save failed: {}", e),
         }
@@ -643,7 +1091,6 @@ impl State {
         let width = PALETTE_WIDTH_DIP * self.scale;
         let top = PALETTE_TOP_DIP * self.scale;
         let lh = self.line_height();
-        // Header row (query) + blank row + one row per visible command.
         let rows = self
             .palette
             .as_ref()
@@ -656,14 +1103,12 @@ impl State {
         Rect::new(left, top, width, height)
     }
 
-    /// Where the palette TextStack should be drawn (the inner padded area).
     fn palette_text_origin(&self) -> (f32, f32) {
         let panel = self.palette_panel_rect();
         let pad = PALETTE_PAD_DIP * self.scale;
         (panel.min_x() + pad, panel.min_y() + pad)
     }
 
-    /// The highlight rectangle for the currently-selected palette row.
     fn palette_selection_rect(&self) -> Option<Rect> {
         let palette = self.palette.as_ref()?;
         if palette.visible_count() == 0 {
@@ -671,7 +1116,6 @@ impl State {
         }
         let lh = self.line_height();
         let (_ox, oy) = self.palette_text_origin();
-        // Header takes one row, then a blank row; the list starts at row 2.
         let row_y = oy + (2 + palette.selected_row()) as f32 * lh;
         let panel = self.palette_panel_rect();
         let pad = PALETTE_PAD_DIP * self.scale;
@@ -685,9 +1129,9 @@ impl State {
 
     // ── find bar ───────────────────────────────────────────────────────────
 
-    /// Open the find bar with an empty query.
+    /// Open the find bar on the active document with an empty query.
     fn open_find(&mut self) {
-        self.find = Some(FindBar::new());
+        self.doc_mut().find = Some(FindBar::new());
         self.refresh_find_text();
         self.scene_dirty = true;
         self.window.request_redraw();
@@ -695,14 +1139,14 @@ impl State {
 
     /// Close the find bar (without changing the selection).
     fn close_find(&mut self) {
-        self.find = None;
+        self.doc_mut().find = None;
         self.scene_dirty = true;
         self.window.request_redraw();
     }
 
-    /// Rebuild the find bar's caption "Find: query   3/12 / no matches".
     fn refresh_find_text(&mut self) {
-        let Some(find) = self.find.as_ref() else {
+        let Some(find) = self.doc().find.as_ref() else {
+            self.find_text.set_content(&mut self.font_system, "");
             return;
         };
         let count = find.match_count();
@@ -712,16 +1156,16 @@ impl State {
             format!("{}/{}", find.current_index() + 1, count)
         };
         let caption = format!("Find: {}   {}", find.query(), suffix);
-        self.find_text.set_content(&caption);
+        self.find_text.set_content(&mut self.font_system, &caption);
     }
 
-    /// Move the editor selection to the find bar's current match, so the
-    /// caret follows along (and the regular caret-follow scrolls it in).
+    /// Move the editor selection to the find bar's current match.
     fn select_current_match(&mut self) {
-        let Some(range) = self.find.as_ref().and_then(|f| f.current_match()) else {
+        let Some(range) = self.doc().find.as_ref().and_then(|f| f.current_match()) else {
             return;
         };
-        self.editor
+        self.doc_mut()
+            .editor
             .set_selection(Selection::new(range.start, range.end));
         self.scene_dirty = true;
         self.follow_caret = true;
@@ -732,12 +1176,13 @@ impl State {
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_find(),
             Key::Named(NamedKey::Enter) => {
-                if self.modifiers.shift_key() {
-                    if let Some(f) = self.find.as_mut() {
+                let shift = self.modifiers.shift_key();
+                if let Some(f) = self.doc_mut().find.as_mut() {
+                    if shift {
                         f.prev_match();
+                    } else {
+                        f.next_match();
                     }
-                } else if let Some(f) = self.find.as_mut() {
-                    f.next_match();
                 }
                 self.refresh_find_text();
                 self.select_current_match();
@@ -745,8 +1190,8 @@ impl State {
                 self.window.request_redraw();
             }
             Key::Named(NamedKey::Backspace) => {
-                let text = self.editor.text();
-                if let Some(f) = self.find.as_mut() {
+                let text = self.doc().editor.text();
+                if let Some(f) = self.doc_mut().find.as_mut() {
                     f.backspace(&text);
                 }
                 self.refresh_find_text();
@@ -759,8 +1204,8 @@ impl State {
                     return;
                 }
                 if let Some(text) = &event.text {
-                    let buffer_text = self.editor.text();
-                    if let Some(f) = self.find.as_mut() {
+                    let buffer_text = self.doc().editor.text();
+                    if let Some(f) = self.doc_mut().find.as_mut() {
                         for c in text.chars() {
                             f.push_char(c, &buffer_text);
                         }
@@ -774,31 +1219,26 @@ impl State {
         }
     }
 
-    /// The find bar's backdrop rectangle.
+    /// The find bar's backdrop rectangle. Tucked under the tab strip.
     fn find_panel_rect(&self) -> Rect {
         let pad = FIND_PAD_DIP * self.scale;
         let width = FIND_WIDTH_DIP * self.scale;
-        let top = FIND_TOP_DIP * self.scale;
+        // Sit just below the tab strip rather than at the very top.
+        let top = (TAB_BAR_HEIGHT_DIP + FIND_TOP_DIP) * self.scale;
         let height = self.line_height() + 2.0 * pad;
         let surface_w = self.gpu.surface_config.width as f32;
-        // Right-aligned with a margin so it doesn't sit on top of the caret.
         let left = surface_w - width - FIND_TOP_DIP * self.scale;
         Rect::new(left.max(0.0), top, width, height)
     }
 
-    /// Where the find bar's caption is drawn.
     fn find_text_origin(&self) -> (f32, f32) {
         let panel = self.find_panel_rect();
         let pad = FIND_PAD_DIP * self.scale;
         (panel.min_x() + pad, panel.min_y() + pad)
     }
 
-    /// Highlight rectangles for every match the find bar found, in the
-    /// editor's coordinate system. Current match is omitted — the regular
-    /// selection highlight already covers it (and a brighter overlay is
-    /// added separately in `rebuild_scene`).
     fn match_highlight_rects(&self) -> Vec<Rect> {
-        let Some(find) = self.find.as_ref() else {
+        let Some(find) = self.doc().find.as_ref() else {
             return Vec::new();
         };
         let current = find.current_index();
@@ -810,37 +1250,23 @@ impl State {
             .collect()
     }
 
-    /// Reset the buffer to a blank scratch one with no file path. Asks first
-    /// if the current buffer has unsaved changes.
+    /// Open a fresh scratch document in a new tab (Cmd-N). If the active tab
+    /// is already a pristine scratch we just stay there.
     fn new_file(&mut self) {
-        if !self.confirm_unsaved("New file") {
+        if self.doc().is_pristine_scratch() {
             return;
         }
-        self.editor = Editor::from("");
-        self.file_path = None;
-        self.scroll_y = 0.0;
-        self.dirty = false;
-        self.text_dirty = true;
-        self.scene_dirty = true;
-        self.follow_caret = false;
-        self.update_title();
-        self.window.request_redraw();
+        self.open_new_tab();
     }
 
-    /// If the buffer is dirty, ask the user what to do. Returns `true` if the
-    /// caller may proceed (saved or discarded), `false` if it must abort
-    /// (Cancel, or a Save As that was cancelled / failed). Clean buffers
-    /// always return `true`.
+    /// If the active document is dirty, ask the user what to do. Returns
+    /// `true` if the caller may proceed (saved or discarded), `false` if it
+    /// must abort. Clean documents always return `true`.
     fn confirm_unsaved(&mut self, reason: &str) -> bool {
-        if !self.dirty {
+        if !self.doc().dirty {
             return true;
         }
-        let name = self
-            .file_path
-            .as_deref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "this buffer".to_string());
+        let name = self.doc().label();
         let result = rfd::MessageDialog::new()
             .set_title(format!("{reason}: unsaved changes"))
             .set_description(format!("{name} has unsaved changes. Save them first?"))
@@ -850,13 +1276,28 @@ impl State {
         match result {
             rfd::MessageDialogResult::Yes => {
                 self.save_to_file();
-                // Save As dialog may have been cancelled, or write may have
-                // failed — both leave `dirty` true.
-                !self.dirty
+                !self.doc().dirty
             }
-            rfd::MessageDialogResult::No => true, // discard
-            _ => false,                           // Cancel / closed dialog
+            rfd::MessageDialogResult::No => true,
+            _ => false,
         }
+    }
+
+    /// Close-window guard: if any document is dirty, prompt for it one by one.
+    /// Returns `true` if the window may close.
+    fn confirm_close_all(&mut self) -> bool {
+        let mut i = 0;
+        while i < self.docs.len() {
+            if self.docs[i].dirty {
+                self.active = i;
+                self.update_title();
+                if !self.confirm_unsaved("Close") {
+                    return false;
+                }
+            }
+            i += 1;
+        }
+        true
     }
 
     /// Pointer moved. During a drag, extend the selection from the drag anchor
@@ -867,42 +1308,45 @@ impl State {
             return;
         };
 
-        // Dragging past a viewport edge scrolls the view one step per move
-        // event. Continuous auto-scroll (without moving the mouse) would need
-        // a timer — deferred.
         let surface_h = self.gpu.surface_config.height as f32;
-        if y < self.text_inset {
-            self.scroll_y = (self.scroll_y - (self.text_inset - y)).clamp(0.0, self.max_scroll());
+        let max = self.max_scroll();
+        let scroll = self.doc().scroll_y;
+        let new_scroll = if y < self.text_inset_y {
+            (scroll - (self.text_inset_y - y)).clamp(0.0, max)
         } else if y > surface_h {
-            self.scroll_y = (self.scroll_y + (y - surface_h)).clamp(0.0, self.max_scroll());
+            (scroll + (y - surface_h)).clamp(0.0, max)
+        } else {
+            scroll
+        };
+        if new_scroll != scroll {
+            self.doc_mut().scroll_y = new_scroll;
         }
 
         let Some(head) = self.char_at_pixel(x, y) else {
             return;
         };
-        self.editor.set_selection(Selection::new(anchor, head));
+        self.doc_mut()
+            .editor
+            .set_selection(Selection::new(anchor, head));
         self.scene_dirty = true;
-        // We scrolled deliberately above; don't let caret-follow fight it.
         self.follow_caret = false;
         self.window.request_redraw();
     }
 
-    /// Mouse wheel: scroll the viewport vertically. A positive `delta_y`
-    /// scrolls toward the top of the document.
+    /// Mouse wheel: scroll the active document vertically.
     fn handle_scroll(&mut self, delta_y: f32) {
-        let new = (self.scroll_y - delta_y).clamp(0.0, self.max_scroll());
-        if new != self.scroll_y {
-            self.scroll_y = new;
+        let max = self.max_scroll();
+        let current = self.doc().scroll_y;
+        let new = (current - delta_y).clamp(0.0, max);
+        if new != current {
+            self.doc_mut().scroll_y = new;
             self.scene_dirty = true;
             self.window.request_redraw();
         }
     }
 
-    /// Total shaped text height in physical pixels.
-    ///
-    /// Measured from the actual cosmic-text layout, so wrapped lines count
-    /// once per *visual* row — `buffer.len_lines() * line_height` would
-    /// undercount because it only sees logical lines.
+    /// Total shaped text height in physical pixels — visual, not logical:
+    /// wrapped lines count once per visible row.
     fn content_height(&self) -> f32 {
         self.text
             .buffer
@@ -914,62 +1358,80 @@ impl State {
 
     /// The largest valid scroll offset — content height beyond the viewport.
     fn max_scroll(&self) -> f32 {
-        let visible = self.gpu.surface_config.height as f32 - self.text_inset;
+        let visible = self.gpu.surface_config.height as f32 - self.text_inset_y;
         (self.content_height() - visible).max(0.0)
     }
 
     /// Scroll the viewport the minimum amount needed to bring the primary
     /// caret fully into view. A no-op when it is already visible.
     fn ensure_caret_visible(&mut self) {
-        let head = self.editor.selections().primary().head;
+        let head = self.doc().editor.selections().primary().head;
         let Some((_, caret_top)) = self.caret_pixel(head) else {
             return;
         };
         let caret_bottom = caret_top + self.line_height();
-        let visible = self.gpu.surface_config.height as f32 - self.text_inset;
+        let visible = self.gpu.surface_config.height as f32 - self.text_inset_y;
+        let max = self.max_scroll();
+        let mut scroll = self.doc().scroll_y;
 
-        if caret_top < self.scroll_y {
-            self.scroll_y = caret_top;
-        } else if caret_bottom > self.scroll_y + visible {
-            self.scroll_y = caret_bottom - visible;
+        if caret_top < scroll {
+            scroll = caret_top;
+        } else if caret_bottom > scroll + visible {
+            scroll = caret_bottom - visible;
         }
-        self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll());
+        self.doc_mut().scroll_y = scroll.clamp(0.0, max);
     }
 
     /// Hit-test a physical-pixel point to a buffer `char` index.
-    ///
-    /// Goes through cosmic-text's shaped layout (`Buffer::hit`), so the
-    /// mapping is correct for complex scripts — a click lands on a real
-    /// grapheme boundary, not an assumed monospace column.
     fn char_at_pixel(&self, x: f32, y: f32) -> Option<usize> {
-        // Into text-origin-relative coordinates, undoing the scroll offset.
-        let tx = x - self.text_inset;
-        let ty = y - self.text_inset + self.scroll_y;
+        let tx = x - self.text_inset_x;
+        let ty = y - self.text_inset_y + self.doc().scroll_y;
         let cursor = self.text.buffer.hit(tx, ty)?;
 
-        // cosmic-text gives (line, byte-in-line); convert to a char index.
-        let line_str = self.editor.buffer().line(cursor.line)?;
+        let line_str = self.doc().editor.buffer().line(cursor.line)?;
         let column = line_str
             .char_indices()
             .take_while(|(b, _)| *b < cursor.index)
             .count();
-        self.editor
+        self.doc()
+            .editor
             .buffer()
             .position_to_char(Position::new(cursor.line, column))
     }
 
-    /// Rebuild `scene` from the current editor state: selection-highlight
-    /// quads under the text, then a caret quad per selection head.
-    ///
-    /// The buffer text is drawn by TextStack, not via a scene `Text` node yet
-    /// — TextStack is still single-buffer.
+    /// Rebuild `scene` from the current editor + tab state.
     fn rebuild_scene(&mut self) {
         let w = self.gpu.surface_config.width as f32;
         let h = self.gpu.surface_config.height as f32;
         let mut root = SceneNode::group(Rect::new(0.0, 0.0, w, h));
 
-        // Selection highlights first — they sit behind the text and the carets.
-        for selection in self.editor.selections().iter() {
+        // Tab strip backdrop — sits behind every tab slot.
+        root.push_child(SceneNode::quad(
+            self.tab_strip_rect(),
+            SceneColor::rgba(22, 22, 28, 255),
+        ));
+        for (i, _) in self.docs.iter().enumerate() {
+            let slot = self.tab_slot_rect(i);
+            let bg = if i == self.active {
+                SceneColor::rgba(48, 48, 60, 255)
+            } else {
+                SceneColor::rgba(30, 30, 38, 255)
+            };
+            root.push_child(SceneNode::quad(slot, bg));
+            // Thin separator on the right edge of every tab except the last.
+            if i + 1 < self.docs.len() {
+                let sep = Rect::new(
+                    slot.min_x() + slot.size.width - 1.0 * self.scale,
+                    slot.min_y() + 4.0 * self.scale,
+                    1.0 * self.scale,
+                    slot.size.height - 8.0 * self.scale,
+                );
+                root.push_child(SceneNode::quad(sep, SceneColor::rgba(60, 60, 70, 255)));
+            }
+        }
+
+        // Selection highlights sit behind text and carets.
+        for selection in self.doc().editor.selections().iter() {
             for rect in self.selection_rects(selection) {
                 root.push_child(SceneNode::quad(rect, SceneColor::rgba(120, 160, 255, 64)));
             }
@@ -977,12 +1439,13 @@ impl State {
 
         // Carets on top of the highlights.
         let line_height = self.line_height();
-        for selection in self.editor.selections().iter() {
+        let scroll = self.doc().scroll_y;
+        for selection in self.doc().editor.selections().iter() {
             if let Some((cx, cy)) = self.caret_pixel(selection.head) {
                 root.push_child(SceneNode::quad(
                     Rect::new(
-                        self.text_inset + cx,
-                        self.text_inset + cy - self.scroll_y,
+                        self.text_inset_x + cx,
+                        self.text_inset_y + cy - scroll,
                         self.caret_width,
                         line_height,
                     ),
@@ -991,24 +1454,20 @@ impl State {
             }
         }
 
-        // Find-bar match highlights sit *behind* the editor's own selection
-        // highlight + caret so the current hit (which is the active selection)
-        // stays visually dominant.
+        // Find-bar match highlights.
         for rect in self.match_highlight_rects() {
             root.push_child(SceneNode::quad(rect, SceneColor::rgba(255, 200, 60, 64)));
         }
 
-        // Find bar itself — a single-row panel near the top, on top of the
-        // editor surface.
-        if self.find.is_some() {
+        // Find bar panel.
+        if self.doc().find.is_some() {
             root.push_child(SceneNode::quad(
                 self.find_panel_rect(),
                 SceneColor::rgba(38, 38, 48, 240),
             ));
         }
 
-        // Palette overlay sits on top of everything else — a dim scrim over
-        // the editor, the panel itself, and a highlight on the selected row.
+        // Palette overlay on top of everything else.
         if self.palette.is_some() {
             root.push_child(SceneNode::quad(
                 Rect::new(0.0, 0.0, w, h),
@@ -1029,28 +1488,24 @@ impl State {
         self.scene = Scene::new(root);
     }
 
-    /// The absolute highlight rectangles for `selection` — empty for a bare
-    /// cursor, one rect for a single-line span, or one rect per line for a
-    /// multi-line span (first line from the start column to end-of-content,
-    /// middle lines full content width, last line from column 0 to the end).
+    /// Selection highlight rectangles.
     fn selection_rects(&self, selection: &Selection) -> Vec<Rect> {
         if selection.is_cursor() {
             return Vec::new();
         }
-        let buffer = self.editor.buffer();
+        let buffer = self.doc().editor.buffer();
         let start = buffer.char_to_position(selection.start());
         let end = buffer.char_to_position(selection.end());
         let mut rects = Vec::new();
 
-        // A tiny minimum width so a zero-width line (e.g. a selected blank
-        // line, or a selected trailing newline) is still visible.
-        let inset = self.text_inset;
-        let scroll = self.scroll_y;
+        let inset_x = self.text_inset_x;
+        let inset_y = self.text_inset_y;
+        let scroll = self.doc().scroll_y;
         let line_height = self.line_height();
         let mut push = |x0: f32, y: f32, x1: f32| {
             rects.push(Rect::new(
-                inset + x0,
-                inset + y - scroll,
+                inset_x + x0,
+                inset_y + y - scroll,
                 (x1 - x0).max(3.0),
                 line_height,
             ));
@@ -1066,14 +1521,12 @@ impl State {
             return rects;
         }
 
-        // First line: start column to end of content.
         if let (Some((sx, sy)), Some((ex, _))) = (
             self.caret_pixel_at(start.line, start.column),
             self.caret_pixel_at(start.line, self.line_content_chars(start.line)),
         ) {
             push(sx, sy, ex);
         }
-        // Middle lines: column 0 to end of content.
         for line in (start.line + 1)..end.line {
             if let (Some((x0, y)), Some((x1, _))) = (
                 self.caret_pixel_at(line, 0),
@@ -1082,7 +1535,6 @@ impl State {
                 push(x0, y, x1);
             }
         }
-        // Last line: column 0 to the end column.
         if let (Some((x0, y)), Some((ex, _))) = (
             self.caret_pixel_at(end.line, 0),
             self.caret_pixel_at(end.line, end.column),
@@ -1092,9 +1544,9 @@ impl State {
         rects
     }
 
-    /// Number of `char`s in `line`'s content, excluding any trailing newline.
     fn line_content_chars(&self, line: usize) -> usize {
-        self.editor
+        self.doc()
+            .editor
             .buffer()
             .line(line)
             .map(|s| {
@@ -1106,30 +1558,19 @@ impl State {
             .unwrap_or(0)
     }
 
-    /// Pixel offset of the caret at `char_idx`, relative to the text origin.
     fn caret_pixel(&self, char_idx: usize) -> Option<(f32, f32)> {
-        let pos = self.editor.buffer().char_to_position(char_idx);
+        let pos = self.doc().editor.buffer().char_to_position(char_idx);
         self.caret_pixel_at(pos.line, pos.column)
     }
 
-    /// Pixel offset of the caret at `(line, column)`, relative to the text
-    /// origin.
-    ///
-    /// Uses the shaped cosmic-text layout. A wrapped logical line spans
-    /// several visual runs (each with the same `line_i`); this picks the run
-    /// whose byte range actually contains the caret, so the caret stays on the
-    /// right visual row. The x position comes from a real glyph boundary, so
-    /// it is correct for complex scripts too.
     fn caret_pixel_at(&self, line: usize, column: usize) -> Option<(f32, f32)> {
-        let line_str = self.editor.buffer().line(line)?;
+        let line_str = self.doc().editor.buffer().line(line)?;
         let byte_in_line = line_str
             .char_indices()
             .nth(column)
             .map(|(b, _)| b)
             .unwrap_or(line_str.len());
 
-        // Visual end of the last run seen for this line — the fallback when
-        // the caret's byte falls past every run (e.g. trailing position).
         let mut last_run_end: Option<(f32, f32)> = None;
 
         for run in self.text.buffer.layout_runs() {
@@ -1141,7 +1582,6 @@ impl State {
             let run_end_x = run.glyphs.last().map(|g| g.x + g.w).unwrap_or(0.0);
             last_run_end = Some((run_end_x, run.line_top));
 
-            // Is the caret within this visual run?
             if byte_in_line >= run_start && byte_in_line <= run_end {
                 let mut x = 0.0;
                 for glyph in run.glyphs.iter() {
@@ -1150,13 +1590,10 @@ impl State {
                     }
                     x = glyph.x + glyph.w;
                 }
-                // Past the last glyph of this run — caret at the run's end.
                 return Some((x, run.line_top));
             }
         }
 
-        // The caret's byte is past every run of this line, or the line has no
-        // runs at all (an empty line still gets one, so the latter is rare).
         last_run_end.or(Some((0.0, line as f32 * self.line_height())))
     }
 
@@ -1164,7 +1601,8 @@ impl State {
         let frame_start = Instant::now();
 
         if self.text_dirty {
-            self.text.set_content(&self.editor.text());
+            let new_text = self.docs[self.active].editor.text();
+            self.text.set_content(&mut self.font_system, &new_text);
             self.text_dirty = false;
         }
         if self.scene_dirty {
@@ -1184,57 +1622,124 @@ impl State {
             self.gpu.surface_config.height as f32,
         );
 
-        self.text.viewport.update(
-            &self.gpu.queue,
-            Resolution {
-                width: self.gpu.surface_config.width,
-                height: self.gpu.surface_config.height,
-            },
-        );
-        let inset = self.text_inset;
+        let surface_w = self.gpu.surface_config.width;
+        let surface_h = self.gpu.surface_config.height;
+        let resolution = Resolution {
+            width: surface_w,
+            height: surface_h,
+        };
+        let full_bounds = TextBounds {
+            left: 0,
+            top: 0,
+            right: surface_w as i32,
+            bottom: surface_h as i32,
+        };
+
+        // Editor text.
+        let inset_x = self.text_inset_x;
+        let inset_y = self.text_inset_y;
+        let scroll = self.docs[self.active].scroll_y;
+        self.text.viewport.update(&self.gpu.queue, resolution);
         self.text
             .renderer
             .prepare(
                 &self.gpu.device,
                 &self.gpu.queue,
-                &mut self.text.font_system,
+                &mut self.font_system,
                 &mut self.text.atlas,
                 &self.text.viewport,
                 [TextArea {
                     buffer: &self.text.buffer,
-                    left: inset,
-                    top: inset - self.scroll_y,
+                    left: inset_x,
+                    top: inset_y - scroll,
                     scale: 1.0,
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: self.gpu.surface_config.width as i32,
-                        bottom: self.gpu.surface_config.height as i32,
-                    },
+                    bounds: full_bounds,
                     default_color: Color::rgb(238, 238, 238),
                     custom_glyphs: &[],
                 }],
-                &mut self.text.swash_cache,
+                &mut self.swash_cache,
             )
             .expect("text prepare failed");
 
-        // Find bar caption — its own TextStack.
-        let find_open = self.find.is_some();
+        // Tab strip labels. Centred vertically inside the strip; one cell per
+        // label, sized roughly to TAB_LABEL_CHARS monospace chars.
+        let tab_strip_h = TAB_BAR_HEIGHT_DIP * self.scale;
+        let tab_text_pad_x = TAB_PAD_X_DIP * self.scale;
+        let tab_text_y = (tab_strip_h - self.line_height()) * 0.5;
+        let strip_bounds = TextBounds {
+            left: 0,
+            top: 0,
+            right: surface_w as i32,
+            bottom: tab_strip_h as i32,
+        };
+        self.tabs_text.viewport.update(&self.gpu.queue, resolution);
+        self.tabs_text
+            .renderer
+            .prepare(
+                &self.gpu.device,
+                &self.gpu.queue,
+                &mut self.font_system,
+                &mut self.tabs_text.atlas,
+                &self.tabs_text.viewport,
+                [TextArea {
+                    buffer: &self.tabs_text.buffer,
+                    left: tab_text_pad_x,
+                    top: tab_text_y,
+                    scale: 1.0,
+                    bounds: strip_bounds,
+                    default_color: Color::rgb(220, 220, 220),
+                    custom_glyphs: &[],
+                }],
+                &mut self.swash_cache,
+            )
+            .expect("tabs text prepare failed");
+
+        // Close "×" glyph — shaped once, drawn at every tab's close-button
+        // position via N TextAreas pointing at the same Buffer.
+        let docs_len = self.docs.len();
+        let scale_factor = self.scale;
+        let slot_w = TAB_WIDTH_DIP * scale_factor;
+        let close_w = TAB_CLOSE_W_DIP * scale_factor;
+        let close_pad = TAB_CLOSE_PAD_DIP * scale_factor;
+        // Center the glyph horizontally inside the close-rect — the "×"
+        // glyph is narrower than the rect, so push it in by a quarter.
+        let close_glyph_offset_x = close_w * 0.25;
+        self.close_text.viewport.update(&self.gpu.queue, resolution);
+        self.close_text
+            .renderer
+            .prepare(
+                &self.gpu.device,
+                &self.gpu.queue,
+                &mut self.font_system,
+                &mut self.close_text.atlas,
+                &self.close_text.viewport,
+                (0..docs_len).map(|i| {
+                    let slot_x = i as f32 * slot_w;
+                    let close_x = slot_x + slot_w - close_w - close_pad + close_glyph_offset_x;
+                    TextArea {
+                        buffer: &self.close_text.buffer,
+                        left: close_x,
+                        top: tab_text_y,
+                        scale: 1.0,
+                        bounds: strip_bounds,
+                        default_color: Color::rgb(180, 180, 190),
+                        custom_glyphs: &[],
+                    }
+                }),
+                &mut self.swash_cache,
+            )
+            .expect("close text prepare failed");
+
+        let find_open = self.doc().find.is_some();
         if find_open {
             let (fx, fy) = self.find_text_origin();
-            self.find_text.viewport.update(
-                &self.gpu.queue,
-                Resolution {
-                    width: self.gpu.surface_config.width,
-                    height: self.gpu.surface_config.height,
-                },
-            );
+            self.find_text.viewport.update(&self.gpu.queue, resolution);
             self.find_text
                 .renderer
                 .prepare(
                     &self.gpu.device,
                     &self.gpu.queue,
-                    &mut self.find_text.font_system,
+                    &mut self.font_system,
                     &mut self.find_text.atlas,
                     &self.find_text.viewport,
                     [TextArea {
@@ -1242,37 +1747,27 @@ impl State {
                         left: fx,
                         top: fy,
                         scale: 1.0,
-                        bounds: TextBounds {
-                            left: 0,
-                            top: 0,
-                            right: self.gpu.surface_config.width as i32,
-                            bottom: self.gpu.surface_config.height as i32,
-                        },
+                        bounds: full_bounds,
                         default_color: Color::rgb(238, 238, 238),
                         custom_glyphs: &[],
                     }],
-                    &mut self.find_text.swash_cache,
+                    &mut self.swash_cache,
                 )
                 .expect("find text prepare failed");
         }
 
-        // Palette text overlay — its own TextStack so it shapes independently.
         let palette_open = self.palette.is_some();
         if palette_open {
             let (px, py) = self.palette_text_origin();
-            self.palette_text.viewport.update(
-                &self.gpu.queue,
-                Resolution {
-                    width: self.gpu.surface_config.width,
-                    height: self.gpu.surface_config.height,
-                },
-            );
+            self.palette_text
+                .viewport
+                .update(&self.gpu.queue, resolution);
             self.palette_text
                 .renderer
                 .prepare(
                     &self.gpu.device,
                     &self.gpu.queue,
-                    &mut self.palette_text.font_system,
+                    &mut self.font_system,
                     &mut self.palette_text.atlas,
                     &self.palette_text.viewport,
                     [TextArea {
@@ -1280,16 +1775,11 @@ impl State {
                         left: px,
                         top: py,
                         scale: 1.0,
-                        bounds: TextBounds {
-                            left: 0,
-                            top: 0,
-                            right: self.gpu.surface_config.width as i32,
-                            bottom: self.gpu.surface_config.height as i32,
-                        },
+                        bounds: full_bounds,
                         default_color: Color::rgb(238, 238, 238),
                         custom_glyphs: &[],
                     }],
-                    &mut self.palette_text.swash_cache,
+                    &mut self.swash_cache,
                 )
                 .expect("palette text prepare failed");
         }
@@ -1321,13 +1811,22 @@ impl State {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            // Editor quads first (highlights, carets, find/palette underlays
-            // + panels); then editor text; then overlay text on top.
+            // Editor quads first (tab strip backdrops + selection + carets +
+            // overlay panels); then editor text; then tab labels; then
+            // overlay text on top.
             self.quads.render(&mut pass);
             self.text
                 .renderer
                 .render(&self.text.atlas, &self.text.viewport, &mut pass)
                 .expect("text render failed");
+            self.tabs_text
+                .renderer
+                .render(&self.tabs_text.atlas, &self.tabs_text.viewport, &mut pass)
+                .expect("tabs text render failed");
+            self.close_text
+                .renderer
+                .render(&self.close_text.atlas, &self.close_text.viewport, &mut pass)
+                .expect("close text render failed");
             if find_open {
                 self.find_text
                     .renderer
@@ -1348,6 +1847,8 @@ impl State {
         self.gpu.queue.submit(Some(encoder.finish()));
         frame.present();
         self.text.atlas.trim();
+        self.tabs_text.atlas.trim();
+        self.close_text.atlas.trim();
         if palette_open {
             self.palette_text.atlas.trim();
         }
@@ -1365,8 +1866,6 @@ impl State {
             );
         }
 
-        // Keystroke latency: from the key press to this frame being presented
-        // (spec §8 target 16ms / hard limit 33ms).
         if let Some(key_at) = self.pending_keystroke.take() {
             log::info!(
                 "keystroke latency {:.2}ms (target 16ms / hard 33ms)",
@@ -1427,7 +1926,6 @@ impl ApplicationHandler for App {
             self.file_path.clone(),
             &self.settings,
         );
-        // ControlFlow::Wait only draws on demand — kick off the first frame.
         state.window.request_redraw();
         self.state = Some(state);
     }
@@ -1437,7 +1935,7 @@ impl ApplicationHandler for App {
             return;
         };
         match event {
-            WindowEvent::CloseRequested if state.confirm_unsaved("Close") => {
+            WindowEvent::CloseRequested if state.confirm_close_all() => {
                 log::info!("close requested — exiting");
                 event_loop.exit();
             }
@@ -1461,14 +1959,19 @@ impl ApplicationHandler for App {
                 ElementState::Pressed => state.handle_mouse_press(),
                 ElementState::Released => state.handle_mouse_release(),
             },
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } => state.handle_mouse_middle(),
             WindowEvent::MouseWheel { delta, .. } => {
-                // Normalize both delta kinds to physical pixels.
                 let delta_y = match delta {
                     MouseScrollDelta::LineDelta(_, lines) => lines * state.line_height(),
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                 };
                 state.handle_scroll(delta_y);
             }
+            WindowEvent::DroppedFile(path) => state.handle_dropped_file(path),
             WindowEvent::RedrawRequested => {
                 state.render();
             }
@@ -1483,8 +1986,6 @@ fn main() {
     )
     .init();
 
-    // Optional file path as the first CLI arg; falls back to the welcome
-    // scratch buffer if absent or unreadable.
     let (initial_text, file_path) = match std::env::args().nth(1) {
         Some(arg) => {
             let path = PathBuf::from(arg);
@@ -1499,8 +2000,6 @@ fn main() {
         None => (WELCOME_TEXT.to_string(), None),
     };
 
-    // Load settings from ~/.config/lighteditor/settings.toml (XDG path) —
-    // missing or malformed files fall through to the defaults.
     let settings = match dirs::config_dir() {
         Some(dir) => Settings::load_or_default(&dir.join(CONFIG_SUBDIR).join(CONFIG_FILENAME)),
         None => {
