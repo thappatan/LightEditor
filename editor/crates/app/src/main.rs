@@ -53,6 +53,13 @@ enum AppEvent {
 /// How long a "settings reloaded" flash stays on the status bar.
 const FLASH_DURATION: Duration = Duration::from_millis(2000);
 
+/// Time window inside which two successive clicks count as a double / triple
+/// click. macOS default is ~500ms; matching it.
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+/// Pointer-movement budget between successive clicks before the count resets
+/// to one, in physical pixels squared.
+const MULTI_CLICK_DIST_SQ: f32 = 16.0;
+
 /// Initial window size, in logical pixels.
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
@@ -171,6 +178,21 @@ fn line_ending_label(le: LineEnding) -> &'static str {
     match le {
         LineEnding::Lf => "LF",
         LineEnding::CrLf => "CRLF",
+    }
+}
+
+/// Closing partner inserted when the user types an opener. Returns the full
+/// `"opener+closer"` pair so the caller can `insert` it in one go and then
+/// move the caret one back; returns `None` for any other input.
+fn auto_pair(input: &str) -> Option<&'static str> {
+    match input {
+        "(" => Some("()"),
+        "[" => Some("[]"),
+        "{" => Some("{}"),
+        "\"" => Some("\"\""),
+        "'" => Some("''"),
+        "`" => Some("``"),
+        _ => None,
     }
 }
 
@@ -329,6 +351,11 @@ struct State {
     /// [`FLASH_DURATION`]; the `Instant` is also used to gate the clear so
     /// a later flash isn't wiped early by an earlier flash's timer.
     status_flash: Option<(String, Instant)>,
+
+    /// Most recent left-button press — drives double/triple-click detection
+    /// (select word / select line). Resets to count = 1 when the press is
+    /// outside the interval or moves further than the threshold.
+    last_click: Option<(Instant, (f32, f32), u32)>,
     /// Used by `set_status_flash` to schedule its own `ClearFlash` event
     /// from a detached sleeper thread. Clone-cheap.
     flash_proxy: EventLoopProxy<AppEvent>,
@@ -501,6 +528,7 @@ impl State {
             palette_text,
             find_text,
             status_flash: None,
+            last_click: None,
             flash_proxy,
             tab_spaces,
             pending_keystroke: None,
@@ -757,7 +785,17 @@ impl State {
                 true
             }
             Key::Named(NamedKey::Enter) => {
-                self.doc_mut().editor.insert_newline();
+                // Auto-indent: copy the leading whitespace of the current
+                // line into the new one. `insert_newline` uses the buffer's
+                // detected LF/CRLF so we mimic the same here.
+                let indent = self.current_line_indent();
+                if indent.is_empty() {
+                    self.doc_mut().editor.insert_newline();
+                } else {
+                    let le = self.doc().editor.buffer().line_ending().as_str();
+                    let payload = format!("{le}{indent}");
+                    self.doc_mut().editor.insert(&payload);
+                }
                 true
             }
             Key::Named(NamedKey::Space) => {
@@ -792,7 +830,14 @@ impl State {
             // Printable character input — winit gives us the resolved text.
             _ => match &event.text {
                 Some(text) if !text.is_empty() => {
-                    self.doc_mut().editor.insert(text);
+                    if let Some(pair) = auto_pair(text) {
+                        self.doc_mut().editor.insert(pair);
+                        // Caret sits one char back so the user is *inside*
+                        // the pair, ready to type the wrapped content.
+                        self.doc_mut().editor.move_left(false);
+                    } else {
+                        self.doc_mut().editor.insert(text);
+                    }
                     true
                 }
                 _ => false,
@@ -823,8 +868,8 @@ impl State {
 
     /// Left-button press: tab-strip click switches tabs (or closes the tab
     /// when the press lands on its "×"); gutter click selects the whole
-    /// logical line; below the strip in the editor area it places a caret
-    /// and starts a potential drag.
+    /// logical line; in the editor area, single-click places a caret,
+    /// double-click selects the word, triple-click selects the line.
     fn handle_mouse_press(&mut self) {
         let Some((mx, my)) = self.mouse_pos else {
             return;
@@ -839,7 +884,20 @@ impl State {
         }
         if self.in_gutter(mx, my) {
             self.select_line_at_pixel(my);
+            self.last_click = None;
             return;
+        }
+        let count = self.record_click(mx, my);
+        match count {
+            2 => {
+                self.select_word_at_pixel(mx, my);
+                return;
+            }
+            3 => {
+                self.select_line_at_pixel(my);
+                return;
+            }
+            _ => {}
         }
         let Some(char_idx) = self.char_at_pixel(mx, my) else {
             return;
@@ -851,6 +909,75 @@ impl State {
         self.scene_dirty = true;
         self.follow_caret = true;
         self.window.request_redraw();
+    }
+
+    /// Update the multi-click state and return the current click count
+    /// (1 / 2 / 3 / …). Successive clicks reset to 1 once they leave the
+    /// time window or move further than the distance threshold.
+    fn record_click(&mut self, x: f32, y: f32) -> u32 {
+        let now = Instant::now();
+        let count = match self.last_click {
+            Some((t, (px, py), c))
+                if now.duration_since(t) < MULTI_CLICK_INTERVAL && {
+                    let dx = x - px;
+                    let dy = y - py;
+                    dx * dx + dy * dy < MULTI_CLICK_DIST_SQ
+                } =>
+            {
+                c + 1
+            }
+            _ => 1,
+        };
+        self.last_click = Some((now, (x, y), count));
+        count
+    }
+
+    /// Select the word (run of alphanumeric or underscore) containing the
+    /// pixel position. A click on whitespace just places the caret.
+    fn select_word_at_pixel(&mut self, x: f32, y: f32) {
+        let Some(char_idx) = self.char_at_pixel(x, y) else {
+            return;
+        };
+        let text = self.doc().editor.text();
+        let chars: Vec<char> = text.chars().collect();
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let n = chars.len();
+        let clamped = char_idx.min(n);
+        let mut start = clamped;
+        let mut end = clamped;
+        while start > 0 && is_word(chars[start - 1]) {
+            start -= 1;
+        }
+        while end < n && is_word(chars[end]) {
+            end += 1;
+        }
+        if start == end {
+            // Click landed on a non-word char — fall back to caret placement.
+            self.doc_mut()
+                .editor
+                .set_selection(Selection::cursor(clamped));
+        } else {
+            self.doc_mut()
+                .editor
+                .set_selection(Selection::new(start, end));
+        }
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.window.request_redraw();
+    }
+
+    /// Leading whitespace of the line where the primary caret currently
+    /// sits. Used by auto-indent to copy the same indent onto the new line
+    /// when the user presses Enter.
+    fn current_line_indent(&self) -> String {
+        let head = self.doc().editor.selections().primary().head;
+        let pos = self.doc().editor.buffer().char_to_position(head);
+        let Some(line) = self.doc().editor.buffer().line(pos.line) else {
+            return String::new();
+        };
+        line.chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect()
     }
 
     /// Is the physical-pixel point inside the gutter strip?
