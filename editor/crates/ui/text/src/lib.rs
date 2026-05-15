@@ -1,9 +1,9 @@
 //! Text rendering stack — cosmic-text shaping + swash raster + glyphon GPU draw.
 //!
-//! Spec §3.3 (text pipeline). This crate owns the GPU-side glyph atlas + the
-//! shaped buffer for one piece of text. `FontSystem` and `SwashCache` are
-//! borrowed from the caller — multiple `TextStack`s share one of each so the
-//! ~80ms `FontSystem::new()` cost is paid once per app, not once per stack.
+//! Spec §3.3 (text pipeline). One `TextStack` shapes a single piece of text
+//! into a cosmic-text `Buffer`; the GPU side (atlas, renderer, viewport) is
+//! shared across stacks via [`TextGpu`] so the app pays the wgpu setup cost
+//! once and submits all text in a single `prepare` + `render` per frame.
 
 use glyphon::{
     Attrs, Buffer, Cache, Family, FontSystem, Metrics, Shaping, SwashCache, TextAtlas,
@@ -28,13 +28,37 @@ fn default_attrs() -> Attrs<'static> {
     Attrs::new().family(FONT_FAMILY)
 }
 
-/// Owns the GPU-side glyph atlas + the shaped buffer for one piece of text.
-/// `FontSystem` and `SwashCache` are passed in by the caller — they are
-/// expensive to construct and shareable across stacks.
-pub struct TextStack {
+/// GPU-side text resources shared across every `TextStack` in an app.
+///
+/// Creating these for each stack burns ~50ms/stack of wgpu setup *and*
+/// duplicates the glyph atlas — one shared instance lets the editor batch
+/// all text into a single `prepare`/`render` per frame.
+pub struct TextGpu {
     pub viewport: Viewport,
     pub atlas: TextAtlas,
     pub renderer: TextRenderer,
+}
+
+impl TextGpu {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+        let cache = Cache::new(device);
+        let viewport = Viewport::new(device, &cache);
+        let mut atlas = TextAtlas::new(device, queue, &cache, format);
+        let renderer =
+            TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
+        Self {
+            viewport,
+            atlas,
+            renderer,
+        }
+    }
+}
+
+/// Owns the shaped cosmic-text `Buffer` for one piece of text.
+///
+/// Has no GPU resources of its own — drawing happens via [`TextGpu`] and an
+/// app-supplied `TextArea` referencing [`TextStack::buffer`].
+pub struct TextStack {
     pub buffer: Buffer,
     /// Font size in *logical* points (DIPs). Physical metrics = pt × scale.
     font_size_pt: f32,
@@ -55,13 +79,7 @@ impl TextStack {
     /// screenful. The caller scrolls and clips the viewport itself. `text` is
     /// shaped with `Shaping::Advanced` so complex scripts (Thai, Arabic,
     /// Devanagari) cluster correctly.
-    // A builder would be tidier but every caller passes every argument; a
-    // refactor is a follow-up.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        format: wgpu::TextureFormat,
         font_system: &mut FontSystem,
         width: f32,
         font_size_pt: f32,
@@ -69,20 +87,10 @@ impl TextStack {
         scale: f32,
         text: &str,
     ) -> Self {
-        let cache = Cache::new(device);
-        let viewport = Viewport::new(device, &cache);
-        let mut atlas = TextAtlas::new(device, queue, &cache, format);
-        let renderer =
-            TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
-
         let metrics = Metrics::new(font_size_pt * scale, line_height_pt * scale);
         let mut buffer = Buffer::new(font_system, metrics);
         buffer.set_size(font_system, Some(width), None);
-
         let mut stack = Self {
-            viewport,
-            atlas,
-            renderer,
             buffer,
             font_size_pt,
             line_height_pt,

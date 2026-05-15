@@ -24,7 +24,7 @@ use editor_core::{LineEnding, Position, Selection};
 use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Point, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{Color, FontSystem, Resolution, SwashCache, TextArea, TextBounds};
-use editor_ui_text::TextStack;
+use editor_ui_text::{TextGpu, TextStack};
 use find::FindBar;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use palette::{Command, CommandPalette};
@@ -198,13 +198,18 @@ struct State {
     window: Arc<Window>,
     gpu: GpuContext,
     quads: QuadRenderer,
-    /// Shared across every `TextStack` (editor, palette, find, tabs, close).
-    /// `FontSystem::new()` walks the OS font directory once — ~80ms cold —
-    /// so building one and lending it out is much cheaper than five.
+    /// Shared across every `TextStack` (editor, palette, find, tabs, close,
+    /// status). `FontSystem::new()` walks the OS font directory once —
+    /// ~80ms cold — so building one and lending it out is much cheaper than
+    /// one per stack.
     font_system: FontSystem,
-    /// Shared swash glyph cache. Per-stack `TextRenderer::prepare` borrows it
-    /// in turn (calls are sequential, so the single `&mut` rotates fine).
+    /// Shared swash glyph cache.
     swash_cache: SwashCache,
+    /// Shared GPU text resources — one viewport, one atlas, one renderer.
+    /// Every per-frame TextArea (editor, tabs, close ×s, status, find,
+    /// palette) goes into a single `prepare` + `render` call, so adding a
+    /// stack is now cheap.
+    text_gpu: TextGpu,
     /// TextStack for the *active* document. Reshape happens on switch and on
     /// edit (`text_dirty`).
     text: TextStack,
@@ -307,11 +312,12 @@ impl State {
         let mut font_system = editor_ui_text::new_font_system();
         let swash_cache = editor_ui_text::new_swash_cache();
 
+        // One shared TextGpu — every stack below reuses these GPU resources
+        // through the single `prepare`/`render` call in `Self::render`.
+        let text_gpu = TextGpu::new(&gpu.device, &gpu.queue, gpu.format());
+
         let text_padding = TEXT_PADDING_DIP * scale;
         let text = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
             &mut font_system,
             size.width as f32 - text_padding,
             font_size_pt,
@@ -325,12 +331,8 @@ impl State {
             None => Document::new_scratch(initial_text),
         };
 
-        // Each overlay TextStack reuses the shared FontSystem above.
         let palette_width = (PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale;
         let palette_text = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
             &mut font_system,
             palette_width,
             font_size_pt,
@@ -341,9 +343,6 @@ impl State {
 
         let find_width = (FIND_WIDTH_DIP - 2.0 * FIND_PAD_DIP) * scale;
         let find_text = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
             &mut font_system,
             find_width,
             font_size_pt,
@@ -355,9 +354,6 @@ impl State {
         // Tab strip TextStack — one long single line of labels. Width spans
         // the whole window; no wrap.
         let tabs_text = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
             &mut font_system,
             size.width as f32,
             font_size_pt,
@@ -369,9 +365,6 @@ impl State {
         // Close-button TextStack — shapes the "×" glyph once and is then
         // drawn at every tab's close-button position via N TextAreas.
         let close_text = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
             &mut font_system,
             TAB_CLOSE_W_DIP * scale,
             font_size_pt,
@@ -385,9 +378,6 @@ impl State {
         // before we decide whether to truncate.
         let status_width = size.width as f32 - 2.0 * STATUS_PAD_X_DIP * scale;
         let status_left = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
             &mut font_system,
             status_width,
             font_size_pt,
@@ -396,9 +386,6 @@ impl State {
             "",
         );
         let status_right = TextStack::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.format(),
             &mut font_system,
             status_width,
             font_size_pt,
@@ -420,6 +407,7 @@ impl State {
             quads,
             font_system,
             swash_cache,
+            text_gpu,
             text,
             docs: vec![doc],
             active: 0,
@@ -1840,34 +1828,16 @@ impl State {
             bottom: (surface_h as f32 - status_bar_h) as i32,
         };
 
-        // Editor text.
+        // All text — editor / tabs / close ×s / status / find / palette —
+        // batched into a single `prepare` + `render`. The order TextAreas
+        // appear in the vec is the draw order, so overlays go last.
         let inset_x = self.text_inset_x;
         let inset_y = self.text_inset_y;
         let scroll = self.docs[self.active].scroll_y;
-        self.text.viewport.update(&self.gpu.queue, resolution);
-        self.text
-            .renderer
-            .prepare(
-                &self.gpu.device,
-                &self.gpu.queue,
-                &mut self.font_system,
-                &mut self.text.atlas,
-                &self.text.viewport,
-                [TextArea {
-                    buffer: &self.text.buffer,
-                    left: inset_x,
-                    top: inset_y - scroll,
-                    scale: 1.0,
-                    bounds: editor_text_bounds,
-                    default_color: Color::rgb(238, 238, 238),
-                    custom_glyphs: &[],
-                }],
-                &mut self.swash_cache,
-            )
-            .expect("text prepare failed");
+        let editor_color = Color::rgb(238, 238, 238);
+        let label_color = Color::rgb(220, 220, 220);
+        let dim_color = Color::rgb(180, 180, 190);
 
-        // Tab strip labels. Centred vertically inside the strip; one cell per
-        // label, sized roughly to TAB_LABEL_CHARS monospace chars.
         let tab_strip_h = TAB_BAR_HEIGHT_DIP * self.scale;
         let tab_text_pad_x = TAB_PAD_X_DIP * self.scale;
         let tab_text_y = (tab_strip_h - self.line_height()) * 0.5;
@@ -1877,69 +1847,13 @@ impl State {
             right: surface_w as i32,
             bottom: tab_strip_h as i32,
         };
-        self.tabs_text.viewport.update(&self.gpu.queue, resolution);
-        self.tabs_text
-            .renderer
-            .prepare(
-                &self.gpu.device,
-                &self.gpu.queue,
-                &mut self.font_system,
-                &mut self.tabs_text.atlas,
-                &self.tabs_text.viewport,
-                [TextArea {
-                    buffer: &self.tabs_text.buffer,
-                    left: tab_text_pad_x,
-                    top: tab_text_y,
-                    scale: 1.0,
-                    bounds: strip_bounds,
-                    default_color: Color::rgb(220, 220, 220),
-                    custom_glyphs: &[],
-                }],
-                &mut self.swash_cache,
-            )
-            .expect("tabs text prepare failed");
 
-        // Close "×" glyph — shaped once, drawn at every tab's close-button
-        // position via N TextAreas pointing at the same Buffer.
         let docs_len = self.docs.len();
-        let scale_factor = self.scale;
-        let slot_w = TAB_WIDTH_DIP * scale_factor;
-        let close_w = TAB_CLOSE_W_DIP * scale_factor;
-        let close_pad = TAB_CLOSE_PAD_DIP * scale_factor;
-        // Center the glyph horizontally inside the close-rect — the "×"
-        // glyph is narrower than the rect, so push it in by a quarter.
+        let slot_w = TAB_WIDTH_DIP * self.scale;
+        let close_w = TAB_CLOSE_W_DIP * self.scale;
+        let close_pad = TAB_CLOSE_PAD_DIP * self.scale;
         let close_glyph_offset_x = close_w * 0.25;
-        self.close_text.viewport.update(&self.gpu.queue, resolution);
-        self.close_text
-            .renderer
-            .prepare(
-                &self.gpu.device,
-                &self.gpu.queue,
-                &mut self.font_system,
-                &mut self.close_text.atlas,
-                &self.close_text.viewport,
-                (0..docs_len).map(|i| {
-                    let slot_x = i as f32 * slot_w;
-                    let close_x = slot_x + slot_w - close_w - close_pad + close_glyph_offset_x;
-                    TextArea {
-                        buffer: &self.close_text.buffer,
-                        left: close_x,
-                        top: tab_text_y,
-                        scale: 1.0,
-                        bounds: strip_bounds,
-                        default_color: Color::rgb(180, 180, 190),
-                        custom_glyphs: &[],
-                    }
-                }),
-                &mut self.swash_cache,
-            )
-            .expect("close text prepare failed");
 
-        // Status bar text — left half is `path · lang · LE`, right half is
-        // `Ln L, Col C · N lines`. Both are single-line and centred
-        // vertically inside the bar; the right half is positioned by the
-        // measured width of its shaped buffer so the caption ends one
-        // STATUS_PAD_X from the window's right edge.
         let status_bar = self.status_bar_rect();
         let status_y = status_bar.min_y() + (status_bar.size.height - self.line_height()) * 0.5;
         let status_pad_x = STATUS_PAD_X_DIP * self.scale;
@@ -1948,113 +1862,113 @@ impl State {
             - status_pad_x
             - shaped_width(&self.status_right))
         .max(status_left_x);
-        let status_color = Color::rgb(180, 180, 190);
         let status_bounds = TextBounds {
             left: 0,
             top: status_bar.min_y() as i32,
             right: surface_w as i32,
             bottom: surface_h as i32,
         };
-        self.status_left
-            .viewport
-            .update(&self.gpu.queue, resolution);
-        self.status_left
-            .renderer
-            .prepare(
-                &self.gpu.device,
-                &self.gpu.queue,
-                &mut self.font_system,
-                &mut self.status_left.atlas,
-                &self.status_left.viewport,
-                [TextArea {
-                    buffer: &self.status_left.buffer,
-                    left: status_left_x,
-                    top: status_y,
-                    scale: 1.0,
-                    bounds: status_bounds,
-                    default_color: status_color,
-                    custom_glyphs: &[],
-                }],
-                &mut self.swash_cache,
-            )
-            .expect("status-left prepare failed");
-        self.status_right
-            .viewport
-            .update(&self.gpu.queue, resolution);
-        self.status_right
-            .renderer
-            .prepare(
-                &self.gpu.device,
-                &self.gpu.queue,
-                &mut self.font_system,
-                &mut self.status_right.atlas,
-                &self.status_right.viewport,
-                [TextArea {
-                    buffer: &self.status_right.buffer,
-                    left: status_right_x,
-                    top: status_y,
-                    scale: 1.0,
-                    bounds: status_bounds,
-                    default_color: status_color,
-                    custom_glyphs: &[],
-                }],
-                &mut self.swash_cache,
-            )
-            .expect("status-right prepare failed");
 
         let find_open = self.doc().find.is_some();
-        if find_open {
-            let (fx, fy) = self.find_text_origin();
-            self.find_text.viewport.update(&self.gpu.queue, resolution);
-            self.find_text
-                .renderer
-                .prepare(
-                    &self.gpu.device,
-                    &self.gpu.queue,
-                    &mut self.font_system,
-                    &mut self.find_text.atlas,
-                    &self.find_text.viewport,
-                    [TextArea {
-                        buffer: &self.find_text.buffer,
-                        left: fx,
-                        top: fy,
-                        scale: 1.0,
-                        bounds: full_bounds,
-                        default_color: Color::rgb(238, 238, 238),
-                        custom_glyphs: &[],
-                    }],
-                    &mut self.swash_cache,
-                )
-                .expect("find text prepare failed");
-        }
+        let find_xy = if find_open {
+            Some(self.find_text_origin())
+        } else {
+            None
+        };
 
         let palette_open = self.palette.is_some();
-        if palette_open {
-            let (px, py) = self.palette_text_origin();
-            self.palette_text
-                .viewport
-                .update(&self.gpu.queue, resolution);
-            self.palette_text
-                .renderer
-                .prepare(
-                    &self.gpu.device,
-                    &self.gpu.queue,
-                    &mut self.font_system,
-                    &mut self.palette_text.atlas,
-                    &self.palette_text.viewport,
-                    [TextArea {
-                        buffer: &self.palette_text.buffer,
-                        left: px,
-                        top: py,
-                        scale: 1.0,
-                        bounds: full_bounds,
-                        default_color: Color::rgb(238, 238, 238),
-                        custom_glyphs: &[],
-                    }],
-                    &mut self.swash_cache,
-                )
-                .expect("palette text prepare failed");
+        let palette_xy = if palette_open {
+            Some(self.palette_text_origin())
+        } else {
+            None
+        };
+
+        let mut text_areas: Vec<TextArea> = Vec::with_capacity(6 + docs_len);
+        text_areas.push(TextArea {
+            buffer: &self.text.buffer,
+            left: inset_x,
+            top: inset_y - scroll,
+            scale: 1.0,
+            bounds: editor_text_bounds,
+            default_color: editor_color,
+            custom_glyphs: &[],
+        });
+        text_areas.push(TextArea {
+            buffer: &self.tabs_text.buffer,
+            left: tab_text_pad_x,
+            top: tab_text_y,
+            scale: 1.0,
+            bounds: strip_bounds,
+            default_color: label_color,
+            custom_glyphs: &[],
+        });
+        for i in 0..docs_len {
+            let slot_x = i as f32 * slot_w;
+            let close_x = slot_x + slot_w - close_w - close_pad + close_glyph_offset_x;
+            text_areas.push(TextArea {
+                buffer: &self.close_text.buffer,
+                left: close_x,
+                top: tab_text_y,
+                scale: 1.0,
+                bounds: strip_bounds,
+                default_color: dim_color,
+                custom_glyphs: &[],
+            });
         }
+        text_areas.push(TextArea {
+            buffer: &self.status_left.buffer,
+            left: status_left_x,
+            top: status_y,
+            scale: 1.0,
+            bounds: status_bounds,
+            default_color: dim_color,
+            custom_glyphs: &[],
+        });
+        text_areas.push(TextArea {
+            buffer: &self.status_right.buffer,
+            left: status_right_x,
+            top: status_y,
+            scale: 1.0,
+            bounds: status_bounds,
+            default_color: dim_color,
+            custom_glyphs: &[],
+        });
+        if let Some((fx, fy)) = find_xy {
+            text_areas.push(TextArea {
+                buffer: &self.find_text.buffer,
+                left: fx,
+                top: fy,
+                scale: 1.0,
+                bounds: full_bounds,
+                default_color: editor_color,
+                custom_glyphs: &[],
+            });
+        }
+        if let Some((px, py)) = palette_xy {
+            text_areas.push(TextArea {
+                buffer: &self.palette_text.buffer,
+                left: px,
+                top: py,
+                scale: 1.0,
+                bounds: full_bounds,
+                default_color: editor_color,
+                custom_glyphs: &[],
+            });
+        }
+
+        self.text_gpu.viewport.update(&self.gpu.queue, resolution);
+        self.text_gpu
+            .renderer
+            .prepare(
+                &self.gpu.device,
+                &self.gpu.queue,
+                &mut self.font_system,
+                &mut self.text_gpu.atlas,
+                &self.text_gpu.viewport,
+                text_areas,
+                &mut self.swash_cache,
+            )
+            .expect("text prepare failed");
 
         let Some(frame) = self.gpu.acquire() else {
             return;
@@ -2084,67 +1998,16 @@ impl State {
                 multiview_mask: None,
             });
             // Editor quads first (tab strip backdrops + selection + carets +
-            // overlay panels); then editor text; then tab labels; then
-            // overlay text on top.
+            // overlay panels); then every text region in one render call.
             self.quads.render(&mut pass);
-            self.text
+            self.text_gpu
                 .renderer
-                .render(&self.text.atlas, &self.text.viewport, &mut pass)
+                .render(&self.text_gpu.atlas, &self.text_gpu.viewport, &mut pass)
                 .expect("text render failed");
-            self.tabs_text
-                .renderer
-                .render(&self.tabs_text.atlas, &self.tabs_text.viewport, &mut pass)
-                .expect("tabs text render failed");
-            self.close_text
-                .renderer
-                .render(&self.close_text.atlas, &self.close_text.viewport, &mut pass)
-                .expect("close text render failed");
-            self.status_left
-                .renderer
-                .render(
-                    &self.status_left.atlas,
-                    &self.status_left.viewport,
-                    &mut pass,
-                )
-                .expect("status-left render failed");
-            self.status_right
-                .renderer
-                .render(
-                    &self.status_right.atlas,
-                    &self.status_right.viewport,
-                    &mut pass,
-                )
-                .expect("status-right render failed");
-            if find_open {
-                self.find_text
-                    .renderer
-                    .render(&self.find_text.atlas, &self.find_text.viewport, &mut pass)
-                    .expect("find text render failed");
-            }
-            if palette_open {
-                self.palette_text
-                    .renderer
-                    .render(
-                        &self.palette_text.atlas,
-                        &self.palette_text.viewport,
-                        &mut pass,
-                    )
-                    .expect("palette text render failed");
-            }
         }
         self.gpu.queue.submit(Some(encoder.finish()));
         frame.present();
-        self.text.atlas.trim();
-        self.tabs_text.atlas.trim();
-        self.close_text.atlas.trim();
-        self.status_left.atlas.trim();
-        self.status_right.atlas.trim();
-        if palette_open {
-            self.palette_text.atlas.trim();
-        }
-        if find_open {
-            self.find_text.atlas.trim();
-        }
+        self.text_gpu.atlas.trim();
 
         self.last_frame_us = frame_start.elapsed().as_micros();
         self.frame_count += 1;
