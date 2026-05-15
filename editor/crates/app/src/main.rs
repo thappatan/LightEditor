@@ -26,6 +26,7 @@ use editor_ui_scene::{Color as SceneColor, Point, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{Color, FontSystem, Resolution, SwashCache, TextArea, TextBounds};
 use editor_ui_text::TextStack;
 use find::FindBar;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use palette::{Command, CommandPalette};
 use wgpu::{
     LoadOp, Operations, RenderPassColorAttachment, RenderPassDescriptor, StoreOp,
@@ -34,9 +35,17 @@ use wgpu::{
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
+
+/// Cross-thread events posted into the winit event loop from background
+/// helpers — currently just the settings file watcher.
+#[derive(Debug, Clone, Copy)]
+enum AppEvent {
+    /// `settings.toml` changed on disk; reload and reapply.
+    SettingsChanged,
+}
 
 /// Initial window size, in logical pixels.
 const WINDOW_WIDTH: u32 = 1280;
@@ -507,6 +516,29 @@ impl State {
         self.status_right.set_width(fs, status_width);
         self.text_dirty = true;
         self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Pick up a fresh `Settings`: reapply font metrics to every TextStack
+    /// and rebuild the Tab-key spaces. Called from the settings file watcher.
+    fn reload_settings(&mut self, settings: &Settings) {
+        let fs = &mut self.font_system;
+        let font = settings.editor.font_size;
+        let lh = settings.editor.line_height;
+        self.text.set_font_size(fs, font, lh);
+        self.palette_text.set_font_size(fs, font, lh);
+        self.find_text.set_font_size(fs, font, lh);
+        self.tabs_text.set_font_size(fs, font, lh);
+        self.close_text.set_font_size(fs, font, lh);
+        self.status_left.set_font_size(fs, font, lh);
+        self.status_right.set_font_size(fs, font, lh);
+        self.tab_spaces = " ".repeat(settings.editor.tab_size);
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        log::info!(
+            "settings reloaded: font_size={font} line_height={lh} tab_size={}",
+            settings.editor.tab_size
+        );
         self.window.request_redraw();
     }
 
@@ -2145,22 +2177,55 @@ struct App {
     initial_text: String,
     file_path: Option<PathBuf>,
     settings: Settings,
+    settings_path: Option<PathBuf>,
+    /// Kept alive so the watcher thread doesn't shut down; consulted only
+    /// via the user-event proxy so the field itself is otherwise unused.
+    _settings_watcher: Option<RecommendedWatcher>,
     state: Option<State>,
 }
 
 impl App {
-    fn new(initial_text: String, file_path: Option<PathBuf>, settings: Settings) -> Self {
+    fn new(
+        initial_text: String,
+        file_path: Option<PathBuf>,
+        settings: Settings,
+        settings_path: Option<PathBuf>,
+        settings_watcher: Option<RecommendedWatcher>,
+    ) -> Self {
         Self {
             cold_start: Instant::now(),
             initial_text,
             file_path,
             settings,
+            settings_path,
+            _settings_watcher: settings_watcher,
             state: None,
         }
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::SettingsChanged => {
+                let Some(path) = self.settings_path.as_ref() else {
+                    return;
+                };
+                let new_settings = Settings::load_or_default(path);
+                // macOS fsevent fires several events for one save (write
+                // tmp, rename, attribute change) — bail when the parsed
+                // contents haven't actually changed so the log isn't N×.
+                if new_settings == self.settings {
+                    return;
+                }
+                if let Some(state) = self.state.as_mut() {
+                    state.reload_settings(&new_settings);
+                }
+                self.settings = new_settings;
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -2254,16 +2319,67 @@ fn main() {
         None => (WELCOME_TEXT.to_string(), None),
     };
 
-    let settings = match dirs::config_dir() {
-        Some(dir) => Settings::load_or_default(&dir.join(CONFIG_SUBDIR).join(CONFIG_FILENAME)),
+    let settings_path = dirs::config_dir().map(|d| d.join(CONFIG_SUBDIR).join(CONFIG_FILENAME));
+    let settings = match settings_path.as_deref() {
+        Some(p) => Settings::load_or_default(p),
         None => {
             log::warn!("no XDG config dir; using default settings");
             Settings::default()
         }
     };
 
-    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
+        .build()
+        .expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(initial_text, file_path, settings);
+
+    // Watch settings.toml so font_size / line_height / tab_size hot-reload
+    // without a restart. Skipped if the OS has no config dir, the parent
+    // directory can't be created, or notify rejects the path.
+    let watcher = settings_path
+        .as_deref()
+        .and_then(|p| spawn_settings_watcher(p, event_loop.create_proxy()));
+
+    let mut app = App::new(initial_text, file_path, settings, settings_path, watcher);
     event_loop.run_app(&mut app).expect("event loop failed");
+}
+
+/// Spawn a file watcher that fires `AppEvent::SettingsChanged` on the
+/// event-loop proxy every time `settings_path`'s filename gets touched.
+/// Returns `None` if anything along the way fails — the editor still runs
+/// with the loaded settings, just without hot-reload.
+fn spawn_settings_watcher(
+    settings_path: &Path,
+    proxy: EventLoopProxy<AppEvent>,
+) -> Option<RecommendedWatcher> {
+    let parent = settings_path.parent()?;
+    if !parent.exists() {
+        // Create the dir so the watcher has something to attach to — the
+        // user might write settings.toml *after* launch.
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("could not create settings dir {}: {}", parent.display(), e);
+            return None;
+        }
+    }
+    let target = settings_path.file_name()?.to_os_string();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let Ok(event) = event else { return };
+        if event
+            .paths
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n == target))
+        {
+            // Loop has gone away if this errors; the watcher is about to be
+            // dropped anyway.
+            let _ = proxy.send_event(AppEvent::SettingsChanged);
+        }
+    })
+    .map_err(|e| log::warn!("settings watcher init failed: {e}"))
+    .ok()?;
+    watcher
+        .watch(parent, RecursiveMode::NonRecursive)
+        .map_err(|e| log::warn!("settings watcher attach failed: {e}"))
+        .ok()?;
+    log::info!("watching {} for settings changes", parent.display());
+    Some(watcher)
 }
