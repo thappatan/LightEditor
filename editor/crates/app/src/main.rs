@@ -822,7 +822,8 @@ impl State {
     }
 
     /// Left-button press: tab-strip click switches tabs (or closes the tab
-    /// when the press lands on its "×"); below the strip it places a caret
+    /// when the press lands on its "×"); gutter click selects the whole
+    /// logical line; below the strip in the editor area it places a caret
     /// and starts a potential drag.
     fn handle_mouse_press(&mut self) {
         let Some((mx, my)) = self.mouse_pos else {
@@ -836,6 +837,10 @@ impl State {
             self.switch_tab(idx);
             return;
         }
+        if self.in_gutter(mx, my) {
+            self.select_line_at_pixel(my);
+            return;
+        }
         let Some(char_idx) = self.char_at_pixel(mx, my) else {
             return;
         };
@@ -843,6 +848,41 @@ impl State {
         self.doc_mut()
             .editor
             .set_selection(Selection::cursor(char_idx));
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.window.request_redraw();
+    }
+
+    /// Is the physical-pixel point inside the gutter strip?
+    fn in_gutter(&self, x: f32, y: f32) -> bool {
+        let bottom = self.gpu.surface_config.height as f32 - STATUS_BAR_HEIGHT_DIP * self.scale;
+        x >= 0.0 && x < self.text_inset_x && y >= self.text_inset_y && y < bottom
+    }
+
+    /// Select the logical line under `y`. Reuses the editor's shaped layout
+    /// to find which line the click landed on so wraps map correctly. The
+    /// selection covers the line content plus its trailing newline.
+    fn select_line_at_pixel(&mut self, y: f32) {
+        let ty = y - self.text_inset_y + self.doc().scroll_y;
+        // Dummy x inside the editor area so `hit` always returns Some.
+        let line = match self.text.buffer.hit(1.0, ty) {
+            Some(c) => c.line,
+            None => return,
+        };
+        let buffer = self.doc().editor.buffer();
+        let Some(start) = buffer.position_to_char(Position::new(line, 0)) else {
+            return;
+        };
+        let end = if line + 1 < buffer.len_lines() {
+            buffer
+                .position_to_char(Position::new(line + 1, 0))
+                .unwrap_or(start)
+        } else {
+            buffer.len_chars()
+        };
+        self.doc_mut()
+            .editor
+            .set_selection(Selection::new(start, end));
         self.scene_dirty = true;
         self.follow_caret = true;
         self.window.request_redraw();
@@ -1814,6 +1854,24 @@ impl State {
             SceneColor::rgba(14, 14, 20, 255),
         ));
 
+        // Active line backdrop — a faint full-width row at every visual run
+        // of the logical line where the primary caret sits. Behind the
+        // selection so the selection's brighter blue still reads.
+        let active_logical = {
+            let head = self.doc().editor.selections().primary().head;
+            self.doc().editor.buffer().char_to_position(head).line
+        };
+        let scroll = self.doc().scroll_y;
+        let line_h = self.line_height();
+        let active_color = SceneColor::rgba(255, 255, 255, 12);
+        for run in self.text.buffer.layout_runs() {
+            if run.line_i != active_logical {
+                continue;
+            }
+            let y = self.text_inset_y + run.line_top - scroll;
+            root.push_child(SceneNode::quad(Rect::new(0.0, y, w, line_h), active_color));
+        }
+
         // Selection highlights sit behind text and carets.
         for selection in self.doc().editor.selections().iter() {
             for rect in self.selection_rects(selection) {
@@ -1822,8 +1880,6 @@ impl State {
         }
 
         // Carets on top of the highlights.
-        let line_height = self.line_height();
-        let scroll = self.doc().scroll_y;
         for selection in self.doc().editor.selections().iter() {
             if let Some((cx, cy)) = self.caret_pixel(selection.head) {
                 root.push_child(SceneNode::quad(
@@ -1831,7 +1887,7 @@ impl State {
                         self.text_inset_x + cx,
                         self.text_inset_y + cy - scroll,
                         self.caret_width,
-                        line_height,
+                        line_h,
                     ),
                     SceneColor::rgb(120, 160, 255),
                 ));
@@ -2047,6 +2103,13 @@ impl State {
         let editor_color = Color::rgb(238, 238, 238);
         let label_color = Color::rgb(220, 220, 220);
         let dim_color = Color::rgb(180, 180, 190);
+        // The line number for the line that has the primary caret on it
+        // gets the brighter colour. Computed once here so the gutter loop
+        // can skip emitting it dim.
+        let active_line = {
+            let head = self.doc().editor.selections().primary().head;
+            self.doc().editor.buffer().char_to_position(head).line
+        };
 
         let tab_strip_h = TAB_BAR_HEIGHT_DIP * self.scale;
         let tab_text_pad_x = TAB_PAD_X_DIP * self.scale;
@@ -2093,21 +2156,18 @@ impl State {
             None
         };
 
-        // Gutter line numbers sit at the same vertical position as the
-        // editor text and share its scroll offset. Bounds clip at the tab
-        // strip and status bar so scrolled numbers don't bleed in.
+        // Gutter line numbers are emitted one TextArea per *visible logical
+        // buffer line*. We use the editor's own layout to find each line's
+        // first visual run, then position the gutter buffer (which contains
+        // every line stacked vertically) so the matching gutter row lines
+        // up with the editor row — clip-bounds to one row hide the rest of
+        // the buffer.
         let gutter_left = GUTTER_PAD_LEFT_DIP * self.scale;
+        let line_height = self.line_height();
+        let viewport_top = self.text_inset_y;
+        let viewport_bottom = surface_h as f32 - status_bar_h;
 
-        let mut text_areas: Vec<TextArea> = Vec::with_capacity(7 + docs_len);
-        text_areas.push(TextArea {
-            buffer: &self.gutter_text.buffer,
-            left: gutter_left,
-            top: inset_y - scroll,
-            scale: 1.0,
-            bounds: editor_text_bounds,
-            default_color: dim_color,
-            custom_glyphs: &[],
-        });
+        let mut text_areas: Vec<TextArea> = Vec::with_capacity(8 + docs_len);
         text_areas.push(TextArea {
             buffer: &self.text.buffer,
             left: inset_x,
@@ -2117,6 +2177,54 @@ impl State {
             default_color: editor_color,
             custom_glyphs: &[],
         });
+        let mut prev_logical = usize::MAX;
+        let mut active_gutter_position: Option<(f32, TextBounds)> = None;
+        for run in self.text.buffer.layout_runs() {
+            // Only the first visual run of each logical line carries a
+            // number; wrapped continuations leave the gutter blank.
+            if run.line_i == prev_logical {
+                continue;
+            }
+            prev_logical = run.line_i;
+            let row_top = inset_y + run.line_top - scroll;
+            // Skip rows entirely outside the editor viewport.
+            if row_top + line_height < viewport_top || row_top > viewport_bottom {
+                continue;
+            }
+            let area_top = row_top - run.line_i as f32 * line_height;
+            let bounds = TextBounds {
+                left: 0,
+                top: row_top.max(viewport_top) as i32,
+                right: inset_x as i32,
+                bottom: (row_top + line_height).min(viewport_bottom) as i32,
+            };
+            if run.line_i == active_line {
+                // Defer the active line to a second TextArea drawn with the
+                // brighter colour; emitting it dim too would blend.
+                active_gutter_position = Some((area_top, bounds));
+                continue;
+            }
+            text_areas.push(TextArea {
+                buffer: &self.gutter_text.buffer,
+                left: gutter_left,
+                top: area_top,
+                scale: 1.0,
+                bounds,
+                default_color: dim_color,
+                custom_glyphs: &[],
+            });
+        }
+        if let Some((area_top, bounds)) = active_gutter_position {
+            text_areas.push(TextArea {
+                buffer: &self.gutter_text.buffer,
+                left: gutter_left,
+                top: area_top,
+                scale: 1.0,
+                bounds,
+                default_color: editor_color,
+                custom_glyphs: &[],
+            });
+        }
         text_areas.push(TextArea {
             buffer: &self.tabs_text.buffer,
             left: tab_text_pad_x,
