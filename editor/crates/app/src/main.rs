@@ -40,7 +40,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 /// Cross-thread events posted into the winit event loop from background
-/// helpers — file watcher + flash-clear timer.
+/// helpers — file watcher, flash-clear timer, caret-blink timer.
 #[derive(Debug, Clone, Copy)]
 enum AppEvent {
     /// `settings.toml` (user or workspace) changed on disk; reload and reapply.
@@ -48,10 +48,21 @@ enum AppEvent {
     /// `FLASH_DURATION` has elapsed since a transient status-bar message was
     /// set — clear it.
     ClearFlash,
+    /// Caret-blink heartbeat. Fires every `CARET_BLINK_INTERVAL`; the
+    /// handler decides whether to flip visibility (skips when recent
+    /// interaction).
+    CaretTick,
 }
 
 /// How long a "settings reloaded" flash stays on the status bar.
 const FLASH_DURATION: Duration = Duration::from_millis(2000);
+
+/// Half-cycle of the caret blink — solid for this long, then hidden for the
+/// same. 530ms matches VSCode's smooth-blink cadence.
+const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+/// After any interaction (keystroke / click), the caret stays solid for at
+/// least this long so it never blinks during active typing.
+const CARET_BLINK_PAUSE: Duration = Duration::from_millis(500);
 
 /// Time window inside which two successive clicks count as a double / triple
 /// click. macOS default is ~500ms; matching it.
@@ -244,6 +255,28 @@ fn substitute_whitespace(text: &str) -> String {
         .collect()
 }
 
+/// Write `text` to the OS clipboard. Logs and swallows errors — clipboard
+/// access can fail on headless Linux or when another app holds the
+/// pasteboard lock; better to no-op than abort the editor.
+fn clipboard_set(text: &str) {
+    match arboard::Clipboard::new() {
+        Ok(mut cb) => {
+            if let Err(e) = cb.set_text(text) {
+                log::warn!("clipboard write failed: {e}");
+            }
+        }
+        Err(e) => log::warn!("clipboard unavailable: {e}"),
+    }
+}
+
+/// Read the OS clipboard. Returns `None` when the clipboard is
+/// unavailable or doesn't currently hold text.
+fn clipboard_get() -> Option<String> {
+    arboard::Clipboard::new()
+        .ok()
+        .and_then(|mut cb| cb.get_text().ok())
+}
+
 /// Closing partner inserted when the user types an opener. Returns the full
 /// `"opener+closer"` pair so the caller can `insert` it in one go and then
 /// move the caret one back; returns `None` for any other input.
@@ -431,6 +464,13 @@ struct State {
     /// Tab whose close "×" is under the pointer. Brightens that "×" on
     /// hover so the affordance is discoverable.
     hovered_close: Option<usize>,
+
+    /// Whether the caret quad is currently drawn. Flipped by the periodic
+    /// `CaretTick` event when no interaction has happened recently.
+    caret_visible: bool,
+    /// Stamp of the last keystroke / mouse press — `tick_caret` keeps the
+    /// caret solid while this is within `CARET_BLINK_PAUSE`.
+    last_interaction: Instant,
     /// Used by `set_status_flash` to schedule its own `ClearFlash` event
     /// from a detached sleeper thread. Clone-cheap.
     flash_proxy: EventLoopProxy<AppEvent>,
@@ -607,6 +647,8 @@ impl State {
             word_wrap: true,
             visible_whitespace: false,
             hovered_close: None,
+            caret_visible: true,
+            last_interaction: Instant::now(),
             flash_proxy,
             tab_spaces,
             pending_keystroke: None,
@@ -769,6 +811,7 @@ impl State {
         if event.state != ElementState::Pressed {
             return;
         }
+        self.note_activity();
 
         // Cmd-Shift-P toggles the palette regardless of whether it is open,
         // so it stays a single muscle-memory key combo.
@@ -909,6 +952,57 @@ impl State {
                             self.window.request_redraw();
                         } else {
                             self.collapse_selection_to_primary();
+                        }
+                        return;
+                    }
+                    "a" => {
+                        self.select_all();
+                        return;
+                    }
+                    "c" => {
+                        self.copy_selection();
+                        return;
+                    }
+                    "v" => {
+                        self.paste_clipboard();
+                        return;
+                    }
+                    "x" => {
+                        self.cut_selection();
+                        return;
+                    }
+                    "z" if self.modifiers.shift_key() => {
+                        self.redo();
+                        return;
+                    }
+                    "z" if !alt => {
+                        // alt-z already matched above for toggle_word_wrap
+                        self.undo();
+                        return;
+                    }
+                    "g" => {
+                        // Cmd-G / Cmd-Shift-G repeat the find — works only
+                        // while the find bar is open (its query is the only
+                        // place a search term currently lives).
+                        if self.doc().find.is_some() {
+                            let shift = self.modifiers.shift_key();
+                            if let Some(f) = self.doc_mut().find.as_mut() {
+                                if shift {
+                                    f.prev_match();
+                                } else {
+                                    f.next_match();
+                                }
+                            }
+                            self.refresh_find_text();
+                            self.select_current_match();
+                            self.scene_dirty = true;
+                            self.window.request_redraw();
+                        }
+                        return;
+                    }
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                        if let Ok(n) = lower.parse::<usize>() {
+                            self.switch_tab(n.saturating_sub(1));
                         }
                         return;
                     }
@@ -1100,6 +1194,7 @@ impl State {
         let Some((mx, my)) = self.mouse_pos else {
             return;
         };
+        self.note_activity();
         if let Some(idx) = self.tab_close_at_pixel(mx, my) {
             self.close_tab_at(idx);
             return;
@@ -1469,6 +1564,113 @@ impl State {
             }
         }
         None
+    }
+
+    /// Touch `last_interaction` so the caret stays solid through the
+    /// current burst of typing or clicking.
+    fn note_activity(&mut self) {
+        self.last_interaction = Instant::now();
+        if !self.caret_visible {
+            self.caret_visible = true;
+            self.scene_dirty = true;
+        }
+    }
+
+    /// Heartbeat from the blink timer. Skips toggling while the user is
+    /// still mid-interaction; otherwise flips visibility and redraws.
+    fn tick_caret(&mut self) {
+        if self.last_interaction.elapsed() < CARET_BLINK_PAUSE {
+            if !self.caret_visible {
+                self.caret_visible = true;
+                self.scene_dirty = true;
+                self.window.request_redraw();
+            }
+            return;
+        }
+        self.caret_visible = !self.caret_visible;
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Select every character in the active document.
+    fn select_all(&mut self) {
+        let len = self.doc().editor.buffer().len_chars();
+        self.doc_mut().editor.set_selection(Selection::new(0, len));
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Step back one undo snapshot on the active document. Refreshes
+    /// scrollbars and the title's "•" indicator.
+    fn undo(&mut self) {
+        if self.doc_mut().editor.undo() {
+            self.text_dirty = true;
+            self.scene_dirty = true;
+            self.follow_caret = true;
+            self.mark_dirty_if_clean();
+            self.window.request_redraw();
+        }
+    }
+
+    /// Step forward one undo snapshot — mirror of [`undo`](Self::undo).
+    fn redo(&mut self) {
+        if self.doc_mut().editor.redo() {
+            self.text_dirty = true;
+            self.scene_dirty = true;
+            self.follow_caret = true;
+            self.mark_dirty_if_clean();
+            self.window.request_redraw();
+        }
+    }
+
+    /// Copy the primary selection's text, or the primary cursor's whole
+    /// line (including its newline) when there's no selection.
+    fn copy_selection(&self) {
+        let primary = self.doc().editor.selections().primary();
+        let text = if primary.is_cursor() {
+            let pos = self.doc().editor.buffer().char_to_position(primary.head);
+            self.doc()
+                .editor
+                .buffer()
+                .line(pos.line)
+                .unwrap_or_default()
+        } else {
+            self.doc()
+                .editor
+                .buffer()
+                .slice(primary.start()..primary.end())
+        };
+        clipboard_set(&text);
+    }
+
+    /// Copy + delete. Cursor-only cuts the whole line; a real selection cuts
+    /// just its span.
+    fn cut_selection(&mut self) {
+        self.copy_selection();
+        let primary = self.doc().editor.selections().primary();
+        if primary.is_cursor() {
+            self.doc_mut().editor.delete_line();
+        } else {
+            self.doc_mut().editor.insert("");
+        }
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.mark_dirty_if_clean();
+        self.window.request_redraw();
+    }
+
+    /// Insert clipboard contents at every cursor.
+    fn paste_clipboard(&mut self) {
+        let Some(text) = clipboard_get() else {
+            return;
+        };
+        self.doc_mut().editor.insert(&text);
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.mark_dirty_if_clean();
+        self.window.request_redraw();
     }
 
     /// Mark the active document dirty if it wasn't already, and refresh
@@ -2790,18 +2992,21 @@ impl State {
             }
         }
 
-        // Carets on top of the highlights.
-        for selection in self.doc().editor.selections().iter() {
-            if let Some((cx, cy)) = self.caret_pixel(selection.head) {
-                root.push_child(SceneNode::quad(
-                    Rect::new(
-                        self.text_inset_x + cx,
-                        self.text_inset_y + cy - scroll,
-                        self.caret_width,
-                        line_h,
-                    ),
-                    SceneColor::rgb(120, 160, 255),
-                ));
+        // Carets on top of the highlights — skipped during the "off" half
+        // of the blink cycle.
+        if self.caret_visible {
+            for selection in self.doc().editor.selections().iter() {
+                if let Some((cx, cy)) = self.caret_pixel(selection.head) {
+                    root.push_child(SceneNode::quad(
+                        Rect::new(
+                            self.text_inset_x + cx,
+                            self.text_inset_y + cy - scroll,
+                            self.caret_width,
+                            line_h,
+                        ),
+                        SceneColor::rgb(120, 160, 255),
+                    ));
+                }
             }
         }
 
@@ -3372,6 +3577,11 @@ impl ApplicationHandler<AppEvent> for App {
                     state.clear_status_flash();
                 }
             }
+            AppEvent::CaretTick => {
+                if let Some(state) = self.state.as_mut() {
+                    state.tick_caret();
+                }
+            }
         }
     }
 
@@ -3500,6 +3710,8 @@ fn main() {
     let workspace_watcher = workspace_settings_path
         .as_deref()
         .and_then(|p| spawn_settings_watcher(p, event_loop.create_proxy()));
+    // Caret-blink heartbeat — one detached thread for the app lifetime.
+    spawn_caret_blink_thread(event_loop.create_proxy());
 
     let mut app = App::new(
         initial_text,
@@ -3512,6 +3724,18 @@ fn main() {
         workspace_watcher,
     );
     event_loop.run_app(&mut app).expect("event loop failed");
+}
+
+/// Detach a background thread that fires `AppEvent::CaretTick` every
+/// `CARET_BLINK_INTERVAL`. The thread exits cleanly when the event loop
+/// goes away (subsequent `send_event` calls return Err).
+fn spawn_caret_blink_thread(proxy: EventLoopProxy<AppEvent>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(CARET_BLINK_INTERVAL);
+        if proxy.send_event(AppEvent::CaretTick).is_err() {
+            return;
+        }
+    });
 }
 
 /// Spawn a file watcher that fires `AppEvent::SettingsChanged` on the
