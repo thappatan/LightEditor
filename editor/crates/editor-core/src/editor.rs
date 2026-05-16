@@ -214,6 +214,108 @@ impl Editor {
         });
     }
 
+    /// Swap the primary selection's line range with the line above. No-op
+    /// when the range already starts at line 0.
+    pub fn move_lines_up(&mut self) {
+        self.move_lines(true);
+    }
+
+    /// Swap the primary selection's line range with the line below. No-op
+    /// when the range already ends at the last line.
+    pub fn move_lines_down(&mut self) {
+        self.move_lines(false);
+    }
+
+    fn move_lines(&mut self, up: bool) {
+        let primary = self.selections.primary();
+        let (start_line, end_line) = self.line_range_for_selection(&primary);
+        let total_lines = self.buffer.len_lines();
+        if up && start_line == 0 {
+            return;
+        }
+        if !up && end_line + 1 >= total_lines {
+            return;
+        }
+        // Compute the two regions to swap: the selected block (lines
+        // start_line..=end_line, including their trailing newlines), and the
+        // adjacent line just above or below it.
+        let block_start = self
+            .buffer
+            .position_to_char(Position::new(start_line, 0))
+            .unwrap_or(0);
+        let block_end = (block_start
+            + (start_line..=end_line)
+                .map(|l| self.buffer.line_len_chars(l).unwrap_or(0))
+                .sum::<usize>())
+        .min(self.buffer.len_chars());
+        let block_text = self.buffer.slice(block_start..block_end);
+
+        let adj_line = if up { start_line - 1 } else { end_line + 1 };
+        let adj_start = self
+            .buffer
+            .position_to_char(Position::new(adj_line, 0))
+            .unwrap_or(0);
+        let adj_end = (adj_start + self.buffer.line_len_chars(adj_line).unwrap_or(0))
+            .min(self.buffer.len_chars());
+        let adj_text = self.buffer.slice(adj_start..adj_end);
+
+        // For the last-line-doesn't-end-with-newline case, both the block
+        // and the adjacent line might be missing a trailing newline. Ensure
+        // the rebuilt order keeps one terminating newline per "row" so the
+        // line count doesn't change.
+        let block_has_eol = block_text.ends_with('\n') || block_text.ends_with("\r\n");
+        let adj_has_eol = adj_text.ends_with('\n') || adj_text.ends_with("\r\n");
+        let le = self.buffer.line_ending().as_str();
+        let (block_norm, adj_norm) = match (up, block_has_eol, adj_has_eol) {
+            // Moving the last block (no trailing EOL) up means the
+            // previously-adjacent line becomes the new last; the *block*
+            // gains an EOL, the new last (adj) loses one.
+            (true, false, true) => {
+                let mut b = block_text.clone();
+                b.push_str(le);
+                let a = adj_text
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .to_string();
+                (b, a)
+            }
+            // Moving a block down past the previously-last line: symmetric.
+            (false, true, false) => {
+                let mut a = adj_text.clone();
+                a.push_str(le);
+                let b = block_text
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .to_string();
+                (b, a)
+            }
+            _ => (block_text.clone(), adj_text.clone()),
+        };
+
+        let replacement = if up {
+            format!("{block_norm}{adj_norm}")
+        } else {
+            format!("{adj_norm}{block_norm}")
+        };
+        let region_start = block_start.min(adj_start);
+        let region_end = block_end.max(adj_end);
+        self.buffer.replace(region_start..region_end, &replacement);
+
+        // Track the selection: shift anchor and head by (signed) the
+        // adjacent line's length in the right direction.
+        let adj_len = adj_text.chars().count();
+        let (new_anchor, new_head) = if up {
+            (
+                primary.anchor.saturating_sub(adj_len),
+                primary.head.saturating_sub(adj_len),
+            )
+        } else {
+            (primary.anchor + adj_len, primary.head + adj_len)
+        };
+        self.selections = SelectionSet::single(Selection::new(new_anchor, new_head));
+        self.commit();
+    }
+
     /// Delete every logical line touched by any selection, plus its
     /// trailing newline. Multi-cursor aware via `edit_ranges`. The cursor
     /// collapses to the line that took the deleted line's place.
@@ -1225,6 +1327,49 @@ mod tests {
         ed.set_selection(Selection::new(0, ed.text().chars().count()));
         ed.toggle_comment_lines("//");
         assert_eq!(ed.text(), "    // foo\n    // bar\n");
+    }
+
+    #[test]
+    fn move_lines_up_swaps_with_previous() {
+        let mut ed = Editor::from("a\nb\nc\n");
+        ed.set_selection(Selection::cursor(2)); // on "b"
+        ed.move_lines_up();
+        assert_eq!(ed.text(), "b\na\nc\n");
+        assert_eq!(ed.selections().primary(), Selection::cursor(0));
+    }
+
+    #[test]
+    fn move_lines_down_swaps_with_next() {
+        let mut ed = Editor::from("a\nb\nc\n");
+        ed.set_selection(Selection::cursor(2)); // on "b"
+        ed.move_lines_down();
+        assert_eq!(ed.text(), "a\nc\nb\n");
+        assert_eq!(ed.selections().primary(), Selection::cursor(4));
+    }
+
+    #[test]
+    fn move_lines_first_line_up_is_noop() {
+        let mut ed = Editor::from("a\nb\n");
+        ed.set_selection(Selection::cursor(0));
+        ed.move_lines_up();
+        assert_eq!(ed.text(), "a\nb\n");
+    }
+
+    #[test]
+    fn move_lines_last_line_down_handles_missing_trailing_newline() {
+        let mut ed = Editor::from("a\nb\nc");
+        ed.set_selection(Selection::cursor(0)); // on "a"
+        ed.move_lines_down();
+        assert_eq!(ed.text(), "b\na\nc");
+    }
+
+    #[test]
+    fn move_lines_round_trips() {
+        let mut ed = Editor::from("alpha\nbeta\ngamma\n");
+        ed.set_selection(Selection::new(6, 10)); // selects within "beta"
+        ed.move_lines_down();
+        ed.move_lines_up();
+        assert_eq!(ed.text(), "alpha\nbeta\ngamma\n");
     }
 
     #[test]
