@@ -146,6 +146,15 @@ const CONFIG_SUBDIR: &str = "lighteditor";
 const CONFIG_FILENAME: &str = "settings.toml";
 /// Theme file name in the same directory.
 const THEME_FILENAME: &str = "theme.toml";
+
+// Bundled themes — TOML embedded at compile time so the palette picker
+// works without the example files being on disk.
+const BUNDLED_SOLARIZED_DARK: &str = include_str!("../../../examples/themes/solarized-dark.toml");
+const BUNDLED_SOLARIZED_LIGHT: &str = include_str!("../../../examples/themes/solarized-light.toml");
+const BUNDLED_MONOKAI: &str = include_str!("../../../examples/themes/monokai.toml");
+const BUNDLED_GRUVBOX_DARK: &str = include_str!("../../../examples/themes/gruvbox-dark.toml");
+const BUNDLED_NORD: &str = include_str!("../../../examples/themes/nord.toml");
+const BUNDLED_TOKYO_NIGHT: &str = include_str!("../../../examples/themes/tokyo-night.toml");
 /// Subdirectory under the current working directory that may hold a
 /// workspace-scoped settings override (spec §4.1.5 — Workspace ranks above
 /// User in the precedence Default → User → Workspace).
@@ -2373,7 +2382,68 @@ impl State {
             Command::SaveAll => self.save_all(),
             Command::CloseOtherTabs => self.close_other_tabs(),
             Command::CloseAllTabs => self.close_all_tabs(),
+            Command::ThemeDefault => self.apply_bundled_theme("Default Dark", ""),
+            Command::ThemeSolarizedDark => {
+                self.apply_bundled_theme("Solarized Dark", BUNDLED_SOLARIZED_DARK)
+            }
+            Command::ThemeSolarizedLight => {
+                self.apply_bundled_theme("Solarized Light", BUNDLED_SOLARIZED_LIGHT)
+            }
+            Command::ThemeMonokai => self.apply_bundled_theme("Monokai", BUNDLED_MONOKAI),
+            Command::ThemeGruvboxDark => {
+                self.apply_bundled_theme("Gruvbox Dark", BUNDLED_GRUVBOX_DARK)
+            }
+            Command::ThemeNord => self.apply_bundled_theme("Nord", BUNDLED_NORD),
+            Command::ThemeTokyoNight => {
+                self.apply_bundled_theme("Tokyo Night", BUNDLED_TOKYO_NIGHT)
+            }
         }
+    }
+
+    /// Apply a bundled theme: parse the embedded TOML (or fall back to
+    /// `Theme::default()` for the empty-content "Default Dark" entry), swap
+    /// the in-memory theme, and write the content to `theme.toml` so the
+    /// pick persists across restarts. The file watcher's dedup keeps the
+    /// disk write from triggering a second reload.
+    fn apply_bundled_theme(&mut self, label: &str, toml_content: &str) {
+        let theme = if toml_content.is_empty() {
+            Theme::default()
+        } else {
+            match toml::from_str::<Theme>(toml_content) {
+                Ok(t) => t,
+                Err(e) => {
+                    log::error!("bundled theme {label} failed to parse: {e}");
+                    return;
+                }
+            }
+        };
+        self.reload_theme(theme);
+        // Persist to disk so the chosen theme survives a restart. The
+        // settings/theme watcher will fire ThemeChanged on the write; the
+        // app-level dedup compares Theme equality and skips a second
+        // in-memory re-apply.
+        if let Some(path) = self.theme_file_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let payload = if toml_content.is_empty() {
+                // For the "Default Dark" pick, write the serialised
+                // default theme so the file is self-documenting.
+                toml::to_string(&Theme::default()).unwrap_or_default()
+            } else {
+                toml_content.to_string()
+            };
+            if let Err(e) = std::fs::write(&path, payload) {
+                log::warn!("couldn't persist theme to {}: {}", path.display(), e);
+            }
+        }
+        log::info!("applied theme: {label}");
+    }
+
+    /// XDG/macOS path where the user's `theme.toml` lives. `None` if the
+    /// OS has no config dir.
+    fn theme_file_path(&self) -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join(CONFIG_SUBDIR).join(THEME_FILENAME))
     }
 
     /// Close every tab except the active one. Each dirty non-active tab is
