@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use document::Document;
-use editor_config::Settings;
+use editor_config::{parse_hex_color, Settings, Theme};
 use editor_core::{LineEnding, Position, Selection};
 use editor_syntax::{Highlight, HighlightCategory};
 use editor_ui_render::{GpuContext, QuadRenderer};
@@ -48,6 +48,8 @@ use winit::window::{Window, WindowId};
 enum AppEvent {
     /// `settings.toml` (user or workspace) changed on disk; reload and reapply.
     SettingsChanged,
+    /// `theme.toml` changed on disk; reload and reapply colors.
+    ThemeChanged,
     /// `FLASH_DURATION` has elapsed since a transient status-bar message was
     /// set — clear it.
     ClearFlash,
@@ -142,6 +144,8 @@ const FIND_PAD_DIP: f32 = 8.0;
 /// Subdirectory under the user's XDG config dir that holds settings.toml.
 const CONFIG_SUBDIR: &str = "lighteditor";
 const CONFIG_FILENAME: &str = "settings.toml";
+/// Theme file name in the same directory.
+const THEME_FILENAME: &str = "theme.toml";
 /// Subdirectory under the current working directory that may hold a
 /// workspace-scoped settings override (spec §4.1.5 — Workspace ranks above
 /// User in the precedence Default → User → Workspace).
@@ -244,18 +248,47 @@ fn find_next_occurrence(
     None
 }
 
-/// Theme color for a syntax category. Hand-picked palette tuned against the
-/// dark editor background — a proper user-themable table is a follow-up.
-fn color_for(category: HighlightCategory) -> Color {
-    match category {
-        HighlightCategory::Keyword => Color::rgb(0xCD, 0x82, 0xE9), // violet
-        HighlightCategory::StringLit => Color::rgb(0xA0, 0xE6, 0xA8), // mint
-        HighlightCategory::Number => Color::rgb(0xFF, 0xB8, 0x7C),  // amber
-        HighlightCategory::Comment => Color::rgb(0x7A, 0x7A, 0x88), // dim gray
-        HighlightCategory::Type => Color::rgb(0xF0, 0xD9, 0x83),    // gold
-        HighlightCategory::Function => Color::rgb(0x8A, 0xB4, 0xF8), // sky
-        HighlightCategory::Punctuation => Color::rgb(0xA0, 0xA0, 0xB0), // muted
+/// Resolve a theme color string (e.g. `"#cd82e9ff"`) to a quad-renderer
+/// `SceneColor`. Falls back to neutral gray when the string is malformed
+/// rather than blowing up on a typo'd hex literal.
+fn quad_color(hex: &str) -> SceneColor {
+    let [r, g, b, a] = parse_hex_color(hex).unwrap_or([0x80, 0x80, 0x88, 0xff]);
+    SceneColor::rgba(r, g, b, a)
+}
+
+/// Resolve a theme color string for cosmic-text. Alpha is dropped — glyphs
+/// are either drawn or not; per-glyph transparency isn't useful at the
+/// text layer.
+fn text_color(hex: &str) -> Color {
+    let [r, g, b, _] = parse_hex_color(hex).unwrap_or([0xee, 0xee, 0xee, 0xff]);
+    Color::rgb(r, g, b)
+}
+
+/// Resolve a theme color string into the `wgpu::Color` (linear-ish float
+/// per channel) the surface clear uses.
+fn clear_color(hex: &str) -> wgpu::Color {
+    let [r, g, b, _] = parse_hex_color(hex).unwrap_or([5, 5, 8, 0xff]);
+    wgpu::Color {
+        r: r as f64 / 255.0,
+        g: g as f64 / 255.0,
+        b: b as f64 / 255.0,
+        a: 1.0,
     }
+}
+
+/// Theme color for a syntax category. Reads from the active document's
+/// theme so user-overridden colors land in the right token type.
+fn syntax_color(theme: &editor_config::SyntaxTheme, category: HighlightCategory) -> Color {
+    let hex = match category {
+        HighlightCategory::Keyword => &theme.keyword,
+        HighlightCategory::StringLit => &theme.string,
+        HighlightCategory::Number => &theme.number,
+        HighlightCategory::Comment => &theme.comment,
+        HighlightCategory::Type => &theme.type_,
+        HighlightCategory::Function => &theme.function,
+        HighlightCategory::Punctuation => &theme.punctuation,
+    };
+    text_color(hex)
 }
 
 /// Build `(slice, attrs)` spans from `text` and `highlights` for
@@ -266,6 +299,7 @@ fn build_highlight_spans<'a>(
     text: &'a str,
     highlights: &'a [Highlight],
     default_color: Color,
+    syntax: &editor_config::SyntaxTheme,
 ) -> Vec<(&'a str, Attrs<'a>)> {
     let total_chars = text.chars().count();
     // Walk char_indices once to get a char→byte map: position[char_idx] = byte.
@@ -289,7 +323,7 @@ fn build_highlight_spans<'a>(
         }
         spans.push((
             &text[char_to_byte[s]..char_to_byte[e]],
-            Attrs::new().color(color_for(hl.category)),
+            Attrs::new().color(syntax_color(syntax, hl.category)),
         ));
         cursor = e;
     }
@@ -500,6 +534,10 @@ struct State {
     /// Spaces inserted by the Tab key (pre-built from `settings.editor.tab_size`).
     tab_spaces: String,
 
+    /// Active theme — colors for every surface and syntax category. Hot-
+    /// reloaded from `theme.toml` via the same watcher pattern as settings.
+    theme: Theme,
+
     /// Transient overlay for the status bar's left half — `Some((msg, t))`
     /// while a flash is active. Cleared via `AppEvent::ClearFlash` after
     /// [`FLASH_DURATION`]; the `Instant` is also used to gate the clear so
@@ -543,12 +581,14 @@ struct State {
 }
 
 impl State {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         window: Arc<Window>,
         cold_start: Instant,
         initial_text: &str,
         file_path: Option<PathBuf>,
         settings: &Settings,
+        theme: Theme,
         flash_proxy: EventLoopProxy<AppEvent>,
     ) -> Self {
         let scale = window.scale_factor() as f32;
@@ -709,6 +749,7 @@ impl State {
             last_interaction: Instant::now(),
             flash_proxy,
             tab_spaces,
+            theme,
             pending_keystroke: None,
             frame_count: 0,
             last_report: Instant::now(),
@@ -793,6 +834,16 @@ impl State {
         // valid (we're just rescaling existing shaped content).
         self.text_dirty = true;
         self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Pick up a fresh `Theme`: swap colors and ask for a redraw. No
+    /// reshaping needed — only the colors of existing glyphs/quads change.
+    fn reload_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        self.text_dirty = true; // syntax colors come from rich shaping
+        self.scene_dirty = true;
+        self.set_status_flash("theme reloaded".to_string());
         self.window.request_redraw();
     }
 
@@ -2963,17 +3014,19 @@ impl State {
         let h = self.gpu.surface_config.height as f32;
         let mut root = SceneNode::group(Rect::new(0.0, 0.0, w, h));
 
+        let et = &self.theme.editor;
         // Tab strip backdrop — sits behind every tab slot.
-        root.push_child(SceneNode::quad(
-            self.tab_strip_rect(),
-            SceneColor::rgba(22, 22, 28, 255),
-        ));
+        let tab_bar_bg = quad_color(&et.tab_bar_bg);
+        let tab_active_bg = quad_color(&et.tab_active_bg);
+        let tab_inactive_bg = quad_color(&et.tab_inactive_bg);
+        let tab_separator = quad_color(&et.tab_separator);
+        root.push_child(SceneNode::quad(self.tab_strip_rect(), tab_bar_bg));
         for (i, _) in self.docs.iter().enumerate() {
             let slot = self.tab_slot_rect(i);
             let bg = if i == self.active {
-                SceneColor::rgba(48, 48, 60, 255)
+                tab_active_bg
             } else {
-                SceneColor::rgba(30, 30, 38, 255)
+                tab_inactive_bg
             };
             root.push_child(SceneNode::quad(slot, bg));
             // Thin separator on the right edge of every tab except the last.
@@ -2984,7 +3037,7 @@ impl State {
                     1.0 * self.scale,
                     slot.size.height - 8.0 * self.scale,
                 );
-                root.push_child(SceneNode::quad(sep, SceneColor::rgba(60, 60, 70, 255)));
+                root.push_child(SceneNode::quad(sep, tab_separator));
             }
         }
 
@@ -2994,7 +3047,7 @@ impl State {
         let gutter_h = (h - self.text_inset_y - STATUS_BAR_HEIGHT_DIP * self.scale).max(0.0);
         root.push_child(SceneNode::quad(
             Rect::new(0.0, self.text_inset_y, self.text_inset_x, gutter_h),
-            SceneColor::rgba(14, 14, 20, 255),
+            quad_color(&et.gutter_bg),
         ));
 
         // Active line backdrop — a faint full-width row at every visual run
@@ -3006,7 +3059,7 @@ impl State {
         };
         let scroll = self.doc().scroll_y;
         let line_h = self.line_height();
-        let active_color = SceneColor::rgba(255, 255, 255, 12);
+        let active_color = quad_color(&et.active_line_bg);
         for run in self.text.buffer.layout_runs() {
             if run.line_i != active_logical {
                 continue;
@@ -3025,7 +3078,7 @@ impl State {
         // that column (the leading space char's `x` in the layout run), so
         // there's no `char_width × column` approximation drift.
         let tab_size = self.doc().indent_unit.max(1);
-        let guide_color = SceneColor::rgba(80, 80, 100, 160);
+        let guide_color = quad_color(&et.indent_guide);
         let guide_w = self.scale.max(1.0);
         let mut prev_logical_g = usize::MAX;
         for run in self.text.buffer.layout_runs() {
@@ -3070,6 +3123,7 @@ impl State {
         // both the bracket and its match get a faint outlined background.
         if let Some((a, b)) = self.matching_bracket_positions() {
             let bracket_w = self.measured_char_width().max(self.caret_width);
+            let bracket_color = quad_color(&et.bracket_match);
             for pos in [a, b] {
                 if let Some((cx, cy)) = self.caret_pixel(pos) {
                     let rect = Rect::new(
@@ -3078,21 +3132,23 @@ impl State {
                         bracket_w,
                         line_h,
                     );
-                    root.push_child(SceneNode::quad(rect, SceneColor::rgba(180, 200, 255, 36)));
+                    root.push_child(SceneNode::quad(rect, bracket_color));
                 }
             }
         }
 
         // Selection highlights sit behind text and carets.
+        let selection_color = quad_color(&et.selection_bg);
         for selection in self.doc().editor.selections().iter() {
             for rect in self.selection_rects(selection) {
-                root.push_child(SceneNode::quad(rect, SceneColor::rgba(120, 160, 255, 64)));
+                root.push_child(SceneNode::quad(rect, selection_color));
             }
         }
 
         // Carets on top of the highlights — skipped during the "off" half
         // of the blink cycle.
         if self.caret_visible {
+            let caret_color = quad_color(&et.caret);
             for selection in self.doc().editor.selections().iter() {
                 if let Some((cx, cy)) = self.caret_pixel(selection.head) {
                     root.push_child(SceneNode::quad(
@@ -3102,29 +3158,30 @@ impl State {
                             self.caret_width,
                             line_h,
                         ),
-                        SceneColor::rgb(120, 160, 255),
+                        caret_color,
                     ));
                 }
             }
         }
 
         // Find-bar match highlights.
+        let find_match_color = quad_color(&et.find_match_bg);
         for rect in self.match_highlight_rects() {
-            root.push_child(SceneNode::quad(rect, SceneColor::rgba(255, 200, 60, 64)));
+            root.push_child(SceneNode::quad(rect, find_match_color));
         }
 
         // Status bar backdrop — opaque so it covers any text that scrolled
         // behind it (text bounds also clip, but defence in depth is cheap).
         root.push_child(SceneNode::quad(
             self.status_bar_rect(),
-            SceneColor::rgba(22, 22, 28, 255),
+            quad_color(&et.status_bg),
         ));
 
         // Find bar panel.
         if self.doc().find.is_some() {
             root.push_child(SceneNode::quad(
                 self.find_panel_rect(),
-                SceneColor::rgba(38, 38, 48, 240),
+                quad_color(&et.overlay_bg),
             ));
         }
 
@@ -3132,16 +3189,16 @@ impl State {
         if self.palette.is_some() {
             root.push_child(SceneNode::quad(
                 Rect::new(0.0, 0.0, w, h),
-                SceneColor::rgba(0, 0, 0, 96),
+                quad_color(&et.overlay_scrim),
             ));
             root.push_child(SceneNode::quad(
                 self.palette_panel_rect(),
-                SceneColor::rgba(38, 38, 48, 240),
+                quad_color(&et.overlay_bg),
             ));
             if let Some(highlight) = self.palette_selection_rect() {
                 root.push_child(SceneNode::quad(
                     highlight,
-                    SceneColor::rgba(120, 160, 255, 80),
+                    quad_color(&et.palette_selection_bg),
                 ));
             }
         }
@@ -3275,8 +3332,13 @@ impl State {
                     .as_mut()
                     .unwrap()
                     .highlight(&new_text);
-                let spans =
-                    build_highlight_spans(&new_text, &highlights, Color::rgb(238, 238, 238));
+                let default_color = text_color(&self.theme.editor.text_fg);
+                let spans = build_highlight_spans(
+                    &new_text,
+                    &highlights,
+                    default_color,
+                    &self.theme.syntax,
+                );
                 self.text.set_content_rich(&mut self.font_system, spans);
             } else {
                 self.text.set_content(&mut self.font_system, &new_text);
@@ -3331,9 +3393,12 @@ impl State {
         let inset_x = self.text_inset_x;
         let inset_y = self.text_inset_y;
         let scroll = self.docs[self.active].scroll_y;
-        let editor_color = Color::rgb(238, 238, 238);
-        let label_color = Color::rgb(220, 220, 220);
-        let dim_color = Color::rgb(180, 180, 190);
+        let editor_color = text_color(&self.theme.editor.text_fg);
+        let label_color = text_color(&self.theme.editor.tab_label_fg);
+        let dim_color = text_color(&self.theme.editor.close_button);
+        let gutter_dim = text_color(&self.theme.editor.gutter_fg);
+        let gutter_active = text_color(&self.theme.editor.gutter_active_fg);
+        let status_fg = text_color(&self.theme.editor.status_fg);
         // The line number for the line that has the primary caret on it
         // gets the brighter colour. Computed once here so the gutter loop
         // can skip emitting it dim.
@@ -3441,7 +3506,7 @@ impl State {
                 top: area_top,
                 scale: 1.0,
                 bounds,
-                default_color: dim_color,
+                default_color: gutter_dim,
                 custom_glyphs: &[],
             });
         }
@@ -3452,7 +3517,7 @@ impl State {
                 top: area_top,
                 scale: 1.0,
                 bounds,
-                default_color: editor_color,
+                default_color: gutter_active,
                 custom_glyphs: &[],
             });
         }
@@ -3490,7 +3555,7 @@ impl State {
             top: status_y,
             scale: 1.0,
             bounds: status_bounds,
-            default_color: dim_color,
+            default_color: status_fg,
             custom_glyphs: &[],
         });
         text_areas.push(TextArea {
@@ -3499,7 +3564,7 @@ impl State {
             top: status_y,
             scale: 1.0,
             bounds: status_bounds,
-            default_color: dim_color,
+            default_color: status_fg,
             custom_glyphs: &[],
         });
         if let Some((fx, fy)) = find_xy {
@@ -3552,12 +3617,7 @@ impl State {
                     resolve_target: None,
                     depth_slice: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.02,
-                            b: 0.04,
-                            a: 1.0,
-                        }),
+                        load: LoadOp::Clear(clear_color(&self.theme.editor.background)),
                         store: StoreOp::Store,
                     },
                 })],
@@ -3617,12 +3677,17 @@ struct App {
     /// Optional `.lighteditor/settings.toml` next to the cwd. Overlaid on top
     /// of `settings_path` when both exist (workspace > user > default).
     workspace_settings_path: Option<PathBuf>,
+    /// Loaded theme — sent into `State::new` once and updated via the
+    /// `ThemeChanged` event on hot-reload.
+    theme: Theme,
+    theme_path: Option<PathBuf>,
     /// Used to schedule `AppEvent::ClearFlash` from a sleeper thread.
     proxy: EventLoopProxy<AppEvent>,
     /// Kept alive so the watcher threads don't shut down; consulted only
     /// via the user-event proxy so the fields themselves are otherwise unused.
     _user_watcher: Option<RecommendedWatcher>,
     _workspace_watcher: Option<RecommendedWatcher>,
+    _theme_watcher: Option<RecommendedWatcher>,
     state: Option<State>,
 }
 
@@ -3634,9 +3699,12 @@ impl App {
         settings: Settings,
         settings_path: Option<PathBuf>,
         workspace_settings_path: Option<PathBuf>,
+        theme: Theme,
+        theme_path: Option<PathBuf>,
         proxy: EventLoopProxy<AppEvent>,
         user_watcher: Option<RecommendedWatcher>,
         workspace_watcher: Option<RecommendedWatcher>,
+        theme_watcher: Option<RecommendedWatcher>,
     ) -> Self {
         Self {
             cold_start: Instant::now(),
@@ -3645,9 +3713,12 @@ impl App {
             settings,
             settings_path,
             workspace_settings_path,
+            theme,
+            theme_path,
             proxy,
             _user_watcher: user_watcher,
             _workspace_watcher: workspace_watcher,
+            _theme_watcher: theme_watcher,
             state: None,
         }
     }
@@ -3682,6 +3753,19 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 self.settings = new_settings;
             }
+            AppEvent::ThemeChanged => {
+                let Some(path) = self.theme_path.as_deref() else {
+                    return;
+                };
+                let new_theme = Theme::load_or_default(path);
+                if new_theme == self.theme {
+                    return;
+                }
+                if let Some(state) = self.state.as_mut() {
+                    state.reload_theme(new_theme.clone());
+                }
+                self.theme = new_theme;
+            }
             AppEvent::ClearFlash => {
                 if let Some(state) = self.state.as_mut() {
                     state.clear_status_flash();
@@ -3713,6 +3797,7 @@ impl ApplicationHandler<AppEvent> for App {
             &self.initial_text,
             self.file_path.clone(),
             &self.settings,
+            self.theme.clone(),
             self.proxy.clone(),
         );
         state.window.request_redraw();
@@ -3793,6 +3878,7 @@ fn main() {
     let workspace_settings_path = std::env::current_dir()
         .ok()
         .map(|d| d.join(WORKSPACE_CONFIG_SUBDIR).join(CONFIG_FILENAME));
+    let theme_path = dirs::config_dir().map(|d| d.join(CONFIG_SUBDIR).join(THEME_FILENAME));
 
     // Default → User → Workspace per spec §4.1.5.
     let mut settings = match settings_path.as_deref() {
@@ -3805,6 +3891,11 @@ fn main() {
     if let Some(p) = workspace_settings_path.as_deref() {
         settings.merge(&Settings::load_partial(p));
     }
+
+    let theme = match theme_path.as_deref() {
+        Some(p) => Theme::load_or_default(p),
+        None => Theme::default(),
+    };
 
     let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()
@@ -3820,6 +3911,9 @@ fn main() {
     let workspace_watcher = workspace_settings_path
         .as_deref()
         .and_then(|p| spawn_settings_watcher(p, event_loop.create_proxy()));
+    let theme_watcher = theme_path
+        .as_deref()
+        .and_then(|p| spawn_theme_watcher(p, event_loop.create_proxy()));
     // Caret-blink heartbeat — one detached thread for the app lifetime.
     spawn_caret_blink_thread(event_loop.create_proxy());
 
@@ -3829,11 +3923,47 @@ fn main() {
         settings,
         settings_path,
         workspace_settings_path,
+        theme,
+        theme_path,
         event_loop.create_proxy(),
         user_watcher,
         workspace_watcher,
+        theme_watcher,
     );
     event_loop.run_app(&mut app).expect("event loop failed");
+}
+
+/// Same shape as `spawn_settings_watcher`, but emits `ThemeChanged`.
+fn spawn_theme_watcher(
+    theme_path: &Path,
+    proxy: EventLoopProxy<AppEvent>,
+) -> Option<RecommendedWatcher> {
+    let parent = theme_path.parent()?;
+    if !parent.exists() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("could not create theme dir {}: {}", parent.display(), e);
+            return None;
+        }
+    }
+    let target = theme_path.file_name()?.to_os_string();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let Ok(event) = event else { return };
+        if event
+            .paths
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n == target))
+        {
+            let _ = proxy.send_event(AppEvent::ThemeChanged);
+        }
+    })
+    .map_err(|e| log::warn!("theme watcher init failed: {e}"))
+    .ok()?;
+    watcher
+        .watch(parent, RecursiveMode::NonRecursive)
+        .map_err(|e| log::warn!("theme watcher attach failed: {e}"))
+        .ok()?;
+    log::info!("watching {} for theme changes", parent.display());
+    Some(watcher)
 }
 
 /// Detach a background thread that fires `AppEvent::CaretTick` every

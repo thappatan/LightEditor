@@ -1,12 +1,16 @@
-//! Editor settings, loaded from a TOML file (ADR-009, spec §4.1.4).
+//! Editor settings and theme, loaded from TOML files (ADR-009, spec §4.1.4).
 //!
-//! The schema is intentionally tiny in M1 — just the few knobs the app
-//! actually reads. New fields slot in by adding a serde-defaulted field; old
-//! files keep working.
+//! The schema is intentionally tiny — just the few knobs the app actually
+//! reads. New fields slot in by adding a serde-defaulted field; old files
+//! keep working.
+
+mod theme;
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+pub use theme::{parse_hex_color, EditorTheme, SyntaxTheme, Theme};
 
 /// The top-level settings document.
 ///
