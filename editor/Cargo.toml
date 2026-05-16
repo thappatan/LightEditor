@@ -83,6 +83,9 @@ tree-sitter-python = "0.23"
 tree-sitter-go = "0.23"
 tree-sitter-c = "0.23"
 tree-sitter-md = "0.3"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-dart = "0.2"
 editor-syntax = { path = "crates/syntax" }
 # tokio = { version = "1", features = ["full"] }
 # lsp-types = "0.95"

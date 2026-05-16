@@ -28,6 +28,9 @@ pub enum Language {
     Go,
     C,
     Markdown,
+    Toml,
+    Yaml,
+    Dart,
 }
 
 impl Language {
@@ -45,6 +48,9 @@ impl Language {
             "go" => Some(Language::Go),
             "c" | "h" => Some(Language::C),
             "md" | "markdown" => Some(Language::Markdown),
+            "toml" => Some(Language::Toml),
+            "yaml" | "yml" => Some(Language::Yaml),
+            "dart" => Some(Language::Dart),
             _ => None,
         }
     }
@@ -60,6 +66,9 @@ impl Language {
             Language::Go => tree_sitter_go::LANGUAGE.into(),
             Language::C => tree_sitter_c::LANGUAGE.into(),
             Language::Markdown => tree_sitter_md::LANGUAGE.into(),
+            Language::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+            Language::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            Language::Dart => tree_sitter_dart::LANGUAGE.into(),
         }
     }
 }
@@ -154,6 +163,9 @@ fn classifier_for(lang: Language) -> Classifier {
         Language::Go => classify_go,
         Language::C => classify_c,
         Language::Markdown => classify_markdown,
+        Language::Toml => classify_toml,
+        Language::Yaml => classify_yaml,
+        Language::Dart => classify_dart,
     }
 }
 
@@ -300,6 +312,65 @@ fn classify_c(kind: &str) -> Option<HighlightCategory> {
         | "for" | "while" | "do" | "switch" | "case" | "default" | "break" | "continue"
         | "return" | "goto" | "sizeof" | "typedef" | "struct" | "union" | "enum" | "inline"
         | "restrict" | "_Atomic" | "_Bool" | "true" | "false" | "NULL" => Some(Keyword),
+        _ => None,
+    }
+}
+
+/// tree-sitter-toml-ng.
+fn classify_toml(kind: &str) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        "string"
+        | "basic_string"
+        | "literal_string"
+        | "multiline_basic_string"
+        | "multiline_literal_string" => Some(StringLit),
+        "integer" | "float" => Some(Number),
+        "boolean" | "true" | "false" => Some(Keyword),
+        "offset_date_time" | "local_date_time" | "local_date" | "local_time" => Some(Type),
+        "[" | "]" | "[[" | "]]" | "=" | "." | "," => Some(Punctuation),
+        _ => None,
+    }
+}
+
+/// tree-sitter-yaml.
+fn classify_yaml(kind: &str) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        "string_scalar"
+        | "single_quote_scalar"
+        | "double_quote_scalar"
+        | "block_scalar"
+        | "plain_scalar" => Some(StringLit),
+        "integer_scalar" | "float_scalar" => Some(Number),
+        "boolean_scalar" | "null_scalar" => Some(Keyword),
+        "anchor" | "alias" | "tag" => Some(Type),
+        "-" | ":" | "|" | ">" | "?" | "&" | "*" | "!" => Some(Punctuation),
+        _ => None,
+    }
+}
+
+/// tree-sitter-dart.
+fn classify_dart(kind: &str) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" | "documentation_comment" | "line_comment" | "block_comment" => Some(Comment),
+        "string_literal" | "raw_string_literal" | "template_string_literal" => Some(StringLit),
+        "decimal_integer_literal"
+        | "hex_integer_literal"
+        | "decimal_floating_point_literal"
+        | "true"
+        | "false" => Some(Number),
+        "type_identifier" | "primitive_type" | "void_type" => Some(Type),
+        "var" | "final" | "const" | "late" | "static" | "abstract" | "class" | "extends"
+        | "implements" | "with" | "mixin" | "enum" | "typedef" | "if" | "else" | "for" | "in"
+        | "while" | "do" | "switch" | "case" | "default" | "break" | "continue" | "return"
+        | "throw" | "try" | "catch" | "finally" | "on" | "rethrow" | "yield" | "async"
+        | "await" | "sync" | "new" | "this" | "super" | "is" | "as" | "null" | "void"
+        | "import" | "export" | "library" | "part" | "show" | "hide" | "deferred" | "factory"
+        | "external" | "operator" | "get" | "set" | "covariant" | "required" => Some(Keyword),
         _ => None,
     }
 }
@@ -493,6 +564,47 @@ fn x() {}
         assert!(cats.contains(&HighlightCategory::Type));
         assert!(cats.contains(&HighlightCategory::Keyword));
         assert!(cats.contains(&HighlightCategory::Number));
+    }
+
+    #[test]
+    fn toml_highlights_string_and_number() {
+        let src = "[package]\nname = \"editor\"\nversion = 42\n";
+        let cats = categories_with(Language::Toml, src);
+        assert!(cats.contains(&HighlightCategory::StringLit));
+        assert!(cats.contains(&HighlightCategory::Number));
+    }
+
+    #[test]
+    fn yaml_highlights_string_and_keyword() {
+        let src = "name: editor\nversion: 1\nactive: true\n";
+        let cats = categories_with(Language::Yaml, src);
+        // plain scalars carry both value text + booleans
+        assert!(cats.contains(&HighlightCategory::StringLit));
+    }
+
+    #[test]
+    fn dart_highlights_class_and_string() {
+        let src = "void main() {\n  var s = \"hello\";\n  print(s);\n}\n";
+        let cats = categories_with(Language::Dart, src);
+        assert!(cats.contains(&HighlightCategory::Keyword)); // void / var
+        assert!(cats.contains(&HighlightCategory::StringLit));
+    }
+
+    #[test]
+    fn for_path_recognizes_new_extensions() {
+        assert_eq!(
+            Language::for_path(Path::new("a.toml")),
+            Some(Language::Toml)
+        );
+        assert_eq!(
+            Language::for_path(Path::new("a.yaml")),
+            Some(Language::Yaml)
+        );
+        assert_eq!(Language::for_path(Path::new("a.yml")), Some(Language::Yaml));
+        assert_eq!(
+            Language::for_path(Path::new("a.dart")),
+            Some(Language::Dart)
+        );
     }
 
     #[test]
