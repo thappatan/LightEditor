@@ -21,9 +21,12 @@ use std::time::{Duration, Instant};
 use document::Document;
 use editor_config::Settings;
 use editor_core::{LineEnding, Position, Selection};
+use editor_syntax::{Highlight, HighlightCategory};
 use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Point, Rect, Scene, SceneNode};
-use editor_ui_text::glyphon::{Color, FontSystem, Resolution, SwashCache, TextArea, TextBounds};
+use editor_ui_text::glyphon::{
+    Attrs, Color, FontSystem, Resolution, SwashCache, TextArea, TextBounds,
+};
 use editor_ui_text::{TextGpu, TextStack};
 use find::{FindBar, FindFocus};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -239,6 +242,61 @@ fn find_next_occurrence(
         j += 1;
     }
     None
+}
+
+/// Theme color for a syntax category. Hand-picked palette tuned against the
+/// dark editor background — a proper user-themable table is a follow-up.
+fn color_for(category: HighlightCategory) -> Color {
+    match category {
+        HighlightCategory::Keyword => Color::rgb(0xCD, 0x82, 0xE9), // violet
+        HighlightCategory::StringLit => Color::rgb(0xA0, 0xE6, 0xA8), // mint
+        HighlightCategory::Number => Color::rgb(0xFF, 0xB8, 0x7C),  // amber
+        HighlightCategory::Comment => Color::rgb(0x7A, 0x7A, 0x88), // dim gray
+        HighlightCategory::Type => Color::rgb(0xF0, 0xD9, 0x83),    // gold
+        HighlightCategory::Function => Color::rgb(0x8A, 0xB4, 0xF8), // sky
+        HighlightCategory::Punctuation => Color::rgb(0xA0, 0xA0, 0xB0), // muted
+    }
+}
+
+/// Build `(slice, attrs)` spans from `text` and `highlights` for
+/// `TextStack::set_content_rich`. The highlights must be in char-range
+/// order and non-overlapping; the syntax crate's leaf-only emission
+/// guarantees this. Concatenating every span exactly reconstructs `text`.
+fn build_highlight_spans<'a>(
+    text: &'a str,
+    highlights: &'a [Highlight],
+    default_color: Color,
+) -> Vec<(&'a str, Attrs<'a>)> {
+    let total_chars = text.chars().count();
+    // Walk char_indices once to get a char→byte map: position[char_idx] = byte.
+    let mut char_to_byte: Vec<usize> = Vec::with_capacity(total_chars + 1);
+    for (b, _) in text.char_indices() {
+        char_to_byte.push(b);
+    }
+    char_to_byte.push(text.len());
+
+    let default = || Attrs::new().color(default_color);
+    let mut spans: Vec<(&str, Attrs)> = Vec::with_capacity(highlights.len() * 2 + 1);
+    let mut cursor: usize = 0;
+    for hl in highlights {
+        let s = hl.range.start.min(total_chars);
+        let e = hl.range.end.min(total_chars);
+        if s < cursor || s >= e {
+            continue;
+        }
+        if s > cursor {
+            spans.push((&text[char_to_byte[cursor]..char_to_byte[s]], default()));
+        }
+        spans.push((
+            &text[char_to_byte[s]..char_to_byte[e]],
+            Attrs::new().color(color_for(hl.category)),
+        ));
+        cursor = e;
+    }
+    if cursor < total_chars {
+        spans.push((&text[char_to_byte[cursor]..], default()));
+    }
+    spans
 }
 
 /// Build a copy of `text` with every space replaced by a middle dot and
@@ -3165,12 +3223,24 @@ impl State {
 
         if self.text_dirty {
             let new_text = self.docs[self.active].editor.text();
-            let shaped = if self.visible_whitespace {
-                substitute_whitespace(&new_text)
+            if self.visible_whitespace {
+                // Visible-whitespace substitution changes some chars' byte
+                // widths, so the syntax char ranges won't line up — fall
+                // back to plain shaping in that mode.
+                let shaped = substitute_whitespace(&new_text);
+                self.text.set_content(&mut self.font_system, &shaped);
+            } else if self.docs[self.active].highlighter.is_some() {
+                let highlights = self.docs[self.active]
+                    .highlighter
+                    .as_mut()
+                    .unwrap()
+                    .highlight(&new_text);
+                let spans =
+                    build_highlight_spans(&new_text, &highlights, Color::rgb(238, 238, 238));
+                self.text.set_content_rich(&mut self.font_system, spans);
             } else {
-                new_text
-            };
-            self.text.set_content(&mut self.font_system, &shaped);
+                self.text.set_content(&mut self.font_system, &new_text);
+            }
             self.text_dirty = false;
         }
         if self.scene_dirty {

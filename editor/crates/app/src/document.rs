@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use editor_core::Editor;
+use editor_syntax::{Highlighter, Language};
 
 use crate::find::FindBar;
 
@@ -20,6 +21,10 @@ pub struct Document {
     /// Find bar belongs to the document: switch tab, find bar disappears;
     /// switch back, it reappears with the same query.
     pub find: Option<FindBar>,
+    /// Tree-sitter highlighter when the document's extension matches one of
+    /// the supported languages. `None` for pathless / unknown-extension
+    /// documents — the renderer falls back to plain text.
+    pub highlighter: Option<Highlighter>,
 }
 
 impl Document {
@@ -30,16 +35,19 @@ impl Document {
             dirty: false,
             scroll_y: 0.0,
             find: None,
+            highlighter: None,
         }
     }
 
     pub fn from_file(path: PathBuf, content: &str) -> Self {
+        let highlighter = Language::for_path(&path).and_then(|l| Highlighter::new(l).ok());
         Self {
             editor: Editor::from(content),
             file_path: Some(path),
             dirty: false,
             scroll_y: 0.0,
             find: None,
+            highlighter,
         }
     }
 

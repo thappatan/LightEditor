@@ -18,7 +18,7 @@ members = [
     # ── Core editor ───────────────────────────────────────
     "crates/buffer",           # text buffer (ropey)
     "crates/editor-core",      # editing operations
-    # "crates/syntax",         # tree-sitter
+    "crates/syntax",           # tree-sitter
     # "crates/lsp-client",     # LSP protocol
     # "crates/dap-client",     # DAP protocol
     # "crates/git",            # git integration (git2)
@@ -74,7 +74,9 @@ serde = { version = "1", features = ["derive"] }
 dirs = "5"
 notify = "6"
 arboard = "3"
-# tree-sitter = "0.22"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+editor-syntax = { path = "crates/syntax" }
 # tokio = { version = "1", features = ["full"] }
 # lsp-types = "0.95"
 # git2 = "0.18"
