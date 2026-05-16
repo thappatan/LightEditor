@@ -19,6 +19,13 @@ pub enum Command {
     SaveAll,
     CloseOtherTabs,
     CloseAllTabs,
+    ThemeDefault,
+    ThemeSolarizedDark,
+    ThemeSolarizedLight,
+    ThemeMonokai,
+    ThemeGruvboxDark,
+    ThemeNord,
+    ThemeTokyoNight,
 }
 
 impl Command {
@@ -32,6 +39,13 @@ impl Command {
             Command::SaveAll => "Save All",
             Command::CloseOtherTabs => "Close Other Tabs",
             Command::CloseAllTabs => "Close All Tabs",
+            Command::ThemeDefault => "Theme: Default Dark",
+            Command::ThemeSolarizedDark => "Theme: Solarized Dark",
+            Command::ThemeSolarizedLight => "Theme: Solarized Light",
+            Command::ThemeMonokai => "Theme: Monokai",
+            Command::ThemeGruvboxDark => "Theme: Gruvbox Dark",
+            Command::ThemeNord => "Theme: Nord",
+            Command::ThemeTokyoNight => "Theme: Tokyo Night",
         }
     }
 }
@@ -45,6 +59,13 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::SaveAll,
     Command::CloseOtherTabs,
     Command::CloseAllTabs,
+    Command::ThemeDefault,
+    Command::ThemeSolarizedDark,
+    Command::ThemeSolarizedLight,
+    Command::ThemeMonokai,
+    Command::ThemeGruvboxDark,
+    Command::ThemeNord,
+    Command::ThemeTokyoNight,
 ];
 
 /// The popup's state.
@@ -189,7 +210,8 @@ mod tests {
     #[test]
     fn backspace_repopulates_when_emptied() {
         let mut p = CommandPalette::new();
-        p.push_char('z'); // matches nothing
+        // `@` matches no command label.
+        p.push_char('@');
         assert_eq!(p.visible_count(), 0);
         assert_eq!(p.selected(), None);
         p.backspace();
@@ -213,7 +235,7 @@ mod tests {
     #[test]
     fn navigation_is_a_noop_on_empty_results() {
         let mut p = CommandPalette::new();
-        p.push_char('z'); // empty
+        p.push_char('@'); // matches no label
         p.next();
         p.prev();
         assert_eq!(p.selected(), None);
