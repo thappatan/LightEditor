@@ -1,0 +1,40 @@
+# Solarized Dark — Ethan Schoonover
+# https://ethanschoonover.com/solarized/
+
+[editor]
+background           = "#002b36"
+text_fg              = "#839496"
+caret                = "#93a1a1"
+selection_bg         = "#07364280"
+active_line_bg       = "#07364260"
+
+gutter_bg            = "#002b36"
+gutter_fg            = "#586e75"
+gutter_active_fg     = "#93a1a1"
+
+tab_bar_bg           = "#001f27"
+tab_active_bg        = "#073642"
+tab_inactive_bg     = "#002b36"
+tab_separator        = "#073642"
+tab_label_fg         = "#93a1a1"
+close_button         = "#586e75"
+
+status_bg            = "#001f27"
+status_fg            = "#586e75"
+
+overlay_bg           = "#073642f0"
+overlay_scrim        = "#00000080"
+palette_selection_bg = "#268bd250"
+
+find_match_bg        = "#b5890050"
+indent_guide         = "#073642c0"
+bracket_match        = "#268bd230"
+
+[syntax]
+keyword     = "#859900"  # green
+string      = "#2aa198"  # cyan
+number      = "#d33682"  # magenta
+comment     = "#586e75"  # base01
+type        = "#b58900"  # yellow
+function    = "#268bd2"  # blue
+punctuation = "#93a1a1"  # base1

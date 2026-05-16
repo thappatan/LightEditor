@@ -1,0 +1,40 @@
+# Nord — Arctic, cold, icy
+# https://www.nordtheme.com/
+
+[editor]
+background           = "#2e3440"  # nord0
+text_fg              = "#d8dee9"  # nord4
+caret                = "#88c0d0"  # nord8
+selection_bg         = "#434c5e90"
+active_line_bg       = "#3b425280"
+
+gutter_bg            = "#2b303b"
+gutter_fg            = "#4c566a"  # nord3
+gutter_active_fg     = "#eceff4"  # nord6
+
+tab_bar_bg           = "#272c36"
+tab_active_bg        = "#3b4252"  # nord1
+tab_inactive_bg      = "#2e3440"
+tab_separator        = "#4c566a"
+tab_label_fg         = "#eceff4"
+close_button         = "#4c566a"
+
+status_bg            = "#272c36"
+status_fg            = "#d8dee9"
+
+overlay_bg           = "#3b4252f5"
+overlay_scrim        = "#00000080"
+palette_selection_bg = "#5e81ac80"
+
+find_match_bg        = "#ebcb8b50"
+indent_guide         = "#434c5ec0"
+bracket_match        = "#88c0d033"
+
+[syntax]
+keyword     = "#81a1c1"  # nord9, lighter blue
+string      = "#a3be8c"  # nord14, green
+number      = "#b48ead"  # nord15, purple
+comment     = "#616e88"
+type        = "#8fbcbb"  # nord7, frost teal
+function    = "#88c0d0"  # nord8
+punctuation = "#d8dee9"  # nord4
