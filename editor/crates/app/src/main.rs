@@ -181,6 +181,54 @@ fn line_ending_label(le: LineEnding) -> &'static str {
     }
 }
 
+/// Find the next char-range in `haystack` where `needle` appears, starting
+/// at or after `from`. Wraps to the beginning if nothing matches past
+/// `from`. Returns `None` for an empty needle or when no occurrence exists.
+fn find_next_occurrence(
+    haystack: &str,
+    needle: &str,
+    from: usize,
+) -> Option<std::ops::Range<usize>> {
+    if needle.is_empty() {
+        return None;
+    }
+    let hay: Vec<char> = haystack.chars().collect();
+    let nee: Vec<char> = needle.chars().collect();
+    if nee.len() > hay.len() {
+        return None;
+    }
+    let from = from.min(hay.len());
+    let mut i = from;
+    while i + nee.len() <= hay.len() {
+        if hay[i..i + nee.len()] == nee[..] {
+            return Some(i..i + nee.len());
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while j + nee.len() <= from {
+        if hay[j..j + nee.len()] == nee[..] {
+            return Some(j..j + nee.len());
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Build a copy of `text` with every space replaced by a middle dot and
+/// every tab by a rightwards-arrow. Both replacements are single chars, so
+/// char indices in the buffer line up exactly with char indices in the
+/// shaped display text — selections and caret positions still work.
+fn substitute_whitespace(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            ' ' => '·',
+            '\t' => '→',
+            other => other,
+        })
+        .collect()
+}
+
 /// Closing partner inserted when the user types an opener. Returns the full
 /// `"opener+closer"` pair so the caller can `insert` it in one go and then
 /// move the caret one back; returns `None` for any other input.
@@ -356,6 +404,18 @@ struct State {
     /// (select word / select line). Resets to count = 1 when the press is
     /// outside the interval or moves further than the threshold.
     last_click: Option<(Instant, (f32, f32), u32)>,
+
+    /// When `true` the editor text wraps at the viewport width. Off mode
+    /// uses an unbounded wrap so long lines extend off-screen — toggled by
+    /// Cmd-Alt-Z.
+    word_wrap: bool,
+    /// When `true`, spaces are drawn as `·` and tabs as `→`. The underlying
+    /// buffer keeps real spaces/tabs; this only affects the shaped display
+    /// text. Toggled by Cmd-Alt-W (when the find bar is closed).
+    visible_whitespace: bool,
+    /// Tab whose close "×" is under the pointer. Brightens that "×" on
+    /// hover so the affordance is discoverable.
+    hovered_close: Option<usize>,
     /// Used by `set_status_flash` to schedule its own `ClearFlash` event
     /// from a detached sleeper thread. Clone-cheap.
     flash_proxy: EventLoopProxy<AppEvent>,
@@ -529,6 +589,9 @@ impl State {
             find_text,
             status_flash: None,
             last_click: None,
+            word_wrap: true,
+            visible_whitespace: false,
+            hovered_close: None,
             flash_proxy,
             tab_spaces,
             pending_keystroke: None,
@@ -726,8 +789,24 @@ impl State {
                 }
                 return;
             }
+            // Cmd-Alt-Up / Cmd-Alt-Down add a caret one line above / below
+            // the primary, at the same column. Matches VSCode.
+            if self.modifiers.alt_key() {
+                match &event.logical_key {
+                    Key::Named(NamedKey::ArrowUp) => {
+                        self.add_cursor_above();
+                        return;
+                    }
+                    Key::Named(NamedKey::ArrowDown) => {
+                        self.add_cursor_below();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             if let Key::Character(c) = &event.logical_key {
                 let lower = c.to_lowercase();
+                let alt = self.modifiers.alt_key();
                 match lower.as_str() {
                     "f" => {
                         if self.doc().find.is_some() {
@@ -738,7 +817,7 @@ impl State {
                         return;
                     }
                     "s" => {
-                        if self.modifiers.alt_key() {
+                        if alt {
                             self.save_all();
                         } else {
                             self.save_to_file();
@@ -757,8 +836,28 @@ impl State {
                         self.open_new_tab();
                         return;
                     }
+                    "w" if alt => {
+                        self.toggle_visible_whitespace();
+                        return;
+                    }
                     "w" => {
                         self.close_active_tab();
+                        return;
+                    }
+                    "z" if alt => {
+                        self.toggle_word_wrap();
+                        return;
+                    }
+                    "d" => {
+                        if self.modifiers.shift_key() {
+                            self.skip_to_next_occurrence();
+                        } else {
+                            self.add_next_occurrence();
+                        }
+                        return;
+                    }
+                    "k" => {
+                        self.collapse_selection_to_primary();
                         return;
                     }
                     _ => {}
@@ -773,15 +872,34 @@ impl State {
         }
 
         let shift = self.modifiers.shift_key();
+        let alt = self.modifiers.alt_key();
+        let cmd = is_cmd_or_ctrl(self.modifiers);
 
         let mut text_changed = true;
         let handled = match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.collapse_selection_to_primary();
+                text_changed = false;
+                true
+            }
             Key::Named(NamedKey::Backspace) => {
-                self.doc_mut().editor.backspace();
+                if cmd {
+                    self.doc_mut().editor.delete_to_line_start();
+                } else if alt {
+                    self.doc_mut().editor.delete_word_left();
+                } else {
+                    self.doc_mut().editor.backspace();
+                }
                 true
             }
             Key::Named(NamedKey::Delete) => {
-                self.doc_mut().editor.delete_forward();
+                if cmd {
+                    self.doc_mut().editor.delete_to_line_end();
+                } else if alt {
+                    self.doc_mut().editor.delete_word_right();
+                } else {
+                    self.doc_mut().editor.delete_forward();
+                }
                 true
             }
             Key::Named(NamedKey::Enter) => {
@@ -808,22 +926,42 @@ impl State {
                 true
             }
             Key::Named(NamedKey::ArrowLeft) => {
-                self.doc_mut().editor.move_left(shift);
+                if cmd {
+                    self.doc_mut().editor.move_line_start(shift);
+                } else if alt {
+                    self.doc_mut().editor.move_word_left(shift);
+                } else {
+                    self.doc_mut().editor.move_left(shift);
+                }
                 text_changed = false;
                 true
             }
             Key::Named(NamedKey::ArrowRight) => {
-                self.doc_mut().editor.move_right(shift);
+                if cmd {
+                    self.doc_mut().editor.move_line_end(shift);
+                } else if alt {
+                    self.doc_mut().editor.move_word_right(shift);
+                } else {
+                    self.doc_mut().editor.move_right(shift);
+                }
                 text_changed = false;
                 true
             }
             Key::Named(NamedKey::ArrowUp) => {
-                self.doc_mut().editor.move_up(shift);
+                if cmd {
+                    self.doc_mut().editor.move_buffer_start(shift);
+                } else {
+                    self.doc_mut().editor.move_up(shift);
+                }
                 text_changed = false;
                 true
             }
             Key::Named(NamedKey::ArrowDown) => {
-                self.doc_mut().editor.move_down(shift);
+                if cmd {
+                    self.doc_mut().editor.move_buffer_end(shift);
+                } else {
+                    self.doc_mut().editor.move_down(shift);
+                }
                 text_changed = false;
                 true
             }
@@ -887,6 +1025,7 @@ impl State {
             self.last_click = None;
             return;
         }
+        let alt = self.modifiers.alt_key();
         let count = self.record_click(mx, my);
         match count {
             2 => {
@@ -903,9 +1042,16 @@ impl State {
             return;
         };
         self.drag_anchor = Some(char_idx);
-        self.doc_mut()
-            .editor
-            .set_selection(Selection::cursor(char_idx));
+        if alt {
+            // Alt-click adds another caret instead of replacing.
+            self.doc_mut()
+                .editor
+                .add_selection(Selection::cursor(char_idx));
+        } else {
+            self.doc_mut()
+                .editor
+                .set_selection(Selection::cursor(char_idx));
+        }
         self.scene_dirty = true;
         self.follow_caret = true;
         self.window.request_redraw();
@@ -960,6 +1106,210 @@ impl State {
             self.doc_mut()
                 .editor
                 .set_selection(Selection::new(start, end));
+        }
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.window.request_redraw();
+    }
+
+    /// Toggle word-wrap for the active editor. When disabled, the editor
+    /// uses an effectively unbounded wrap width so long lines extend off
+    /// the right edge of the viewport (horizontal scrolling is a later
+    /// follow-up — for v1 the editor just clips).
+    fn toggle_word_wrap(&mut self) {
+        self.word_wrap = !self.word_wrap;
+        let width = if self.word_wrap {
+            self.gpu.surface_config.width as f32 - self.text_padding
+        } else {
+            // Large enough that no realistic line wraps; cosmic-text still
+            // shapes the buffer correctly at this width.
+            1.0e7
+        };
+        self.text.set_width(&mut self.font_system, width);
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        let msg = if self.word_wrap {
+            "word wrap on"
+        } else {
+            "word wrap off"
+        };
+        self.set_status_flash(msg.to_string());
+        self.window.request_redraw();
+    }
+
+    /// Toggle visible-whitespace mode. The underlying buffer is unchanged;
+    /// `text_dirty` triggers a reshape with substitutions on the next
+    /// render frame.
+    fn toggle_visible_whitespace(&mut self) {
+        self.visible_whitespace = !self.visible_whitespace;
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        let msg = if self.visible_whitespace {
+            "whitespace visible"
+        } else {
+            "whitespace hidden"
+        };
+        self.set_status_flash(msg.to_string());
+        self.window.request_redraw();
+    }
+
+    /// Cmd-D smart-select: with no real selection, expand the primary caret
+    /// to the word it sits in (like double-click); with a selection, find
+    /// the next occurrence of the selected text *after* the selection's
+    /// end and add it as a new cursor.
+    fn add_next_occurrence(&mut self) {
+        let primary = self.doc().editor.selections().primary();
+        if primary.is_cursor() {
+            // Expand to word — same definition as double-click.
+            let head = primary.head;
+            let text = self.doc().editor.text();
+            let chars: Vec<char> = text.chars().collect();
+            let is_word = |c: char| c.is_alphanumeric() || c == '_';
+            let n = chars.len();
+            let mut start = head.min(n);
+            let mut end = head.min(n);
+            while start > 0 && is_word(chars[start - 1]) {
+                start -= 1;
+            }
+            while end < n && is_word(chars[end]) {
+                end += 1;
+            }
+            if start == end {
+                return;
+            }
+            self.doc_mut()
+                .editor
+                .set_selection(Selection::new(start, end));
+        } else {
+            let needle: String = self
+                .doc()
+                .editor
+                .buffer()
+                .slice(primary.start()..primary.end());
+            let Some(range) =
+                find_next_occurrence(&self.doc().editor.text(), &needle, primary.end())
+            else {
+                return;
+            };
+            self.doc_mut()
+                .editor
+                .add_selection(Selection::new(range.start, range.end));
+        }
+        self.text_dirty = false;
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.window.request_redraw();
+    }
+
+    /// Jump the primary caret to the next occurrence of its currently-
+    /// selected text, *without* keeping the old position as another cursor.
+    /// Useful when Cmd-D would have added a false positive that the user
+    /// wants to skip over. Wraps past the end of the buffer.
+    fn skip_to_next_occurrence(&mut self) {
+        let primary = self.doc().editor.selections().primary();
+        if primary.is_cursor() {
+            return;
+        }
+        let needle: String = self
+            .doc()
+            .editor
+            .buffer()
+            .slice(primary.start()..primary.end());
+        let Some(range) = find_next_occurrence(&self.doc().editor.text(), &needle, primary.end())
+        else {
+            return;
+        };
+        self.doc_mut()
+            .editor
+            .set_selection(Selection::new(range.start, range.end));
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.window.request_redraw();
+    }
+
+    /// Add a caret on the line above the primary at the same column.
+    /// No-op when the primary is already on the first line; clamps the
+    /// column to the new line's length.
+    fn add_cursor_above(&mut self) {
+        self.add_cursor_vertical(true);
+    }
+
+    /// Add a caret on the line below the primary at the same column.
+    fn add_cursor_below(&mut self) {
+        self.add_cursor_vertical(false);
+    }
+
+    fn add_cursor_vertical(&mut self, up: bool) {
+        let editor = &self.doc().editor;
+        let buffer = editor.buffer();
+        // Stack from the *extreme* current cursor in the requested
+        // direction, not the primary — pressing Cmd-Alt-↓ N times should
+        // add N cursors below, not the same line N times. The primary's
+        // column anchors the stack so wandering caret positions don't
+        // drift the column from press to press.
+        let target_col = buffer
+            .char_to_position(editor.selections().primary().head)
+            .column;
+        let extreme_line = editor
+            .selections()
+            .iter()
+            .map(|s| buffer.char_to_position(s.head).line)
+            .fold(None, |acc: Option<usize>, line| {
+                Some(match acc {
+                    None => line,
+                    Some(prev) if up => prev.min(line),
+                    Some(prev) => prev.max(line),
+                })
+            });
+        let Some(extreme_line) = extreme_line else {
+            return;
+        };
+        let new_line = if up {
+            if extreme_line == 0 {
+                return;
+            }
+            extreme_line - 1
+        } else {
+            let next = extreme_line + 1;
+            if next >= buffer.len_lines() {
+                return;
+            }
+            next
+        };
+        let line_len = buffer
+            .line(new_line)
+            .map(|s| {
+                s.trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .chars()
+                    .count()
+            })
+            .unwrap_or(0);
+        let col = target_col.min(line_len);
+        let Some(char_idx) = buffer.position_to_char(Position::new(new_line, col)) else {
+            return;
+        };
+        self.doc_mut()
+            .editor
+            .add_selection(Selection::cursor(char_idx));
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.window.request_redraw();
+    }
+
+    /// Esc / Cmd-K behavior: drop every cursor except the primary; if the
+    /// primary is a real range, collapse it to a cursor at the head.
+    fn collapse_selection_to_primary(&mut self) {
+        let multi = self.doc().editor.selections().has_multiple();
+        let primary = self.doc().editor.selections().primary();
+        if multi {
+            self.doc_mut().editor.collapse_to_primary();
+        } else if !primary.is_cursor() {
+            self.doc_mut()
+                .editor
+                .set_selection(Selection::cursor(primary.head));
+        } else {
+            return;
         }
         self.scene_dirty = true;
         self.follow_caret = true;
@@ -1987,8 +2337,15 @@ impl State {
 
     /// Pointer moved. During a drag, extend the selection from the drag anchor
     /// to the pointer; a drag past the top/bottom edge also scrolls the view.
+    /// Also updates the hovered close-"×" state for visual feedback.
     fn handle_mouse_move(&mut self, x: f32, y: f32) {
         self.mouse_pos = Some((x, y));
+        let new_hover = self.tab_close_at_pixel(x, y);
+        if new_hover != self.hovered_close {
+            self.hovered_close = new_hover;
+            self.scene_dirty = true;
+            self.window.request_redraw();
+        }
         let Some(anchor) = self.drag_anchor else {
             return;
         };
@@ -2330,7 +2687,12 @@ impl State {
 
         if self.text_dirty {
             let new_text = self.docs[self.active].editor.text();
-            self.text.set_content(&mut self.font_system, &new_text);
+            let shaped = if self.visible_whitespace {
+                substitute_whitespace(&new_text)
+            } else {
+                new_text
+            };
+            self.text.set_content(&mut self.font_system, &shaped);
             self.text_dirty = false;
         }
         if self.scene_dirty {
@@ -2515,16 +2877,22 @@ impl State {
             default_color: label_color,
             custom_glyphs: &[],
         });
+        let hovered_close = self.hovered_close;
         for i in 0..docs_len {
             let slot_x = i as f32 * slot_w;
             let close_x = slot_x + slot_w - close_w - close_pad + close_glyph_offset_x;
+            let color = if Some(i) == hovered_close {
+                editor_color
+            } else {
+                dim_color
+            };
             text_areas.push(TextArea {
                 buffer: &self.close_text.buffer,
                 left: close_x,
                 top: tab_text_y,
                 scale: 1.0,
                 bounds: strip_bounds,
-                default_color: dim_color,
+                default_color: color,
                 custom_glyphs: &[],
             });
         }
