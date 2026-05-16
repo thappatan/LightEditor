@@ -3015,14 +3015,16 @@ impl State {
             root.push_child(SceneNode::quad(Rect::new(0.0, y, w, line_h), active_color));
         }
 
-        // Indent guides — thin vertical lines every `tab_size` chars of
-        // leading whitespace per visible logical line. Drawn before the
-        // selection so a selection over them still reads clearly.
-        // Measure the actual digit advance from the gutter's shaped run
-        // instead of guessing — `font_size × 0.6` drifts for fonts whose
-        // monospace advance isn't exactly 0.6 em.
+        // Indent guides — thin vertical lines every `indent_unit` chars of
+        // leading whitespace per visible logical line. The unit comes from
+        // the document, not the user's `tab_size` setting, so a 4-space-
+        // indented file viewed at `tab_size = 2` still gets guides at the
+        // file's actual indent boundaries.
+        //
+        // Measure the digit advance from the editor's shaped buffer — an
+        // approximation drifts at deeper indents.
         let char_w = self.measured_char_width();
-        let tab_size = self.tab_spaces.len().max(1);
+        let tab_size = self.doc().indent_unit.max(1);
         let guide_color = SceneColor::rgba(80, 80, 100, 160);
         let guide_w = self.scale.max(1.0);
         let mut prev_logical_g = usize::MAX;
