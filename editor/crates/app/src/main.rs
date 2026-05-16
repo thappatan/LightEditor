@@ -3050,7 +3050,11 @@ impl State {
             // `start` byte hits that column and use its rendered `x`.
             for level in 1..=levels {
                 let target_byte = level * tab_size;
-                let Some(gx) = run.glyphs.iter().find(|g| g.start >= target_byte).map(|g| g.x)
+                let Some(gx) = run
+                    .glyphs
+                    .iter()
+                    .find(|g| g.start >= target_byte)
+                    .map(|g| g.x)
                 else {
                     continue;
                 };
