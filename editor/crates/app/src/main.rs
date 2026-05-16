@@ -819,6 +819,34 @@ impl State {
                     _ => {}
                 }
             }
+        }
+        // Alt-Shift-↑/↓ swaps the line under (or selected by) the primary
+        // with the line above / below. Checked outside the Cmd block since
+        // it doesn't involve Cmd / Ctrl.
+        if self.modifiers.alt_key() && self.modifiers.shift_key() {
+            match &event.logical_key {
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.doc_mut().editor.move_lines_up();
+                    self.text_dirty = true;
+                    self.scene_dirty = true;
+                    self.follow_caret = true;
+                    self.mark_dirty_if_clean();
+                    self.window.request_redraw();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.doc_mut().editor.move_lines_down();
+                    self.text_dirty = true;
+                    self.scene_dirty = true;
+                    self.follow_caret = true;
+                    self.mark_dirty_if_clean();
+                    self.window.request_redraw();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_cmd_or_ctrl(self.modifiers) {
             if let Key::Character(c) = &event.logical_key {
                 let lower = c.to_lowercase();
                 let alt = self.modifiers.alt_key();
@@ -1374,6 +1402,73 @@ impl State {
         self.scene_dirty = true;
         self.follow_caret = true;
         self.window.request_redraw();
+    }
+
+    /// Find the matching bracket for whichever bracket the primary caret
+    /// sits next to. Looks at the char right of the caret first, then the
+    /// char left of it. Returns `(this_pos, match_pos)` or `None` when
+    /// the caret isn't adjacent to a bracket or the match is missing.
+    fn matching_bracket_positions(&self) -> Option<(usize, usize)> {
+        let primary = self.doc().editor.selections().primary();
+        if !primary.is_cursor() {
+            return None;
+        }
+        let head = primary.head;
+        let text = self.doc().editor.text();
+        let chars: Vec<char> = text.chars().collect();
+        let pair_of = |c: char| -> Option<(char, bool)> {
+            match c {
+                '(' => Some((')', true)),
+                '[' => Some((']', true)),
+                '{' => Some(('}', true)),
+                ')' => Some(('(', false)),
+                ']' => Some(('[', false)),
+                '}' => Some(('{', false)),
+                _ => None,
+            }
+        };
+
+        let candidate = (head < chars.len())
+            .then(|| pair_of(chars[head]).map(|(t, f)| (head, chars[head], t, f)))
+            .flatten()
+            .or_else(|| {
+                (head > 0)
+                    .then(|| {
+                        pair_of(chars[head - 1]).map(|(t, f)| (head - 1, chars[head - 1], t, f))
+                    })
+                    .flatten()
+            });
+        let (pos, this, target, forward) = candidate?;
+
+        let mut depth = 1i32;
+        if forward {
+            let mut i = pos + 1;
+            while i < chars.len() {
+                if chars[i] == this {
+                    depth += 1;
+                } else if chars[i] == target {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((pos, i));
+                    }
+                }
+                i += 1;
+            }
+        } else {
+            let mut i = pos;
+            while i > 0 {
+                i -= 1;
+                if chars[i] == this {
+                    depth += 1;
+                } else if chars[i] == target {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((pos, i));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Mark the active document dirty if it wasn't already, and refresh
@@ -2636,6 +2731,56 @@ impl State {
             }
             let y = self.text_inset_y + run.line_top - scroll;
             root.push_child(SceneNode::quad(Rect::new(0.0, y, w, line_h), active_color));
+        }
+
+        // Indent guides — thin vertical lines every `tab_size` chars of
+        // leading whitespace per visible logical line. Drawn before the
+        // selection so a selection over them still reads clearly.
+        let char_w = self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale;
+        let tab_size = self.tab_spaces.len().max(1);
+        let guide_color = SceneColor::rgba(80, 80, 100, 160);
+        let guide_w = self.scale.max(1.0);
+        let mut prev_logical_g = usize::MAX;
+        for run in self.text.buffer.layout_runs() {
+            if run.line_i == prev_logical_g {
+                continue;
+            }
+            prev_logical_g = run.line_i;
+            let Some(line_text) = self.doc().editor.buffer().line(run.line_i) else {
+                continue;
+            };
+            let leading_ws = line_text
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .count();
+            let levels = leading_ws / tab_size;
+            if levels == 0 {
+                continue;
+            }
+            let y = self.text_inset_y + run.line_top - scroll;
+            for level in 1..=levels {
+                let x = self.text_inset_x + level as f32 * tab_size as f32 * char_w;
+                root.push_child(SceneNode::quad(
+                    Rect::new(x, y, guide_w, line_h),
+                    guide_color,
+                ));
+            }
+        }
+
+        // Bracket-pair highlight — when the caret sits next to a bracket,
+        // both the bracket and its match get a faint outlined background.
+        if let Some((a, b)) = self.matching_bracket_positions() {
+            for pos in [a, b] {
+                if let Some((cx, cy)) = self.caret_pixel(pos) {
+                    let rect = Rect::new(
+                        self.text_inset_x + cx,
+                        self.text_inset_y + cy - scroll,
+                        char_w.max(self.caret_width),
+                        line_h,
+                    );
+                    root.push_child(SceneNode::quad(rect, SceneColor::rgba(180, 200, 255, 36)));
+                }
+            }
         }
 
         // Selection highlights sit behind text and carets.
