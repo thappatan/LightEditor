@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use editor_core::Editor;
-use editor_syntax::{Highlighter, Language};
+use editor_syntax::{Highlight, Highlighter, Language};
 
 use crate::find::FindBar;
 
@@ -25,6 +25,14 @@ pub struct Document {
     /// the supported languages. `None` for pathless / unknown-extension
     /// documents — the renderer falls back to plain text.
     pub highlighter: Option<Highlighter>,
+    /// Cached highlights from the most recent successful parse, keyed on
+    /// the editor's revision at parse time. The renderer reuses these when
+    /// the revision hasn't moved (typical when switching tabs without
+    /// editing).
+    pub cached_highlights: Vec<Highlight>,
+    /// Revision counter the cached highlights were produced from. `None`
+    /// means "no parse yet" — force one.
+    pub cached_revision: Option<u64>,
     /// Detected indent width *in characters* for this document, used by
     /// indent guides so they line up with the file's actual indentation
     /// rather than the user-settings `tab_size`. Falls back to 4 for
@@ -41,6 +49,8 @@ impl Document {
             scroll_y: 0.0,
             find: None,
             highlighter: None,
+            cached_highlights: Vec::new(),
+            cached_revision: None,
             indent_unit: detect_indent_unit(initial_text),
         }
     }
@@ -55,6 +65,8 @@ impl Document {
             scroll_y: 0.0,
             find: None,
             highlighter,
+            cached_highlights: Vec::new(),
+            cached_revision: None,
             indent_unit,
         }
     }

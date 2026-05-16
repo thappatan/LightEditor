@@ -18,6 +18,10 @@ pub struct Editor {
     buffer: TextBuffer,
     selections: SelectionSet,
     undo: UndoTree,
+    /// Monotonic counter — bumped every time `apply_edits` (or undo/redo)
+    /// changes the buffer text. Callers cache derived data keyed on this
+    /// number and skip recomputation when it hasn't moved.
+    revision: u64,
 }
 
 impl Editor {
@@ -40,6 +44,14 @@ impl Editor {
     /// `String`.
     pub fn text(&self) -> String {
         self.buffer.to_string()
+    }
+
+    /// Monotonic revision counter. Bumped on every successful edit (and on
+    /// each undo / redo step). Useful for caching parse trees, syntax
+    /// highlights, scroll-position-derived data — anything that depends
+    /// on the buffer's current text.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     // ── edit operations (applied at every selection) ──────────────────────
@@ -586,6 +598,7 @@ impl Editor {
             Some((buffer, selections)) => {
                 self.buffer = buffer;
                 self.selections = selections;
+                self.revision = self.revision.wrapping_add(1);
                 true
             }
             None => false,
@@ -599,6 +612,7 @@ impl Editor {
             Some((buffer, selections)) => {
                 self.buffer = buffer;
                 self.selections = selections;
+                self.revision = self.revision.wrapping_add(1);
                 true
             }
             None => false,
@@ -735,10 +749,12 @@ impl Editor {
         self.selections = SelectionSet::new(new, primary_head);
     }
 
-    /// Record the current state as a new undo snapshot.
+    /// Record the current state as a new undo snapshot and bump the
+    /// revision counter — every edit funnels through here.
     fn commit(&mut self) {
         self.undo
             .commit(self.buffer.clone(), self.selections.clone());
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Number of `char`s in `line`, excluding any trailing `\n` or `\r\n`.
@@ -875,6 +891,7 @@ impl From<TextBuffer> for Editor {
             buffer,
             selections,
             undo,
+            revision: 0,
         }
     }
 }
@@ -1380,6 +1397,40 @@ mod tests {
         ed.indent_lines("  ");
         ed.outdent_lines(2);
         assert_eq!(ed.text(), original);
+    }
+
+    // ── revision counter ──────────────────────────────────────────────────
+
+    #[test]
+    fn revision_starts_at_zero_and_increments_on_each_edit() {
+        let mut ed = Editor::new();
+        assert_eq!(ed.revision(), 0);
+        ed.insert("a");
+        assert_eq!(ed.revision(), 1);
+        ed.insert("b");
+        assert_eq!(ed.revision(), 2);
+    }
+
+    #[test]
+    fn revision_does_not_change_on_selection_only() {
+        let mut ed = Editor::from("hi");
+        let r0 = ed.revision();
+        ed.set_selection(Selection::new(0, 2));
+        ed.move_left(false);
+        ed.move_right(true);
+        assert_eq!(ed.revision(), r0);
+    }
+
+    #[test]
+    fn revision_bumps_on_undo_and_redo() {
+        let mut ed = Editor::new();
+        ed.insert("a");
+        let r1 = ed.revision();
+        assert!(ed.undo());
+        assert!(ed.revision() > r1);
+        let r2 = ed.revision();
+        assert!(ed.redo());
+        assert!(ed.revision() > r2);
     }
 
     // Test-only helper to seed selection state without going through editing.

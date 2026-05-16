@@ -3327,15 +3327,24 @@ impl State {
                 let shaped = substitute_whitespace(&new_text);
                 self.text.set_content(&mut self.font_system, &shaped);
             } else if self.docs[self.active].highlighter.is_some() {
-                let highlights = self.docs[self.active]
-                    .highlighter
-                    .as_mut()
-                    .unwrap()
-                    .highlight(&new_text);
+                // Cache key: editor revision. Switching tabs back to a doc
+                // that hasn't changed since the last parse skips the whole
+                // tree-sitter pass.
+                let revision = self.docs[self.active].editor.revision();
+                let needs_parse = self.docs[self.active].cached_revision != Some(revision);
+                if needs_parse {
+                    let highlights = self.docs[self.active]
+                        .highlighter
+                        .as_mut()
+                        .unwrap()
+                        .highlight(&new_text);
+                    self.docs[self.active].cached_highlights = highlights;
+                    self.docs[self.active].cached_revision = Some(revision);
+                }
                 let default_color = text_color(&self.theme.editor.text_fg);
                 let spans = build_highlight_spans(
                     &new_text,
-                    &highlights,
+                    &self.docs[self.active].cached_highlights,
                     default_color,
                     &self.theme.syntax,
                 );
