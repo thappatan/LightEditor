@@ -800,6 +800,7 @@ dependencies = [
 name = "editor-syntax"
 version = "0.1.0"
 dependencies = [
+ "editor-buffer",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",

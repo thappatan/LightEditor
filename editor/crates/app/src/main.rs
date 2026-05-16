@@ -3519,15 +3519,22 @@ impl State {
             } else if self.docs[self.active].highlighter.is_some() {
                 // Cache key: editor revision. Switching tabs back to a doc
                 // that hasn't changed since the last parse skips the whole
-                // tree-sitter pass.
+                // tree-sitter pass. Edits between parses are drained from
+                // the editor and fed to the highlighter so tree-sitter can
+                // reparse incrementally instead of from scratch.
                 let revision = self.docs[self.active].editor.revision();
                 let needs_parse = self.docs[self.active].cached_revision != Some(revision);
                 if needs_parse {
-                    let highlights = self.docs[self.active]
-                        .highlighter
-                        .as_mut()
-                        .unwrap()
-                        .highlight(&new_text);
+                    let pending = self.docs[self.active].editor.take_pending_edits();
+                    let highlighter = self.docs[self.active].highlighter.as_mut().unwrap();
+                    if pending.tree_invalidated {
+                        highlighter.reset();
+                    } else {
+                        for edit in &pending.edits {
+                            highlighter.apply_edit(edit);
+                        }
+                    }
+                    let highlights = highlighter.highlight(&new_text);
                     self.docs[self.active].cached_highlights = highlights;
                     self.docs[self.active].cached_revision = Some(revision);
                 }

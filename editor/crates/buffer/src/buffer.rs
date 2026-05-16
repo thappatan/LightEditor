@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use ropey::Rope;
 
-use crate::{LineEnding, Position};
+use crate::{BytePoint, LineEnding, Position};
 
 /// A text buffer backed by a `ropey::Rope` (ADR-004).
 ///
@@ -111,6 +111,26 @@ impl TextBuffer {
         Position {
             line,
             column: char_idx - line_start,
+        }
+    }
+
+    /// Convert a `char` index to its UTF-8 byte offset. Panics if `char_idx`
+    /// is past the end of the buffer.
+    pub fn char_to_byte(&self, char_idx: usize) -> usize {
+        self.rope.char_to_byte(char_idx)
+    }
+
+    /// `char_idx` as a (row, byte-column) point — matches tree-sitter's
+    /// `Point` convention so downstream parsers can use it directly. Past
+    /// the end of the buffer returns the end-of-buffer point.
+    pub fn byte_point(&self, char_idx: usize) -> BytePoint {
+        let char_idx = char_idx.min(self.rope.len_chars());
+        let row = self.rope.char_to_line(char_idx);
+        let line_byte_start = self.rope.line_to_byte(row);
+        let byte = self.rope.char_to_byte(char_idx);
+        BytePoint {
+            row,
+            column: byte - line_byte_start,
         }
     }
 
@@ -297,6 +317,33 @@ mod tests {
         let buf = TextBuffer::new();
         assert_eq!(buf.char_to_position(0), Position::ZERO);
         assert_eq!(buf.char_to_position(100), Position::ZERO);
+    }
+
+    #[test]
+    fn char_to_byte_counts_utf8_bytes() {
+        let buf = TextBuffer::from("aก๋b");
+        // "a" — 1 byte, "ก" — 3 bytes, "๋" — 3 bytes, "b" — 1 byte.
+        assert_eq!(buf.char_to_byte(0), 0);
+        assert_eq!(buf.char_to_byte(1), 1);
+        assert_eq!(buf.char_to_byte(2), 4);
+        assert_eq!(buf.char_to_byte(3), 7);
+        assert_eq!(buf.char_to_byte(4), 8);
+        assert_eq!(buf.char_to_byte(buf.len_chars()), buf.len_bytes());
+    }
+
+    #[test]
+    fn byte_point_reports_row_and_byte_column() {
+        let buf = TextBuffer::from("alpha\nกข\nz");
+        // "alpha\n" — first line, then "กข\n" — second.
+        assert_eq!(buf.byte_point(0), BytePoint { row: 0, column: 0 });
+        assert_eq!(buf.byte_point(5), BytePoint { row: 0, column: 5 });
+        // Start of line 1 (right after the newline).
+        assert_eq!(buf.byte_point(6), BytePoint { row: 1, column: 0 });
+        // After "ก" — that's 3 bytes.
+        assert_eq!(buf.byte_point(7), BytePoint { row: 1, column: 3 });
+        // End of buffer.
+        let end = buf.byte_point(buf.len_chars());
+        assert_eq!(end.row, 2);
     }
 
     #[test]
