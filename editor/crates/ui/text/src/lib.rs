@@ -121,6 +121,24 @@ impl TextStack {
         self.buffer.shape_until_scroll(font_system, false);
     }
 
+    /// Reshape the buffer to a sequence of attributed `(slice, attrs)` spans.
+    /// Used by the syntax-highlighter path so per-token colors land in the
+    /// shaped glyphs. Concatenating every span's slice MUST equal the full
+    /// document text — the caller is responsible for that.
+    pub fn set_content_rich<'a, I>(&mut self, font_system: &mut FontSystem, spans: I)
+    where
+        I: IntoIterator<Item = (&'a str, Attrs<'a>)>,
+    {
+        self.buffer.set_rich_text(
+            font_system,
+            spans,
+            &default_attrs(),
+            Shaping::Advanced,
+            None,
+        );
+        self.buffer.shape_until_scroll(font_system, false);
+    }
+
     /// Set the wrap width (physical pixels). Height stays unbounded — see
     /// [`new`](TextStack::new). A non-positive width is ignored.
     pub fn set_width(&mut self, font_system: &mut FontSystem, width: f32) {

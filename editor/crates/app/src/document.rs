@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use editor_core::Editor;
+use editor_syntax::{Highlighter, Language};
 
 use crate::find::FindBar;
 
@@ -20,6 +21,15 @@ pub struct Document {
     /// Find bar belongs to the document: switch tab, find bar disappears;
     /// switch back, it reappears with the same query.
     pub find: Option<FindBar>,
+    /// Tree-sitter highlighter when the document's extension matches one of
+    /// the supported languages. `None` for pathless / unknown-extension
+    /// documents — the renderer falls back to plain text.
+    pub highlighter: Option<Highlighter>,
+    /// Detected indent width *in characters* for this document, used by
+    /// indent guides so they line up with the file's actual indentation
+    /// rather than the user-settings `tab_size`. Falls back to 4 for
+    /// fresh / un-indented files.
+    pub indent_unit: usize,
 }
 
 impl Document {
@@ -30,16 +40,22 @@ impl Document {
             dirty: false,
             scroll_y: 0.0,
             find: None,
+            highlighter: None,
+            indent_unit: detect_indent_unit(initial_text),
         }
     }
 
     pub fn from_file(path: PathBuf, content: &str) -> Self {
+        let highlighter = Language::for_path(&path).and_then(|l| Highlighter::new(l).ok());
+        let indent_unit = detect_indent_unit(content);
         Self {
             editor: Editor::from(content),
             file_path: Some(path),
             dirty: false,
             scroll_y: 0.0,
             find: None,
+            highlighter,
+            indent_unit,
         }
     }
 
@@ -55,6 +71,35 @@ impl Document {
     /// Used by file-open to replace the slot instead of pushing a new tab.
     pub fn is_pristine_scratch(&self) -> bool {
         self.file_path.is_none() && !self.dirty
+    }
+}
+
+/// Best-effort detection of the document's leading-space indent unit.
+/// Scans up to the first 500 lines; the smallest non-zero leading-space
+/// count seen (ignoring blank / tab-indented lines) becomes the unit.
+/// Returns 4 when no spaced indent is found.
+fn detect_indent_unit(text: &str) -> usize {
+    let mut smallest = usize::MAX;
+    for line in text.lines().take(500) {
+        // Tab-indented lines defeat space-based guides; skip them.
+        if line.starts_with('\t') {
+            continue;
+        }
+        let leading = line.chars().take_while(|c| *c == ' ').count();
+        if leading == 0 {
+            continue;
+        }
+        if line[leading..].trim().is_empty() {
+            continue; // blank-with-whitespace
+        }
+        if leading < smallest {
+            smallest = leading;
+        }
+    }
+    if smallest == usize::MAX || smallest == 0 {
+        4
+    } else {
+        smallest
     }
 }
 
@@ -87,5 +132,30 @@ mod tests {
         let mut d = Document::new_scratch("");
         d.dirty = true;
         assert!(!d.is_pristine_scratch());
+    }
+
+    #[test]
+    fn detect_indent_unit_finds_two_space_indent() {
+        let src = "fn main() {\n  let x = 1;\n  if x > 0 {\n    let y = 2;\n  }\n}\n";
+        assert_eq!(detect_indent_unit(src), 2);
+    }
+
+    #[test]
+    fn detect_indent_unit_finds_four_space_indent() {
+        let src = "fn a() {\n    let x = 1;\n        let y = 2;\n}\n";
+        assert_eq!(detect_indent_unit(src), 4);
+    }
+
+    #[test]
+    fn detect_indent_unit_defaults_to_4_when_unindented() {
+        assert_eq!(detect_indent_unit("nope\nno indent\nat all\n"), 4);
+        assert_eq!(detect_indent_unit(""), 4);
+    }
+
+    #[test]
+    fn detect_indent_unit_ignores_tab_indented_lines() {
+        let src = "\tfoo\n  bar\n    baz\n";
+        // Tab-indented "foo" doesn't count; "  bar" wins.
+        assert_eq!(detect_indent_unit(src), 2);
     }
 }
