@@ -872,6 +872,8 @@ impl State {
         }
 
         let shift = self.modifiers.shift_key();
+        let alt = self.modifiers.alt_key();
+        let cmd = is_cmd_or_ctrl(self.modifiers);
 
         let mut text_changed = true;
         let handled = match &event.logical_key {
@@ -881,11 +883,23 @@ impl State {
                 true
             }
             Key::Named(NamedKey::Backspace) => {
-                self.doc_mut().editor.backspace();
+                if cmd {
+                    self.doc_mut().editor.delete_to_line_start();
+                } else if alt {
+                    self.doc_mut().editor.delete_word_left();
+                } else {
+                    self.doc_mut().editor.backspace();
+                }
                 true
             }
             Key::Named(NamedKey::Delete) => {
-                self.doc_mut().editor.delete_forward();
+                if cmd {
+                    self.doc_mut().editor.delete_to_line_end();
+                } else if alt {
+                    self.doc_mut().editor.delete_word_right();
+                } else {
+                    self.doc_mut().editor.delete_forward();
+                }
                 true
             }
             Key::Named(NamedKey::Enter) => {
@@ -912,22 +926,42 @@ impl State {
                 true
             }
             Key::Named(NamedKey::ArrowLeft) => {
-                self.doc_mut().editor.move_left(shift);
+                if cmd {
+                    self.doc_mut().editor.move_line_start(shift);
+                } else if alt {
+                    self.doc_mut().editor.move_word_left(shift);
+                } else {
+                    self.doc_mut().editor.move_left(shift);
+                }
                 text_changed = false;
                 true
             }
             Key::Named(NamedKey::ArrowRight) => {
-                self.doc_mut().editor.move_right(shift);
+                if cmd {
+                    self.doc_mut().editor.move_line_end(shift);
+                } else if alt {
+                    self.doc_mut().editor.move_word_right(shift);
+                } else {
+                    self.doc_mut().editor.move_right(shift);
+                }
                 text_changed = false;
                 true
             }
             Key::Named(NamedKey::ArrowUp) => {
-                self.doc_mut().editor.move_up(shift);
+                if cmd {
+                    self.doc_mut().editor.move_buffer_start(shift);
+                } else {
+                    self.doc_mut().editor.move_up(shift);
+                }
                 text_changed = false;
                 true
             }
             Key::Named(NamedKey::ArrowDown) => {
-                self.doc_mut().editor.move_down(shift);
+                if cmd {
+                    self.doc_mut().editor.move_buffer_end(shift);
+                } else {
+                    self.doc_mut().editor.move_down(shift);
+                }
                 text_changed = false;
                 true
             }

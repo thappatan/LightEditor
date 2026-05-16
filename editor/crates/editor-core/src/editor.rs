@@ -120,6 +120,119 @@ impl Editor {
         self.move_vertical(extend, false);
     }
 
+    // ── word / line / buffer movement ─────────────────────────────────────
+
+    /// Move every caret to the previous word boundary. A "word" here is a
+    /// run of alphanumeric or underscore chars; non-word chars (whitespace,
+    /// punctuation, brackets) are skipped over together. See
+    /// [`move_left`](Editor::move_left) for the `extend` semantics.
+    pub fn move_word_left(&mut self, extend: bool) {
+        self.move_head(extend, |ed, sel| ed.prev_word_start(sel.head));
+    }
+
+    /// Move every caret to the next word boundary. Mirror of
+    /// [`move_word_left`](Editor::move_word_left).
+    pub fn move_word_right(&mut self, extend: bool) {
+        self.move_head(extend, |ed, sel| ed.next_word_end(sel.head));
+    }
+
+    /// Move every caret to column 0 of its current line.
+    pub fn move_line_start(&mut self, extend: bool) {
+        self.move_head(extend, |ed, sel| {
+            let pos = ed.buffer.char_to_position(sel.head);
+            ed.buffer
+                .position_to_char(Position::new(pos.line, 0))
+                .unwrap_or(sel.head)
+        });
+    }
+
+    /// Move every caret to the end of its current line (before any
+    /// trailing newline).
+    pub fn move_line_end(&mut self, extend: bool) {
+        self.move_head(extend, |ed, sel| {
+            let pos = ed.buffer.char_to_position(sel.head);
+            let col = ed.line_content_chars(pos.line);
+            ed.buffer
+                .position_to_char(Position::new(pos.line, col))
+                .unwrap_or(sel.head)
+        });
+    }
+
+    /// Move every caret to the very start of the buffer.
+    pub fn move_buffer_start(&mut self, extend: bool) {
+        self.move_head(extend, |_ed, _sel| 0);
+    }
+
+    /// Move every caret to the very end of the buffer.
+    pub fn move_buffer_end(&mut self, extend: bool) {
+        let len = self.buffer.len_chars();
+        self.move_head(extend, move |_ed, _sel| len);
+    }
+
+    /// Delete from each cursor back to the previous word boundary; a
+    /// non-empty selection just deletes its span.
+    pub fn delete_word_left(&mut self) {
+        self.edit_ranges(|sel, ed| {
+            if sel.is_cursor() {
+                let to = sel.head;
+                let from = ed.prev_word_start(to);
+                from..to
+            } else {
+                sel.range()
+            }
+        });
+    }
+
+    /// Delete from each cursor forward to the next word boundary; a
+    /// non-empty selection just deletes its span.
+    pub fn delete_word_right(&mut self) {
+        self.edit_ranges(|sel, ed| {
+            if sel.is_cursor() {
+                let from = sel.head;
+                let to = ed.next_word_end(from);
+                from..to
+            } else {
+                sel.range()
+            }
+        });
+    }
+
+    /// Delete from each cursor back to the start of its current line.
+    pub fn delete_to_line_start(&mut self) {
+        self.edit_ranges(|sel, ed| {
+            if sel.is_cursor() {
+                let to = sel.head;
+                let pos = ed.buffer.char_to_position(to);
+                let from = ed
+                    .buffer
+                    .position_to_char(Position::new(pos.line, 0))
+                    .unwrap_or(to);
+                from..to
+            } else {
+                sel.range()
+            }
+        });
+    }
+
+    /// Delete from each cursor forward to the end of its current line
+    /// (before any trailing newline).
+    pub fn delete_to_line_end(&mut self) {
+        self.edit_ranges(|sel, ed| {
+            if sel.is_cursor() {
+                let from = sel.head;
+                let pos = ed.buffer.char_to_position(from);
+                let col = ed.line_content_chars(pos.line);
+                let to = ed
+                    .buffer
+                    .position_to_char(Position::new(pos.line, col))
+                    .unwrap_or(from);
+                from..to
+            } else {
+                sel.range()
+            }
+        });
+    }
+
     // ── direct selection placement ────────────────────────────────────────
 
     /// Replace all selections with a single one — e.g. a mouse click, a drag,
@@ -323,6 +436,63 @@ impl Editor {
 
     /// Number of `char`s in `line`, excluding any trailing `\n` or `\r\n`.
     /// 0 if `line` is out of range.
+    /// Common machinery for the word/line/buffer movement methods: for
+    /// every selection, derive a new head from `head_of(self, sel)`. With
+    /// `extend`, the anchor stays put; without, the selection collapses to
+    /// a cursor at the new head.
+    fn move_head(&mut self, extend: bool, head_of: impl Fn(&Editor, &Selection) -> usize) {
+        let primary_index = self.selections.primary_index();
+        let new: Vec<Selection> = self
+            .selections
+            .selections()
+            .iter()
+            .map(|sel| {
+                let head = head_of(self, sel);
+                if extend {
+                    Selection::new(sel.anchor, head)
+                } else {
+                    Selection::cursor(head)
+                }
+            })
+            .collect();
+        let primary_head = new[primary_index].head;
+        self.selections = SelectionSet::new(new, primary_head);
+    }
+
+    /// The `char` index at the start of the word at or before `from`. Walks
+    /// left over non-word chars then over word chars; "word" is alphanumeric
+    /// or underscore. Returns `0` when no word is found going back.
+    fn prev_word_start(&self, from: usize) -> usize {
+        let text = self.buffer.to_string();
+        let chars: Vec<char> = text.chars().collect();
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut i = from.min(chars.len());
+        while i > 0 && !is_word(chars[i - 1]) {
+            i -= 1;
+        }
+        while i > 0 && is_word(chars[i - 1]) {
+            i -= 1;
+        }
+        i
+    }
+
+    /// The `char` index at the end of the word at or after `from`. Walks
+    /// right over non-word chars then over word chars. Returns
+    /// `buffer.len_chars()` when no word is found going forward.
+    fn next_word_end(&self, from: usize) -> usize {
+        let text = self.buffer.to_string();
+        let chars: Vec<char> = text.chars().collect();
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut i = from.min(chars.len());
+        while i < chars.len() && !is_word(chars[i]) {
+            i += 1;
+        }
+        while i < chars.len() && is_word(chars[i]) {
+            i += 1;
+        }
+        i
+    }
+
     fn line_content_chars(&self, line: usize) -> usize {
         match self.buffer.line(line) {
             Some(s) => s
@@ -690,6 +860,107 @@ mod tests {
         // out-of-bounds indices are clamped to the buffer length
         ed.set_selection(Selection::new(99, 100));
         assert_eq!(ed.selections().primary(), Selection::cursor(5));
+    }
+
+    // ── word / line / buffer movement + delete ────────────────────────────
+
+    #[test]
+    fn move_word_right_jumps_over_word_and_whitespace() {
+        let mut ed = Editor::from("hello world  foo");
+        ed.set_selection(Selection::cursor(0));
+        ed.move_word_right(false);
+        // Skips no non-word chars (already at word), walks to end of "hello".
+        assert_eq!(ed.selections().primary(), Selection::cursor(5));
+        ed.move_word_right(false);
+        // Skips " ", walks to end of "world".
+        assert_eq!(ed.selections().primary(), Selection::cursor(11));
+        ed.move_word_right(false);
+        // Skips "  ", walks to end of "foo".
+        assert_eq!(ed.selections().primary(), Selection::cursor(16));
+    }
+
+    #[test]
+    fn move_word_left_jumps_back_to_word_start() {
+        let mut ed = Editor::from("hello world");
+        ed.set_selection(Selection::cursor(11));
+        ed.move_word_left(false);
+        assert_eq!(ed.selections().primary(), Selection::cursor(6));
+        ed.move_word_left(false);
+        assert_eq!(ed.selections().primary(), Selection::cursor(0));
+    }
+
+    #[test]
+    fn move_line_start_and_end_anchor_to_columns() {
+        let mut ed = Editor::from("    foo\nbar baz");
+        ed.set_selection(Selection::cursor(6)); // mid-word "foo"
+        ed.move_line_start(false);
+        assert_eq!(ed.selections().primary(), Selection::cursor(0));
+        ed.move_line_end(false);
+        assert_eq!(ed.selections().primary(), Selection::cursor(7));
+        // Second line — line_start lands at the line's first char, not 0.
+        ed.set_selection(Selection::cursor(12));
+        ed.move_line_start(false);
+        assert_eq!(ed.selections().primary(), Selection::cursor(8));
+    }
+
+    #[test]
+    fn move_buffer_start_and_end() {
+        let mut ed = Editor::from("a\nb\nc");
+        ed.set_selection(Selection::cursor(2));
+        ed.move_buffer_start(false);
+        assert_eq!(ed.selections().primary(), Selection::cursor(0));
+        ed.move_buffer_end(false);
+        assert_eq!(ed.selections().primary(), Selection::cursor(5));
+    }
+
+    #[test]
+    fn delete_word_left_removes_previous_token() {
+        let mut ed = Editor::from("hello world");
+        ed.set_selection(Selection::cursor(11));
+        ed.delete_word_left();
+        assert_eq!(ed.text(), "hello ");
+        assert_eq!(ed.selections().primary(), Selection::cursor(6));
+        ed.delete_word_left();
+        // Walks back over the space AND the previous word.
+        assert_eq!(ed.text(), "");
+    }
+
+    #[test]
+    fn delete_word_right_removes_next_token() {
+        let mut ed = Editor::from("hello world");
+        ed.set_selection(Selection::cursor(0));
+        ed.delete_word_right();
+        assert_eq!(ed.text(), " world");
+        ed.delete_word_right();
+        assert_eq!(ed.text(), "");
+    }
+
+    #[test]
+    fn delete_to_line_start_keeps_other_lines() {
+        let mut ed = Editor::from("aaa\nbbb ccc\nddd");
+        ed.set_selection(Selection::cursor(11)); // end of "bbb ccc"
+        ed.delete_to_line_start();
+        assert_eq!(ed.text(), "aaa\n\nddd");
+        assert_eq!(ed.selections().primary(), Selection::cursor(4));
+    }
+
+    #[test]
+    fn delete_to_line_end_keeps_other_lines() {
+        let mut ed = Editor::from("aaa\nbbb ccc\nddd");
+        ed.set_selection(Selection::cursor(4)); // start of "bbb ccc"
+        ed.delete_to_line_end();
+        assert_eq!(ed.text(), "aaa\n\nddd");
+        assert_eq!(ed.selections().primary(), Selection::cursor(4));
+    }
+
+    #[test]
+    fn move_word_right_with_extend_grows_selection() {
+        let mut ed = Editor::from("hello world");
+        ed.set_selection(Selection::cursor(0));
+        ed.move_word_right(true);
+        let p = ed.selections().primary();
+        assert_eq!(p.anchor, 0);
+        assert_eq!(p.head, 5);
     }
 
     // Test-only helper to seed selection state without going through editing.
