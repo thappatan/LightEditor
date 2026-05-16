@@ -3021,9 +3021,9 @@ impl State {
         // indented file viewed at `tab_size = 2` still gets guides at the
         // file's actual indent boundaries.
         //
-        // Measure the digit advance from the editor's shaped buffer — an
-        // approximation drifts at deeper indents.
-        let char_w = self.measured_char_width();
+        // Each guide's x comes from the actual rendered glyph position at
+        // that column (the leading space char's `x` in the layout run), so
+        // there's no `char_width × column` approximation drift.
         let tab_size = self.doc().indent_unit.max(1);
         let guide_color = SceneColor::rgba(80, 80, 100, 160);
         let guide_w = self.scale.max(1.0);
@@ -3045,8 +3045,16 @@ impl State {
                 continue;
             }
             let y = self.text_inset_y + run.line_top - scroll;
+            // Each indent column is `tab_size` *bytes* in (leading whitespace
+            // is one byte per char), so we can find the glyph whose
+            // `start` byte hits that column and use its rendered `x`.
             for level in 1..=levels {
-                let x = self.text_inset_x + level as f32 * tab_size as f32 * char_w;
+                let target_byte = level * tab_size;
+                let Some(gx) = run.glyphs.iter().find(|g| g.start >= target_byte).map(|g| g.x)
+                else {
+                    continue;
+                };
+                let x = self.text_inset_x + gx;
                 root.push_child(SceneNode::quad(
                     Rect::new(x, y, guide_w, line_h),
                     guide_color,
@@ -3057,12 +3065,13 @@ impl State {
         // Bracket-pair highlight — when the caret sits next to a bracket,
         // both the bracket and its match get a faint outlined background.
         if let Some((a, b)) = self.matching_bracket_positions() {
+            let bracket_w = self.measured_char_width().max(self.caret_width);
             for pos in [a, b] {
                 if let Some((cx, cy)) = self.caret_pixel(pos) {
                     let rect = Rect::new(
                         self.text_inset_x + cx,
                         self.text_inset_y + cy - scroll,
-                        char_w.max(self.caret_width),
+                        bracket_w,
                         line_h,
                     );
                     root.push_child(SceneNode::quad(rect, SceneColor::rgba(180, 200, 255, 36)));
