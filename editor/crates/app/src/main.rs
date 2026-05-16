@@ -1557,6 +1557,28 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// Actual width of one monospace digit in physical pixels, measured
+    /// from the gutter's shaped buffer. Falls back to the
+    /// `font_size × MONOSPACE_CHAR_FACTOR` approximation only when the
+    /// gutter is somehow empty.
+    fn measured_char_width(&self) -> f32 {
+        self.text
+            .buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .find(|g| g.w > 0.0)
+            .map(|g| g.w)
+            .or_else(|| {
+                self.gutter_text
+                    .buffer
+                    .layout_runs()
+                    .flat_map(|run| run.glyphs.iter())
+                    .find(|g| g.w > 0.0)
+                    .map(|g| g.w)
+            })
+            .unwrap_or_else(|| self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale)
+    }
+
     /// Find the matching bracket for whichever bracket the primary caret
     /// sits next to. Looks at the char right of the caret first, then the
     /// char left of it. Returns `(this_pos, match_pos)` or `None` when
@@ -2996,7 +3018,10 @@ impl State {
         // Indent guides — thin vertical lines every `tab_size` chars of
         // leading whitespace per visible logical line. Drawn before the
         // selection so a selection over them still reads clearly.
-        let char_w = self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale;
+        // Measure the actual digit advance from the gutter's shaped run
+        // instead of guessing — `font_size × 0.6` drifts for fonts whose
+        // monospace advance isn't exactly 0.6 em.
+        let char_w = self.measured_char_width();
         let tab_size = self.tab_spaces.len().max(1);
         let guide_color = SceneColor::rgba(80, 80, 100, 160);
         let guide_w = self.scale.max(1.0);
