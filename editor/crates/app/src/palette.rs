@@ -26,6 +26,7 @@ pub enum Command {
     ThemeGruvboxDark,
     ThemeNord,
     ThemeTokyoNight,
+    BrowseThemes,
 }
 
 impl Command {
@@ -46,6 +47,7 @@ impl Command {
             Command::ThemeGruvboxDark => "Theme: Gruvbox Dark",
             Command::ThemeNord => "Theme: Nord",
             Command::ThemeTokyoNight => "Theme: Tokyo Night",
+            Command::BrowseThemes => "Theme: Browse…",
         }
     }
 }
@@ -66,6 +68,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ThemeGruvboxDark,
     Command::ThemeNord,
     Command::ThemeTokyoNight,
+    Command::BrowseThemes,
 ];
 
 /// The popup's state.

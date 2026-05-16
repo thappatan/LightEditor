@@ -393,6 +393,20 @@ fn auto_pair(input: &str) -> Option<&'static str> {
     }
 }
 
+/// Matching closer for a single opener character. Quotes mirror to
+/// themselves and are used both for auto-pair and wrap.
+fn matching_closer(c: char) -> Option<char> {
+    match c {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        '`' => Some('`'),
+        _ => None,
+    }
+}
+
 /// Short label suitable for a status-bar flash — just the filename (with
 /// extension), falling back to the full path's stringified form for weird
 /// edge cases where there is no terminal component.
@@ -1268,12 +1282,7 @@ impl State {
             // Printable character input — winit gives us the resolved text.
             _ => match &event.text {
                 Some(text) if !text.is_empty() => {
-                    if let Some(pair) = auto_pair(text) {
-                        self.doc_mut().editor.insert(pair);
-                        // Caret sits one char back so the user is *inside*
-                        // the pair, ready to type the wrapped content.
-                        self.doc_mut().editor.move_left(false);
-                    } else {
+                    if !self.try_smart_bracket(text) {
                         self.doc_mut().editor.insert(text);
                     }
                     true
@@ -1881,6 +1890,75 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// Smarter bracket / quote handling. Returns `true` when the input was
+    /// consumed; `false` means the caller should fall through to a plain
+    /// `editor.insert(text)`.
+    ///
+    /// Cases handled:
+    /// 1. **Overtype** — typing `)`, `]`, or `}` when the next char already
+    ///    matches just moves the caret right, instead of doubling up.
+    /// 2. **Wrap selection** — typing an opener (`(`, `[`, `{`, quote)
+    ///    while a non-empty selection exists wraps it: `foo` → `(foo)`,
+    ///    with the selection preserved on the inner text.
+    /// 3. **Auto-pair** (existing) — typing an opener at a cursor inserts
+    ///    the matching closer and steps back one char.
+    fn try_smart_bracket(&mut self, text: &str) -> bool {
+        if text.chars().count() != 1 {
+            return false;
+        }
+        let c = text.chars().next().unwrap();
+
+        // 1. Overtype: typing a closer right before the same closer.
+        if matches!(c, ')' | ']' | '}') {
+            if let Some(next) = self.char_after_primary() {
+                if next == c {
+                    self.doc_mut().editor.move_right(false);
+                    return true;
+                }
+            }
+        }
+
+        // 2. Wrap selection.
+        let primary = self.doc().editor.selections().primary();
+        if !primary.is_cursor() {
+            if let Some(closer) = matching_closer(c) {
+                let start = primary.start();
+                let end = primary.end();
+                let selected = self.doc().editor.buffer().slice(start..end);
+                let inner_len = selected.chars().count();
+                let wrapped = format!("{c}{selected}{closer}");
+                self.doc_mut().editor.insert(&wrapped);
+                // `insert` collapses to a cursor at the end of the
+                // inserted text; restore the selection on the inner
+                // content (one char past the opener through one char
+                // before the closer).
+                let inner_start = start + 1;
+                let inner_end = inner_start + inner_len;
+                self.doc_mut()
+                    .editor
+                    .set_selection(Selection::new(inner_start, inner_end));
+                return true;
+            }
+        }
+
+        // 3. Auto-pair the opener.
+        if let Some(pair) = auto_pair(text) {
+            self.doc_mut().editor.insert(pair);
+            self.doc_mut().editor.move_left(false);
+            return true;
+        }
+
+        false
+    }
+
+    /// Char immediately to the right of the primary caret, or `None` at
+    /// end-of-buffer. Iterates `chars()` once — fine for the bracket-
+    /// overtype check which fires at most once per keystroke.
+    fn char_after_primary(&self) -> Option<char> {
+        let head = self.doc().editor.selections().primary().head;
+        self.doc().editor.text().chars().nth(head)
+    }
+
     /// Leading whitespace of the line where the primary caret currently
     /// sits. Used by auto-indent to copy the same indent onto the new line
     /// when the user presses Enter.
@@ -2233,6 +2311,15 @@ impl State {
         let pos = doc.editor.buffer().char_to_position(head);
         let lines = doc.editor.buffer().len_lines();
         let indent = self.tab_spaces.len();
+        // When the find bar is open, prepend its match count to the right
+        // half so the user keeps an eye on the search while typing in the
+        // editor.
+        let find_prefix = doc
+            .find
+            .as_ref()
+            .filter(|f| f.match_count() > 0)
+            .map(|f| format!("{}/{}  ·  ", f.current_index() + 1, f.match_count()))
+            .unwrap_or_default();
 
         let flash = self
             .status_flash
@@ -2242,7 +2329,7 @@ impl State {
         let left = flash
             .unwrap_or_else(|| format!("{label}  ·  {language}  ·  Spaces: {indent}  ·  {le}"));
         let right = format!(
-            "Ln {}, Col {}  ·  {} lines",
+            "{find_prefix}Ln {}, Col {}  ·  {} lines",
             pos.line + 1,
             pos.column + 1,
             lines
@@ -2397,7 +2484,40 @@ impl State {
             Command::ThemeTokyoNight => {
                 self.apply_bundled_theme("Tokyo Night", BUNDLED_TOKYO_NIGHT)
             }
+            Command::BrowseThemes => self.browse_themes(),
         }
+    }
+
+    /// "Theme: Browse…" — open a file dialog rooted at
+    /// `~/.config/lighteditor/themes/` (created on demand) so the user can
+    /// pick a custom theme file they've dropped there. Picking applies the
+    /// theme and persists it to `theme.toml`.
+    fn browse_themes(&mut self) {
+        let themes_dir = dirs::config_dir().map(|d| d.join(CONFIG_SUBDIR).join("themes"));
+        if let Some(dir) = themes_dir.as_deref() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let dialog = match themes_dir.as_deref() {
+            Some(d) => rfd::FileDialog::new()
+                .set_directory(d)
+                .add_filter("Theme", &["toml"]),
+            None => rfd::FileDialog::new().add_filter("Theme", &["toml"]),
+        };
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("could not read theme {}: {}", path.display(), e);
+                return;
+            }
+        };
+        let label = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Custom".to_string());
+        self.apply_bundled_theme(&label, &content);
     }
 
     /// Apply a bundled theme: parse the embedded TOML (or fall back to

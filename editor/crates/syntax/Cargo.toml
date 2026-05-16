@@ -18,3 +18,6 @@ tree-sitter-md = { workspace = true }
 tree-sitter-toml-ng = { workspace = true }
 tree-sitter-yaml = { workspace = true }
 tree-sitter-dart = { workspace = true }
+tree-sitter-bash = { workspace = true }
+tree-sitter-lua = { workspace = true }
+tree-sitter-ruby = { workspace = true }

@@ -31,6 +31,9 @@ pub enum Language {
     Toml,
     Yaml,
     Dart,
+    Bash,
+    Lua,
+    Ruby,
 }
 
 impl Language {
@@ -51,6 +54,9 @@ impl Language {
             "toml" => Some(Language::Toml),
             "yaml" | "yml" => Some(Language::Yaml),
             "dart" => Some(Language::Dart),
+            "sh" | "bash" | "zsh" => Some(Language::Bash),
+            "lua" => Some(Language::Lua),
+            "rb" | "rbw" => Some(Language::Ruby),
             _ => None,
         }
     }
@@ -69,6 +75,9 @@ impl Language {
             Language::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
             Language::Yaml => tree_sitter_yaml::LANGUAGE.into(),
             Language::Dart => tree_sitter_dart::LANGUAGE.into(),
+            Language::Bash => tree_sitter_bash::LANGUAGE.into(),
+            Language::Lua => tree_sitter_lua::LANGUAGE.into(),
+            Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
         }
     }
 }
@@ -176,6 +185,9 @@ fn classifier_for(lang: Language) -> Classifier {
         Language::Toml => classify_toml,
         Language::Yaml => classify_yaml,
         Language::Dart => classify_dart,
+        Language::Bash => classify_bash,
+        Language::Lua => classify_lua,
+        Language::Ruby => classify_ruby,
     }
 }
 
@@ -346,10 +358,19 @@ fn classify_json(
 /// tree-sitter-python.
 fn classify_python(
     kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
+    parent: Option<&str>,
+    field: Option<&str>,
 ) -> Option<HighlightCategory> {
     use HighlightCategory::*;
+    if kind == "identifier" {
+        match (parent, field) {
+            (Some("function_definition"), Some("name")) => return Some(Function),
+            (Some("class_definition"), Some("name")) => return Some(Type),
+            (Some("call"), Some("function")) => return Some(Function),
+            (Some("decorator"), _) => return Some(Function),
+            _ => {}
+        }
+    }
     match kind {
         "comment" => Some(Comment),
         "string" | "string_start" | "string_end" | "string_content" | "escape_sequence" => {
@@ -367,12 +388,16 @@ fn classify_python(
 }
 
 /// tree-sitter-go.
-fn classify_go(
-    kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_go(kind: &str, parent: Option<&str>, field: Option<&str>) -> Option<HighlightCategory> {
     use HighlightCategory::*;
+    if matches!(kind, "identifier" | "field_identifier") {
+        match (parent, field) {
+            (Some("function_declaration"), Some("name")) => return Some(Function),
+            (Some("method_declaration"), Some("name")) => return Some(Function),
+            (Some("call_expression"), Some("function")) => return Some(Function),
+            _ => {}
+        }
+    }
     match kind {
         "comment" => Some(Comment),
         "interpreted_string_literal" | "raw_string_literal" | "rune_literal" => Some(StringLit),
@@ -387,12 +412,15 @@ fn classify_go(
 }
 
 /// tree-sitter-c.
-fn classify_c(
-    kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_c(kind: &str, parent: Option<&str>, field: Option<&str>) -> Option<HighlightCategory> {
     use HighlightCategory::*;
+    if kind == "identifier" {
+        match (parent, field) {
+            (Some("call_expression"), Some("function")) => return Some(Function),
+            (Some("function_declarator"), Some("declarator")) => return Some(Function),
+            _ => {}
+        }
+    }
     match kind {
         "comment" => Some(Comment),
         "string_literal" | "char_literal" | "system_lib_string" => Some(StringLit),
@@ -454,10 +482,20 @@ fn classify_yaml(
 /// tree-sitter-dart.
 fn classify_dart(
     kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
+    parent: Option<&str>,
+    field: Option<&str>,
 ) -> Option<HighlightCategory> {
     use HighlightCategory::*;
+    if kind == "identifier" {
+        match (parent, field) {
+            (Some("function_signature"), Some("name"))
+            | (Some("method_signature"), Some("name"))
+            | (Some("getter_signature"), Some("name"))
+            | (Some("setter_signature"), Some("name")) => return Some(Function),
+            (Some("class_definition"), Some("name")) => return Some(Type),
+            _ => {}
+        }
+    }
     match kind {
         "comment" | "documentation_comment" | "line_comment" | "block_comment" => Some(Comment),
         "string_literal" | "raw_string_literal" | "template_string_literal" => Some(StringLit),
@@ -508,6 +546,68 @@ fn classify_markdown(
         | "thematic_break" => Some(Punctuation),
         "link_destination" | "link_label" | "uri_autolink" => Some(StringLit),
         "html_block" | "html_tag" => Some(Comment),
+        _ => None,
+    }
+}
+
+/// tree-sitter-bash.
+fn classify_bash(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        "string" | "raw_string" | "ansi_c_string" | "heredoc_body" => Some(StringLit),
+        "number" => Some(Number),
+        "variable_name" | "simple_expansion" => Some(Type),
+        "function_definition" | "command_name" => Some(Function),
+        "if" | "then" | "elif" | "else" | "fi" | "for" | "while" | "until" | "do" | "done"
+        | "case" | "esac" | "in" | "function" | "return" | "break" | "continue" | "local"
+        | "readonly" | "declare" | "export" | "unset" | "true" | "false" => Some(Keyword),
+        _ => None,
+    }
+}
+
+/// tree-sitter-lua.
+fn classify_lua(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        "string" => Some(StringLit),
+        "number" => Some(Number),
+        "and" | "break" | "do" | "else" | "elseif" | "end" | "false" | "for" | "function"
+        | "goto" | "if" | "in" | "local" | "nil" | "not" | "or" | "repeat" | "return" | "then"
+        | "true" | "until" | "while" => Some(Keyword),
+        _ => None,
+    }
+}
+
+/// tree-sitter-ruby.
+fn classify_ruby(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        "string" | "string_content" | "string_array" | "symbol_array" | "heredoc_body" => {
+            Some(StringLit)
+        }
+        "integer" | "float" => Some(Number),
+        "constant" => Some(Type),
+        "simple_symbol" | "delimited_symbol" => Some(Function),
+        "def" | "class" | "module" | "if" | "elsif" | "else" | "unless" | "while" | "until"
+        | "for" | "in" | "do" | "end" | "begin" | "rescue" | "ensure" | "raise" | "return"
+        | "break" | "next" | "redo" | "retry" | "yield" | "true" | "false" | "nil" | "self"
+        | "and" | "or" | "not" | "case" | "when" | "then" | "require" | "require_relative"
+        | "lambda" | "proc" => Some(Keyword),
         _ => None,
     }
 }
@@ -807,6 +907,57 @@ fn x() {}
         assert!(hs
             .iter()
             .any(|h| h.category == HighlightCategory::Punctuation));
+    }
+
+    #[test]
+    fn python_highlights_function_definition_name() {
+        let src = "def hello():\n    pass\n";
+        let hs = highlights_of(Language::Python, src);
+        assert!(hs.iter().any(|h| h.category == HighlightCategory::Function));
+    }
+
+    #[test]
+    fn go_highlights_function_declaration_name() {
+        let src = "package main\nfunc hello() {}\n";
+        let hs = highlights_of(Language::Go, src);
+        assert!(hs.iter().any(|h| h.category == HighlightCategory::Function));
+    }
+
+    #[test]
+    fn c_highlights_call_function() {
+        let src = "int main() { printf(\"hi\"); return 0; }";
+        let hs = highlights_of(Language::C, src);
+        assert!(hs.iter().any(|h| h.category == HighlightCategory::Function));
+    }
+
+    #[test]
+    fn bash_highlights_keywords_and_string() {
+        let src = "if [ -f x ]; then\n  echo \"hi\"\nfi\n";
+        let hs = highlights_of(Language::Bash, src);
+        assert!(hs.iter().any(|h| h.category == HighlightCategory::Keyword));
+        assert!(hs
+            .iter()
+            .any(|h| h.category == HighlightCategory::StringLit));
+    }
+
+    #[test]
+    fn lua_highlights_function_and_string() {
+        let src = "local function greet(n)\n  return \"hi \" .. n\nend\n";
+        let hs = highlights_of(Language::Lua, src);
+        assert!(hs.iter().any(|h| h.category == HighlightCategory::Keyword));
+        assert!(hs
+            .iter()
+            .any(|h| h.category == HighlightCategory::StringLit));
+    }
+
+    #[test]
+    fn ruby_highlights_def_and_string() {
+        let src = "def greet(name)\n  puts \"hi #{name}\"\nend\n";
+        let hs = highlights_of(Language::Ruby, src);
+        assert!(hs.iter().any(|h| h.category == HighlightCategory::Keyword));
+        assert!(hs
+            .iter()
+            .any(|h| h.category == HighlightCategory::StringLit));
     }
 
     #[test]
