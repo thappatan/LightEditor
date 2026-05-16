@@ -1,0 +1,40 @@
+# Tokyo Night — Folke Lemaitre's modern dark
+# https://github.com/folke/tokyonight.nvim
+
+[editor]
+background           = "#1a1b26"
+text_fg              = "#c0caf5"
+caret                = "#c0caf5"
+selection_bg         = "#33467c80"
+active_line_bg       = "#292e4280"
+
+gutter_bg            = "#16161e"
+gutter_fg            = "#3b4261"
+gutter_active_fg     = "#c0caf5"
+
+tab_bar_bg           = "#13141a"
+tab_active_bg        = "#1f2335"
+tab_inactive_bg      = "#1a1b26"
+tab_separator        = "#292e42"
+tab_label_fg         = "#a9b1d6"
+close_button         = "#565f89"
+
+status_bg            = "#16161e"
+status_fg            = "#737aa2"
+
+overlay_bg           = "#1f2335f5"
+overlay_scrim        = "#0000008a"
+palette_selection_bg = "#7aa2f750"
+
+find_match_bg        = "#e0af6850"
+indent_guide         = "#3b4261c0"
+bracket_match        = "#7aa2f733"
+
+[syntax]
+keyword     = "#bb9af7"  # purple
+string      = "#9ece6a"  # green
+number      = "#ff9e64"  # orange
+comment     = "#565f89"
+type        = "#2ac3de"  # cyan
+function    = "#7aa2f7"  # blue
+punctuation = "#89ddff"  # light cyan

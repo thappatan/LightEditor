@@ -1,0 +1,39 @@
+# Monokai — Wimer Hazenberg's classic, popularised by TextMate / Sublime.
+
+[editor]
+background           = "#272822"
+text_fg              = "#f8f8f2"
+caret                = "#f8f8f0"
+selection_bg         = "#49483e80"
+active_line_bg       = "#3e3d3260"
+
+gutter_bg            = "#1e1f1c"
+gutter_fg            = "#90908a"
+gutter_active_fg     = "#f8f8f0"
+
+tab_bar_bg           = "#1e1f1c"
+tab_active_bg        = "#3e3d32"
+tab_inactive_bg      = "#272822"
+tab_separator        = "#414339"
+tab_label_fg         = "#f8f8f0"
+close_button         = "#90908a"
+
+status_bg            = "#1e1f1c"
+status_fg            = "#cfcfc2"
+
+overlay_bg           = "#3e3d32f2"
+overlay_scrim        = "#0000007a"
+palette_selection_bg = "#a6e22e30"
+
+find_match_bg        = "#fd971f30"
+indent_guide         = "#49483ea0"
+bracket_match        = "#66d9ef30"
+
+[syntax]
+keyword     = "#f92672"  # pink
+string      = "#e6db74"  # yellow
+number      = "#ae81ff"  # purple
+comment     = "#75715e"  # gray-green
+type        = "#66d9ef"  # cyan
+function    = "#a6e22e"  # green
+punctuation = "#f8f8f2"  # white

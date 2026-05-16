@@ -1,0 +1,40 @@
+# Solarized Light — Ethan Schoonover
+# https://ethanschoonover.com/solarized/
+
+[editor]
+background           = "#fdf6e3"
+text_fg              = "#657b83"
+caret                = "#586e75"
+selection_bg         = "#eee8d580"
+active_line_bg       = "#eee8d590"
+
+gutter_bg            = "#eee8d5"
+gutter_fg            = "#93a1a1"
+gutter_active_fg     = "#586e75"
+
+tab_bar_bg           = "#eee8d5"
+tab_active_bg        = "#fdf6e3"
+tab_inactive_bg      = "#e6dfc1"
+tab_separator        = "#cdc6ad"
+tab_label_fg         = "#586e75"
+close_button         = "#93a1a1"
+
+status_bg            = "#eee8d5"
+status_fg            = "#586e75"
+
+overlay_bg           = "#eee8d5f5"
+overlay_scrim        = "#3030303a"
+palette_selection_bg = "#268bd230"
+
+find_match_bg        = "#b5890050"
+indent_guide         = "#cdc6adc0"
+bracket_match        = "#268bd226"
+
+[syntax]
+keyword     = "#859900"  # green
+string      = "#2aa198"  # cyan
+number      = "#d33682"  # magenta
+comment     = "#93a1a1"  # base1
+type        = "#b58900"  # yellow
+function    = "#268bd2"  # blue
+punctuation = "#586e75"  # base01

@@ -1,0 +1,40 @@
+# Gruvbox Dark — Pavel Pertsev
+# https://github.com/morhetz/gruvbox
+
+[editor]
+background           = "#282828"
+text_fg              = "#ebdbb2"
+caret                = "#fbf1c7"
+selection_bg         = "#458588a0"
+active_line_bg       = "#3c383680"
+
+gutter_bg            = "#1d2021"
+gutter_fg            = "#928374"
+gutter_active_fg     = "#fbf1c7"
+
+tab_bar_bg           = "#1d2021"
+tab_active_bg        = "#3c3836"
+tab_inactive_bg      = "#282828"
+tab_separator        = "#504945"
+tab_label_fg         = "#ebdbb2"
+close_button         = "#928374"
+
+status_bg            = "#1d2021"
+status_fg            = "#bdae93"
+
+overlay_bg           = "#3c3836f5"
+overlay_scrim        = "#0000007a"
+palette_selection_bg = "#83a59850"
+
+find_match_bg        = "#fabd2f50"
+indent_guide         = "#504945c0"
+bracket_match        = "#fe801930"
+
+[syntax]
+keyword     = "#fb4934"  # red
+string      = "#b8bb26"  # green
+number      = "#d3869b"  # purple
+comment     = "#928374"  # gray
+type        = "#fabd2f"  # yellow
+function    = "#8ec07c"  # aqua
+punctuation = "#83a598"  # blue
