@@ -123,7 +123,14 @@ impl Highlighter {
         let byte_to_char = build_byte_to_char_map(text);
         let classifier = classifier_for(self.lang);
         let mut out = Vec::new();
-        collect(&tree.root_node(), &byte_to_char, classifier, &mut out);
+        collect(
+            &tree.root_node(),
+            None,
+            None,
+            &byte_to_char,
+            classifier,
+            &mut out,
+        );
         out
     }
 }
@@ -149,9 +156,12 @@ fn build_byte_to_char_map(text: &str) -> Vec<usize> {
     map
 }
 
-/// Per-language classifier function pointer. Returns the bucket for a
-/// tree-sitter node kind, or `None` to skip (and recurse into the node).
-type Classifier = fn(&str) -> Option<HighlightCategory>;
+/// Per-language classifier function pointer. The first argument is the
+/// node's kind; the second is the parent's kind (or `None` at root); the
+/// third is the field name the node occupies inside its parent. Returning
+/// `None` falls through to the recursive walk and lets a more specific
+/// child node provide the highlight.
+type Classifier = fn(&str, Option<&str>, Option<&str>) -> Option<HighlightCategory>;
 
 fn classifier_for(lang: Language) -> Classifier {
     match lang {
@@ -169,8 +179,15 @@ fn classifier_for(lang: Language) -> Classifier {
     }
 }
 
-fn collect(node: &Node, byte_to_char: &[usize], classify: Classifier, out: &mut Vec<Highlight>) {
-    if let Some(cat) = classify(node.kind()) {
+fn collect(
+    node: &Node,
+    parent_kind: Option<&str>,
+    parent_field: Option<&str>,
+    byte_to_char: &[usize],
+    classify: Classifier,
+    out: &mut Vec<Highlight>,
+) {
+    if let Some(cat) = classify(node.kind(), parent_kind, parent_field) {
         let start = byte_to_char
             .get(node.start_byte())
             .copied()
@@ -186,21 +203,50 @@ fn collect(node: &Node, byte_to_char: &[usize], classify: Classifier, out: &mut 
             });
         }
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect(&child, byte_to_char, classify, out);
+    // Walk children manually so we can pass field-name info downward — the
+    // `children(&mut cursor)` iterator borrows the cursor exclusively which
+    // makes querying `cursor.field_name()` mid-iteration awkward.
+    let this_kind = node.kind();
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i) else {
+            continue;
+        };
+        let field = node.field_name_for_child(i as u32);
+        collect(&child, Some(this_kind), field, byte_to_char, classify, out);
     }
 }
 
 /// tree-sitter-rust. Anonymous keyword nodes carry the keyword text itself
 /// as their `kind()`, which is what powers the long keyword match arm.
-fn classify_rust(kind: &str) -> Option<HighlightCategory> {
+/// Specific context-sensitive cases (function names, macro invocations,
+/// field access, lifetimes) check `parent_kind` / `field` first.
+fn classify_rust(
+    kind: &str,
+    parent: Option<&str>,
+    field: Option<&str>,
+) -> Option<HighlightCategory> {
     use HighlightCategory::*;
+    // Field-specific identifier classifications. Each line is
+    // (parent_kind, field_name) → category.
+    if kind == "identifier" {
+        match (parent, field) {
+            (Some("function_item"), Some("name")) => return Some(Function),
+            (Some("function_signature_item"), Some("name")) => return Some(Function),
+            (Some("call_expression"), Some("function")) => return Some(Function),
+            (Some("macro_invocation"), Some("macro")) => return Some(Function),
+            _ => {}
+        }
+    }
     match kind {
         "line_comment" | "block_comment" => Some(Comment),
         "string_literal" | "raw_string_literal" | "char_literal" => Some(StringLit),
         "integer_literal" | "float_literal" => Some(Number),
         "type_identifier" | "primitive_type" => Some(Type),
+        // Lifetimes — `'a`, `'static`. Distinct enough to colour as Type.
+        "lifetime" => Some(Type),
+        // `obj.field` — colour the field name like punctuation so it sits
+        // between value-loud and keyword-loud.
+        "field_identifier" => Some(Punctuation),
         "fn" | "let" | "mut" | "pub" | "const" | "static" | "use" | "mod" | "struct" | "enum"
         | "impl" | "trait" | "for" | "in" | "if" | "else" | "while" | "loop" | "match"
         | "return" | "break" | "continue" | "as" | "ref" | "self" | "Self" | "true" | "false"
@@ -210,9 +256,25 @@ fn classify_rust(kind: &str) -> Option<HighlightCategory> {
     }
 }
 
-/// tree-sitter-typescript (also serves TSX).
-fn classify_typescript(kind: &str) -> Option<HighlightCategory> {
+/// tree-sitter-typescript (also serves TSX). Function-context identifiers
+/// (function_declaration.name, call_expression.function, method names) get
+/// the Function colour; other identifiers fall through to default text.
+fn classify_typescript(
+    kind: &str,
+    parent: Option<&str>,
+    field: Option<&str>,
+) -> Option<HighlightCategory> {
     use HighlightCategory::*;
+    if kind == "identifier" || kind == "property_identifier" {
+        match (parent, field) {
+            (Some("function_declaration"), Some("name"))
+            | (Some("function_signature"), Some("name"))
+            | (Some("method_definition"), Some("name"))
+            | (Some("method_signature"), Some("name")) => return Some(Function),
+            (Some("call_expression"), Some("function")) => return Some(Function),
+            _ => {}
+        }
+    }
     match kind {
         "comment" => Some(Comment),
         "string" | "string_fragment" | "template_string" | "regex" | "regex_pattern" => {
@@ -232,9 +294,22 @@ fn classify_typescript(kind: &str) -> Option<HighlightCategory> {
     }
 }
 
-/// tree-sitter-javascript — superset minus the TS-only keywords.
-fn classify_javascript(kind: &str) -> Option<HighlightCategory> {
+/// tree-sitter-javascript — same context-sensitive function rules as TS
+/// minus the TS-only keywords.
+fn classify_javascript(
+    kind: &str,
+    parent: Option<&str>,
+    field: Option<&str>,
+) -> Option<HighlightCategory> {
     use HighlightCategory::*;
+    if kind == "identifier" || kind == "property_identifier" {
+        match (parent, field) {
+            (Some("function_declaration"), Some("name"))
+            | (Some("method_definition"), Some("name")) => return Some(Function),
+            (Some("call_expression"), Some("function")) => return Some(Function),
+            _ => {}
+        }
+    }
     match kind {
         "comment" => Some(Comment),
         "string" | "string_fragment" | "template_string" | "regex" | "regex_pattern" => {
@@ -253,7 +328,11 @@ fn classify_javascript(kind: &str) -> Option<HighlightCategory> {
 }
 
 /// tree-sitter-json — small grammar, four buckets.
-fn classify_json(kind: &str) -> Option<HighlightCategory> {
+fn classify_json(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
     use HighlightCategory::*;
     match kind {
         "comment" => Some(Comment),
@@ -265,7 +344,11 @@ fn classify_json(kind: &str) -> Option<HighlightCategory> {
 }
 
 /// tree-sitter-python.
-fn classify_python(kind: &str) -> Option<HighlightCategory> {
+fn classify_python(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
     use HighlightCategory::*;
     match kind {
         "comment" => Some(Comment),
@@ -284,7 +367,11 @@ fn classify_python(kind: &str) -> Option<HighlightCategory> {
 }
 
 /// tree-sitter-go.
-fn classify_go(kind: &str) -> Option<HighlightCategory> {
+fn classify_go(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
     use HighlightCategory::*;
     match kind {
         "comment" => Some(Comment),
@@ -300,7 +387,11 @@ fn classify_go(kind: &str) -> Option<HighlightCategory> {
 }
 
 /// tree-sitter-c.
-fn classify_c(kind: &str) -> Option<HighlightCategory> {
+fn classify_c(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
     use HighlightCategory::*;
     match kind {
         "comment" => Some(Comment),
@@ -317,7 +408,11 @@ fn classify_c(kind: &str) -> Option<HighlightCategory> {
 }
 
 /// tree-sitter-toml-ng.
-fn classify_toml(kind: &str) -> Option<HighlightCategory> {
+fn classify_toml(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
     use HighlightCategory::*;
     match kind {
         "comment" => Some(Comment),
@@ -335,7 +430,11 @@ fn classify_toml(kind: &str) -> Option<HighlightCategory> {
 }
 
 /// tree-sitter-yaml.
-fn classify_yaml(kind: &str) -> Option<HighlightCategory> {
+fn classify_yaml(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
     use HighlightCategory::*;
     match kind {
         "comment" => Some(Comment),
@@ -353,7 +452,11 @@ fn classify_yaml(kind: &str) -> Option<HighlightCategory> {
 }
 
 /// tree-sitter-dart.
-fn classify_dart(kind: &str) -> Option<HighlightCategory> {
+fn classify_dart(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
     use HighlightCategory::*;
     match kind {
         "comment" | "documentation_comment" | "line_comment" | "block_comment" => Some(Comment),
@@ -377,7 +480,11 @@ fn classify_dart(kind: &str) -> Option<HighlightCategory> {
 
 /// tree-sitter-md (CommonMark). Block-structure grammar — we surface the
 /// leaf markers and code spans, treat headings as keywords.
-fn classify_markdown(kind: &str) -> Option<HighlightCategory> {
+fn classify_markdown(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
     use HighlightCategory::*;
     match kind {
         "atx_h1_marker"
@@ -645,6 +752,68 @@ fn x() {}
             }
         }
         walk(tree.root_node(), 0);
+    }
+
+    fn highlights_of(lang: Language, text: &str) -> Vec<Highlight> {
+        let mut h = Highlighter::new(lang).expect("grammar");
+        h.highlight(text)
+    }
+
+    #[test]
+    fn rust_highlights_function_name_and_call() {
+        let src = "fn hello() {}\nfn main() { hello(); }\n";
+        let hs = highlights_of(Language::Rust, src);
+        let func_ranges: Vec<_> = hs
+            .iter()
+            .filter(|h| h.category == HighlightCategory::Function)
+            .map(|h| h.range.clone())
+            .collect();
+        // Expect at least three function highlights: `hello` (def),
+        // `main` (def), `hello` (call).
+        assert!(
+            func_ranges.len() >= 3,
+            "expected >=3 function highlights, got {:?}",
+            func_ranges
+        );
+    }
+
+    #[test]
+    fn rust_highlights_macro_invocation() {
+        let src = "fn x() { println!(\"hi\"); }";
+        let hs = highlights_of(Language::Rust, src);
+        // `println` should be a Function highlight via macro_invocation.macro.
+        assert!(hs.iter().any(|h| h.category == HighlightCategory::Function));
+    }
+
+    #[test]
+    fn rust_highlights_lifetime() {
+        let src = "fn x<'a>(s: &'a str) {}";
+        let hs = highlights_of(Language::Rust, src);
+        // Two `'a` lifetimes appear (declaration + reference).
+        let lifetime_count = hs
+            .iter()
+            .filter(|h| h.category == HighlightCategory::Type)
+            .count();
+        assert!(
+            lifetime_count >= 2,
+            "expected at least 2 type/lifetime tokens"
+        );
+    }
+
+    #[test]
+    fn rust_highlights_field_access() {
+        let src = "fn x(p: Foo) { p.bar }";
+        let hs = highlights_of(Language::Rust, src);
+        assert!(hs
+            .iter()
+            .any(|h| h.category == HighlightCategory::Punctuation));
+    }
+
+    #[test]
+    fn typescript_highlights_function_declaration_name() {
+        let src = "function greet() { return 1; }";
+        let hs = highlights_of(Language::TypeScript, src);
+        assert!(hs.iter().any(|h| h.category == HighlightCategory::Function));
     }
 
     #[test]
