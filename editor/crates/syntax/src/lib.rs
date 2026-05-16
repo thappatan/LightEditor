@@ -15,10 +15,19 @@ use std::path::Path;
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 /// Languages we have a grammar for. New entries plug into `for_path`,
-/// `ts_language`, and a matching `classify_*` function.
+/// `ts_language`, and the per-language `classify_*` function selected by
+/// `Highlighter::highlight`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
+    TypeScript,
+    Tsx,
+    JavaScript,
+    Json,
+    Python,
+    Go,
+    C,
+    Markdown,
 }
 
 impl Language {
@@ -28,6 +37,14 @@ impl Language {
         let ext = path.extension()?.to_str()?;
         match ext.to_ascii_lowercase().as_str() {
             "rs" => Some(Language::Rust),
+            "ts" => Some(Language::TypeScript),
+            "tsx" => Some(Language::Tsx),
+            "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
+            "json" => Some(Language::Json),
+            "py" | "pyi" => Some(Language::Python),
+            "go" => Some(Language::Go),
+            "c" | "h" => Some(Language::C),
+            "md" | "markdown" => Some(Language::Markdown),
             _ => None,
         }
     }
@@ -35,6 +52,14 @@ impl Language {
     fn ts_language(self) -> TsLanguage {
         match self {
             Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Language::Json => tree_sitter_json::LANGUAGE.into(),
+            Language::Python => tree_sitter_python::LANGUAGE.into(),
+            Language::Go => tree_sitter_go::LANGUAGE.into(),
+            Language::C => tree_sitter_c::LANGUAGE.into(),
+            Language::Markdown => tree_sitter_md::LANGUAGE.into(),
         }
     }
 }
@@ -64,6 +89,7 @@ pub struct Highlight {
 /// text every call — incremental parsing via stored old-tree is a follow-up.
 pub struct Highlighter {
     parser: Parser,
+    lang: Language,
 }
 
 impl Highlighter {
@@ -72,7 +98,7 @@ impl Highlighter {
     pub fn new(lang: Language) -> Result<Self, tree_sitter::LanguageError> {
         let mut parser = Parser::new();
         parser.set_language(&lang.ts_language())?;
-        Ok(Self { parser })
+        Ok(Self { parser, lang })
     }
 
     /// Parse `text` and return every interesting leaf node as a `Highlight`.
@@ -86,8 +112,9 @@ impl Highlighter {
             return Vec::new();
         };
         let byte_to_char = build_byte_to_char_map(text);
+        let classifier = classifier_for(self.lang);
         let mut out = Vec::new();
-        collect_rust(&tree.root_node(), &byte_to_char, &mut out);
+        collect(&tree.root_node(), &byte_to_char, classifier, &mut out);
         out
     }
 }
@@ -113,8 +140,25 @@ fn build_byte_to_char_map(text: &str) -> Vec<usize> {
     map
 }
 
-fn collect_rust(node: &Node, byte_to_char: &[usize], out: &mut Vec<Highlight>) {
-    if let Some(cat) = classify_rust(node.kind()) {
+/// Per-language classifier function pointer. Returns the bucket for a
+/// tree-sitter node kind, or `None` to skip (and recurse into the node).
+type Classifier = fn(&str) -> Option<HighlightCategory>;
+
+fn classifier_for(lang: Language) -> Classifier {
+    match lang {
+        Language::Rust => classify_rust,
+        Language::TypeScript | Language::Tsx => classify_typescript,
+        Language::JavaScript => classify_javascript,
+        Language::Json => classify_json,
+        Language::Python => classify_python,
+        Language::Go => classify_go,
+        Language::C => classify_c,
+        Language::Markdown => classify_markdown,
+    }
+}
+
+fn collect(node: &Node, byte_to_char: &[usize], classify: Classifier, out: &mut Vec<Highlight>) {
+    if let Some(cat) = classify(node.kind()) {
         let start = byte_to_char
             .get(node.start_byte())
             .copied()
@@ -132,13 +176,12 @@ fn collect_rust(node: &Node, byte_to_char: &[usize], out: &mut Vec<Highlight>) {
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_rust(&child, byte_to_char, out);
+        collect(&child, byte_to_char, classify, out);
     }
 }
 
-/// Map tree-sitter-rust node kinds onto our coarse categories. Anonymous
-/// keyword nodes carry the keyword text itself as their `kind()`, which is
-/// what powers the long match arm.
+/// tree-sitter-rust. Anonymous keyword nodes carry the keyword text itself
+/// as their `kind()`, which is what powers the long keyword match arm.
 fn classify_rust(kind: &str) -> Option<HighlightCategory> {
     use HighlightCategory::*;
     match kind {
@@ -151,6 +194,142 @@ fn classify_rust(kind: &str) -> Option<HighlightCategory> {
         | "return" | "break" | "continue" | "as" | "ref" | "self" | "Self" | "true" | "false"
         | "where" | "async" | "await" | "move" | "type" | "extern" | "crate" | "dyn" | "unsafe"
         | "yield" => Some(Keyword),
+        _ => None,
+    }
+}
+
+/// tree-sitter-typescript (also serves TSX).
+fn classify_typescript(kind: &str) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        "string" | "string_fragment" | "template_string" | "regex" | "regex_pattern" => {
+            Some(StringLit)
+        }
+        "number" => Some(Number),
+        "type_identifier" | "predefined_type" => Some(Type),
+        "const" | "let" | "var" | "function" | "class" | "interface" | "type" | "enum"
+        | "namespace" | "module" | "if" | "else" | "return" | "for" | "while" | "do" | "switch"
+        | "case" | "default" | "break" | "continue" | "throw" | "try" | "catch" | "finally"
+        | "import" | "from" | "export" | "as" | "extends" | "implements" | "new" | "this"
+        | "super" | "in" | "of" | "typeof" | "instanceof" | "void" | "delete" | "yield"
+        | "async" | "await" | "true" | "false" | "null" | "undefined" | "static" | "public"
+        | "private" | "protected" | "readonly" | "abstract" | "declare" | "satisfies" | "keyof"
+        | "infer" | "is" | "asserts" => Some(Keyword),
+        _ => None,
+    }
+}
+
+/// tree-sitter-javascript — superset minus the TS-only keywords.
+fn classify_javascript(kind: &str) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        "string" | "string_fragment" | "template_string" | "regex" | "regex_pattern" => {
+            Some(StringLit)
+        }
+        "number" => Some(Number),
+        "const" | "let" | "var" | "function" | "class" | "if" | "else" | "return" | "for"
+        | "while" | "do" | "switch" | "case" | "default" | "break" | "continue" | "throw"
+        | "try" | "catch" | "finally" | "import" | "from" | "export" | "as" | "extends" | "new"
+        | "this" | "super" | "in" | "of" | "typeof" | "instanceof" | "void" | "delete"
+        | "yield" | "async" | "await" | "true" | "false" | "null" | "undefined" | "static" => {
+            Some(Keyword)
+        }
+        _ => None,
+    }
+}
+
+/// tree-sitter-json — small grammar, four buckets.
+fn classify_json(kind: &str) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        "string" | "string_content" => Some(StringLit),
+        "number" => Some(Number),
+        "true" | "false" | "null" => Some(Keyword),
+        _ => None,
+    }
+}
+
+/// tree-sitter-python.
+fn classify_python(kind: &str) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        "string" | "string_start" | "string_end" | "string_content" | "escape_sequence" => {
+            Some(StringLit)
+        }
+        "integer" | "float" => Some(Number),
+        "type" => Some(Type),
+        "def" | "class" | "if" | "elif" | "else" | "while" | "for" | "in" | "not" | "and"
+        | "or" | "is" | "return" | "import" | "from" | "as" | "try" | "except" | "finally"
+        | "raise" | "pass" | "break" | "continue" | "lambda" | "yield" | "async" | "await"
+        | "with" | "True" | "False" | "None" | "global" | "nonlocal" | "assert" | "del"
+        | "match" | "case" => Some(Keyword),
+        _ => None,
+    }
+}
+
+/// tree-sitter-go.
+fn classify_go(kind: &str) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        "interpreted_string_literal" | "raw_string_literal" | "rune_literal" => Some(StringLit),
+        "int_literal" | "float_literal" | "imaginary_literal" => Some(Number),
+        "type_identifier" | "predeclared_type" => Some(Type),
+        "func" | "var" | "const" | "type" | "struct" | "interface" | "if" | "else" | "for"
+        | "range" | "switch" | "case" | "default" | "break" | "continue" | "return" | "go"
+        | "defer" | "select" | "chan" | "package" | "import" | "map" | "true" | "false" | "nil"
+        | "fallthrough" | "goto" => Some(Keyword),
+        _ => None,
+    }
+}
+
+/// tree-sitter-c.
+fn classify_c(kind: &str) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        "string_literal" | "char_literal" | "system_lib_string" => Some(StringLit),
+        "number_literal" => Some(Number),
+        "primitive_type" | "type_identifier" | "sized_type_specifier" => Some(Type),
+        "int" | "char" | "float" | "double" | "void" | "long" | "short" | "unsigned" | "signed"
+        | "const" | "static" | "extern" | "auto" | "register" | "volatile" | "if" | "else"
+        | "for" | "while" | "do" | "switch" | "case" | "default" | "break" | "continue"
+        | "return" | "goto" | "sizeof" | "typedef" | "struct" | "union" | "enum" | "inline"
+        | "restrict" | "_Atomic" | "_Bool" | "true" | "false" | "NULL" => Some(Keyword),
+        _ => None,
+    }
+}
+
+/// tree-sitter-md (CommonMark). Block-structure grammar — we surface the
+/// leaf markers and code spans, treat headings as keywords.
+fn classify_markdown(kind: &str) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "atx_h1_marker"
+        | "atx_h2_marker"
+        | "atx_h3_marker"
+        | "atx_h4_marker"
+        | "atx_h5_marker"
+        | "atx_h6_marker"
+        | "setext_h1_underline"
+        | "setext_h2_underline" => Some(Keyword),
+        "code_fence_content" | "fenced_code_block" | "indented_code_block" | "code_span" => {
+            Some(StringLit)
+        }
+        "info_string" => Some(Type),
+        "list_marker_minus"
+        | "list_marker_plus"
+        | "list_marker_star"
+        | "list_marker_dot"
+        | "list_marker_parenthesis"
+        | "block_quote_marker"
+        | "thematic_break" => Some(Punctuation),
+        "link_destination" | "link_label" | "uri_autolink" => Some(StringLit),
+        "html_block" | "html_tag" => Some(Comment),
         _ => None,
     }
 }
@@ -225,6 +404,135 @@ fn x() {}
         assert!(comment.range.start < total_chars);
         assert!(comment.range.end <= total_chars);
         assert!(comment.range.end > comment.range.start);
+    }
+
+    fn categories_with(lang: Language, text: &str) -> Vec<HighlightCategory> {
+        let mut h = Highlighter::new(lang).expect("grammar");
+        h.highlight(text).into_iter().map(|h| h.category).collect()
+    }
+
+    #[test]
+    fn for_path_recognizes_every_language() {
+        let cases = [
+            ("a.rs", Language::Rust),
+            ("a.ts", Language::TypeScript),
+            ("a.tsx", Language::Tsx),
+            ("a.js", Language::JavaScript),
+            ("a.jsx", Language::JavaScript),
+            ("a.mjs", Language::JavaScript),
+            ("a.json", Language::Json),
+            ("a.py", Language::Python),
+            ("a.go", Language::Go),
+            ("a.c", Language::C),
+            ("a.h", Language::C),
+            ("a.md", Language::Markdown),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                Language::for_path(Path::new(name)),
+                Some(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_highlights_keywords_and_types() {
+        let cats = categories_with(
+            Language::TypeScript,
+            "const x: number = 1;\ninterface A {}\n",
+        );
+        assert!(cats.contains(&HighlightCategory::Keyword));
+        assert!(cats.contains(&HighlightCategory::Number));
+        // `number` is a predefined_type
+        assert!(cats.contains(&HighlightCategory::Type));
+    }
+
+    #[test]
+    fn tsx_uses_typescript_classifier() {
+        let cats = categories_with(Language::Tsx, "const x = <div>hi</div>;");
+        assert!(cats.contains(&HighlightCategory::Keyword));
+    }
+
+    #[test]
+    fn javascript_highlights_keywords() {
+        let cats = categories_with(Language::JavaScript, "let x = 1;\nfunction f() {}\n");
+        assert!(cats.contains(&HighlightCategory::Keyword));
+        assert!(cats.contains(&HighlightCategory::Number));
+    }
+
+    #[test]
+    fn json_highlights_string_and_bool() {
+        let cats = categories_with(Language::Json, r#"{"a": "hello", "b": true, "c": 42}"#);
+        assert!(cats.contains(&HighlightCategory::StringLit));
+        assert!(cats.contains(&HighlightCategory::Keyword)); // true
+        assert!(cats.contains(&HighlightCategory::Number));
+    }
+
+    #[test]
+    fn python_highlights_def_and_string() {
+        let cats = categories_with(Language::Python, "def hello():\n    return \"world\"\n");
+        assert!(cats.contains(&HighlightCategory::Keyword));
+        assert!(cats.contains(&HighlightCategory::StringLit));
+    }
+
+    #[test]
+    fn go_highlights_func_and_types() {
+        let cats = categories_with(
+            Language::Go,
+            "package main\nfunc main() { var x int = 1 }\n",
+        );
+        assert!(cats.contains(&HighlightCategory::Keyword));
+        assert!(cats.contains(&HighlightCategory::Type));
+        assert!(cats.contains(&HighlightCategory::Number));
+    }
+
+    #[test]
+    fn c_highlights_primitives_and_keywords() {
+        let cats = categories_with(Language::C, "int main() { return 0; }\n");
+        assert!(cats.contains(&HighlightCategory::Type));
+        assert!(cats.contains(&HighlightCategory::Keyword));
+        assert!(cats.contains(&HighlightCategory::Number));
+    }
+
+    #[test]
+    fn markdown_highlights_headings() {
+        let cats = categories_with(Language::Markdown, "# Title\n\nsome text\n");
+        // atx_h1_marker → Keyword
+        assert!(cats.contains(&HighlightCategory::Keyword));
+    }
+
+    #[test]
+    fn markdown_recognises_list_markers() {
+        let cats = categories_with(Language::Markdown, "- a\n- b\n");
+        // list_marker_minus → Punctuation
+        assert!(cats.contains(&HighlightCategory::Punctuation));
+    }
+
+    /// Walk the tree of a code-fenced Markdown sample and dump every node
+    /// kind. Useful when wiring more markdown nodes into the classifier —
+    /// kept as a `#[ignore]`d test so it doesn't run in CI but stays
+    /// runnable on demand with `cargo test -- --ignored md_node_kinds`.
+    #[test]
+    #[ignore]
+    fn md_node_kinds_dump() {
+        use tree_sitter::Parser;
+        let mut p = Parser::new();
+        p.set_language(&Language::Markdown.ts_language()).unwrap();
+        let tree = p
+            .parse("# h\n\n`x`\n\n```rust\nfn x(){}\n```\n", None)
+            .unwrap();
+        fn walk(n: tree_sitter::Node, depth: usize) {
+            for _ in 0..depth {
+                print!("  ");
+            }
+            println!("{} [{}..{}]", n.kind(), n.start_byte(), n.end_byte());
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                walk(child, depth + 1);
+            }
+        }
+        walk(tree.root_node(), 0);
     }
 
     #[test]
