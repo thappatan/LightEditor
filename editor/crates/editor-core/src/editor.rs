@@ -214,6 +214,211 @@ impl Editor {
         });
     }
 
+    /// Delete every logical line touched by any selection, plus its
+    /// trailing newline. Multi-cursor aware via `edit_ranges`. The cursor
+    /// collapses to the line that took the deleted line's place.
+    pub fn delete_line(&mut self) {
+        self.edit_ranges(|sel, ed| {
+            let start_line = ed.buffer.char_to_position(sel.start()).line;
+            let end_line = ed.buffer.char_to_position(sel.end()).line;
+            let start = ed
+                .buffer
+                .position_to_char(Position::new(start_line, 0))
+                .unwrap_or(sel.start());
+            let line_start = ed
+                .buffer
+                .position_to_char(Position::new(end_line, 0))
+                .unwrap_or(sel.end());
+            let line_len = ed.buffer.line_len_chars(end_line).unwrap_or(0);
+            let end = (line_start + line_len).min(ed.buffer.len_chars());
+            start..end
+        });
+    }
+
+    /// Prepend `indent` to each line the primary selection touches. A
+    /// selection ending exactly at column 0 of a line excludes that line
+    /// (so the last "anchor" line isn't dragged into the indent). Multi-
+    /// cursor edits on the *same* line are not supported in v1 — the
+    /// primary's selection drives the range.
+    pub fn indent_lines(&mut self, indent: &str) {
+        let primary = self.selections.primary();
+        let (start_line, end_line) = self.line_range_for_selection(&primary);
+        if end_line < start_line {
+            return;
+        }
+        let indent_len = indent.chars().count();
+        let mut anchor = primary.anchor;
+        let mut head = primary.head;
+        for line in (start_line..=end_line).rev() {
+            let Some(line_start) = self.buffer.position_to_char(Position::new(line, 0)) else {
+                continue;
+            };
+            self.buffer.insert(line_start, indent);
+            if anchor >= line_start {
+                anchor += indent_len;
+            }
+            if head >= line_start {
+                head += indent_len;
+            }
+        }
+        self.selections = SelectionSet::single(Selection::new(anchor, head));
+        self.commit();
+    }
+
+    /// Remove up to `max_spaces` leading spaces (or a single leading tab)
+    /// from each line touched by the primary selection.
+    pub fn outdent_lines(&mut self, max_spaces: usize) {
+        let primary = self.selections.primary();
+        let (start_line, end_line) = self.line_range_for_selection(&primary);
+        if end_line < start_line {
+            return;
+        }
+        let mut anchor = primary.anchor;
+        let mut head = primary.head;
+        for line in (start_line..=end_line).rev() {
+            let Some(line_text) = self.buffer.line(line) else {
+                continue;
+            };
+            let mut to_remove = 0;
+            for c in line_text.chars().take(max_spaces) {
+                if c == ' ' {
+                    to_remove += 1;
+                } else if c == '\t' && to_remove == 0 {
+                    to_remove = 1;
+                    break;
+                } else {
+                    break;
+                }
+            }
+            if to_remove == 0 {
+                continue;
+            }
+            let Some(line_start) = self.buffer.position_to_char(Position::new(line, 0)) else {
+                continue;
+            };
+            self.buffer.remove(line_start..line_start + to_remove);
+            if anchor > line_start {
+                anchor = anchor.saturating_sub(to_remove);
+            }
+            if head > line_start {
+                head = head.saturating_sub(to_remove);
+            }
+        }
+        self.selections = SelectionSet::single(Selection::new(anchor, head));
+        self.commit();
+    }
+
+    /// Toggle a line comment (`prefix + space`) on every line touched by
+    /// the primary selection. If every non-blank line already starts with
+    /// the prefix (after leading whitespace), the prefix is stripped from
+    /// each; otherwise it's added to each. Blank lines are skipped when
+    /// adding so they don't grow ragged trailing markers.
+    pub fn toggle_comment_lines(&mut self, prefix: &str) {
+        let primary = self.selections.primary();
+        let (start_line, end_line) = self.line_range_for_selection(&primary);
+        if end_line < start_line {
+            return;
+        }
+        let payload = format!("{prefix} ");
+        let prefix_chars = prefix.chars().count();
+        let payload_chars = payload.chars().count();
+
+        let all_commented = (start_line..=end_line).all(|line| {
+            let s = self.buffer.line(line).unwrap_or_default();
+            let trimmed = s.trim_start_matches([' ', '\t']);
+            // Blank lines don't count against the "all commented" check.
+            let body = trimmed.trim_end_matches('\n').trim_end_matches('\r');
+            body.is_empty() || body.starts_with(prefix)
+        });
+
+        let mut anchor = primary.anchor;
+        let mut head = primary.head;
+
+        if all_commented {
+            for line in (start_line..=end_line).rev() {
+                let Some(line_text) = self.buffer.line(line) else {
+                    continue;
+                };
+                let leading_ws = line_text
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .count();
+                let line_chars: Vec<char> = line_text.chars().collect();
+                if !line_chars
+                    .iter()
+                    .skip(leading_ws)
+                    .take(prefix_chars)
+                    .copied()
+                    .eq(prefix.chars())
+                {
+                    continue; // line was blank — nothing to strip
+                }
+                let after_prefix = leading_ws + prefix_chars;
+                let extra_space = if line_chars.get(after_prefix) == Some(&' ') {
+                    1
+                } else {
+                    0
+                };
+                let total = prefix_chars + extra_space;
+                let Some(line_start) = self.buffer.position_to_char(Position::new(line, 0)) else {
+                    continue;
+                };
+                let remove_at = line_start + leading_ws;
+                self.buffer.remove(remove_at..remove_at + total);
+                if anchor > remove_at {
+                    anchor = anchor.saturating_sub(total);
+                }
+                if head > remove_at {
+                    head = head.saturating_sub(total);
+                }
+            }
+        } else {
+            for line in (start_line..=end_line).rev() {
+                let Some(line_text) = self.buffer.line(line) else {
+                    continue;
+                };
+                if line_text
+                    .chars()
+                    .all(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r')
+                {
+                    continue; // blank — skip when adding
+                }
+                let leading_ws = line_text
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .count();
+                let Some(line_start) = self.buffer.position_to_char(Position::new(line, 0)) else {
+                    continue;
+                };
+                let insert_at = line_start + leading_ws;
+                self.buffer.insert(insert_at, &payload);
+                if anchor >= insert_at {
+                    anchor += payload_chars;
+                }
+                if head >= insert_at {
+                    head += payload_chars;
+                }
+            }
+        }
+        self.selections = SelectionSet::single(Selection::new(anchor, head));
+        self.commit();
+    }
+
+    /// Range of lines touched by a selection. If the selection ends at
+    /// column 0 of a line and spans more than that one line, that final
+    /// line is excluded — it matches VSCode's "don't drag the cursor's
+    /// landing line into a multi-line operation" intuition.
+    fn line_range_for_selection(&self, sel: &Selection) -> (usize, usize) {
+        let start_line = self.buffer.char_to_position(sel.start()).line;
+        let end_pos = self.buffer.char_to_position(sel.end());
+        let end_line = if end_pos.column == 0 && end_pos.line > start_line {
+            end_pos.line - 1
+        } else {
+            end_pos.line
+        };
+        (start_line, end_line)
+    }
+
     /// Delete from each cursor forward to the end of its current line
     /// (before any trailing newline).
     pub fn delete_to_line_end(&mut self) {
@@ -961,6 +1166,75 @@ mod tests {
         let p = ed.selections().primary();
         assert_eq!(p.anchor, 0);
         assert_eq!(p.head, 5);
+    }
+
+    // ── line operations ───────────────────────────────────────────────────
+
+    #[test]
+    fn delete_line_removes_line_and_trailing_newline() {
+        let mut ed = Editor::from("a\nb\nc\n");
+        ed.set_selection(Selection::cursor(2)); // on line 1 ("b")
+        ed.delete_line();
+        assert_eq!(ed.text(), "a\nc\n");
+    }
+
+    #[test]
+    fn delete_line_removes_every_touched_line() {
+        let mut ed = Editor::from("a\nb\nc\nd\n");
+        // Selection spans lines 1..3 ("b\nc")
+        ed.set_selection(Selection::new(2, 5));
+        ed.delete_line();
+        assert_eq!(ed.text(), "a\nd\n");
+    }
+
+    #[test]
+    fn indent_lines_prepends_to_each_touched_line() {
+        let mut ed = Editor::from("a\nb\nc");
+        ed.set_selection(Selection::new(0, 4)); // spans lines 0..2
+        ed.indent_lines("    ");
+        assert_eq!(ed.text(), "    a\n    b\nc");
+    }
+
+    #[test]
+    fn outdent_lines_strips_leading_spaces() {
+        let mut ed = Editor::from("    a\n    b\nc");
+        ed.set_selection(Selection::new(0, ed.text().chars().count()));
+        ed.outdent_lines(4);
+        assert_eq!(ed.text(), "a\nb\nc");
+    }
+
+    #[test]
+    fn toggle_comment_adds_when_no_line_is_commented() {
+        let mut ed = Editor::from("foo\nbar\n");
+        ed.set_selection(Selection::new(0, ed.text().chars().count()));
+        ed.toggle_comment_lines("//");
+        assert_eq!(ed.text(), "// foo\n// bar\n");
+    }
+
+    #[test]
+    fn toggle_comment_removes_when_every_non_blank_line_is_commented() {
+        let mut ed = Editor::from("// foo\n\n// bar\n");
+        ed.set_selection(Selection::new(0, ed.text().chars().count()));
+        ed.toggle_comment_lines("//");
+        assert_eq!(ed.text(), "foo\n\nbar\n");
+    }
+
+    #[test]
+    fn toggle_comment_preserves_leading_indent() {
+        let mut ed = Editor::from("    foo\n    bar\n");
+        ed.set_selection(Selection::new(0, ed.text().chars().count()));
+        ed.toggle_comment_lines("//");
+        assert_eq!(ed.text(), "    // foo\n    // bar\n");
+    }
+
+    #[test]
+    fn indent_then_outdent_round_trips() {
+        let original = "a\nb\nc";
+        let mut ed = Editor::from(original);
+        ed.set_selection(Selection::new(0, ed.text().chars().count()));
+        ed.indent_lines("  ");
+        ed.outdent_lines(2);
+        assert_eq!(ed.text(), original);
     }
 
     // Test-only helper to seed selection state without going through editing.

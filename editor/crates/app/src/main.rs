@@ -173,6 +173,21 @@ fn language_for(path: Option<&Path>) -> &'static str {
     }
 }
 
+/// Line-comment prefix to use for a file path. Falls back to `//` for
+/// anything outside the small whitelist (covers Rust / TS / Dart / JS / Java
+/// / C / Go style files and a few `#` / `--` languages). A proper
+/// language-config table is a follow-up alongside syntax highlighting.
+fn comment_prefix_for(path: Option<&Path>) -> &'static str {
+    let Some(ext) = path.and_then(|p| p.extension()).and_then(|e| e.to_str()) else {
+        return "//";
+    };
+    match ext.to_ascii_lowercase().as_str() {
+        "py" | "sh" | "bash" | "zsh" | "toml" | "yaml" | "yml" | "rb" => "#",
+        "sql" | "hs" | "elm" | "lua" => "--",
+        _ => "//",
+    }
+}
+
 /// `"LF"` / `"CRLF"` for the buffer's dominant line-ending convention.
 fn line_ending_label(le: LineEnding) -> &'static str {
     match le {
@@ -857,11 +872,41 @@ impl State {
                         return;
                     }
                     "k" => {
-                        self.collapse_selection_to_primary();
+                        if self.modifiers.shift_key() {
+                            self.doc_mut().editor.delete_line();
+                            self.text_dirty = true;
+                            self.scene_dirty = true;
+                            self.follow_caret = true;
+                            self.mark_dirty_if_clean();
+                            self.window.request_redraw();
+                        } else {
+                            self.collapse_selection_to_primary();
+                        }
+                        return;
+                    }
+                    "/" => {
+                        let prefix = comment_prefix_for(self.doc().file_path.as_deref());
+                        self.doc_mut().editor.toggle_comment_lines(prefix);
+                        self.text_dirty = true;
+                        self.scene_dirty = true;
+                        self.follow_caret = true;
+                        self.mark_dirty_if_clean();
+                        self.window.request_redraw();
                         return;
                     }
                     _ => {}
                 }
+            }
+            // Cmd-Enter (with optional Shift) inserts a blank line below /
+            // above. Handled here so the regular Enter handler's auto-indent
+            // doesn't fire instead.
+            if let Key::Named(NamedKey::Enter) = &event.logical_key {
+                if self.modifiers.shift_key() {
+                    self.insert_blank_line_above();
+                } else {
+                    self.insert_blank_line_below();
+                }
+                return;
             }
         }
 
@@ -921,8 +966,23 @@ impl State {
                 true
             }
             Key::Named(NamedKey::Tab) => {
-                let spaces = self.tab_spaces.clone();
-                self.doc_mut().editor.insert(&spaces);
+                let primary = self.doc().editor.selections().primary();
+                let multi_line = !primary.is_cursor() && {
+                    let buf = self.doc().editor.buffer();
+                    let sl = buf.char_to_position(primary.start()).line;
+                    let el = buf.char_to_position(primary.end()).line;
+                    sl != el
+                };
+                if shift {
+                    let indent_size = self.tab_spaces.len().max(1);
+                    self.doc_mut().editor.outdent_lines(indent_size);
+                } else if multi_line {
+                    let spaces = self.tab_spaces.clone();
+                    self.doc_mut().editor.indent_lines(&spaces);
+                } else {
+                    let spaces = self.tab_spaces.clone();
+                    self.doc_mut().editor.insert(&spaces);
+                }
                 true
             }
             Key::Named(NamedKey::ArrowLeft) => {
@@ -1313,6 +1373,74 @@ impl State {
         }
         self.scene_dirty = true;
         self.follow_caret = true;
+        self.window.request_redraw();
+    }
+
+    /// Mark the active document dirty if it wasn't already, and refresh
+    /// the title / tab strip so the "•" indicator appears.
+    fn mark_dirty_if_clean(&mut self) {
+        if !self.doc().dirty {
+            self.doc_mut().dirty = true;
+            self.update_title();
+            self.refresh_tabs_text();
+        }
+    }
+
+    /// Cmd-Enter: insert a blank line below the primary's current line and
+    /// move the caret onto it with the same leading indent.
+    fn insert_blank_line_below(&mut self) {
+        let indent = self.current_line_indent();
+        let head = self.doc().editor.selections().primary().head;
+        let buffer = self.doc().editor.buffer();
+        let line = buffer.char_to_position(head).line;
+        let line_text = buffer.line(line).unwrap_or_default();
+        let content_chars = line_text
+            .trim_end_matches('\n')
+            .trim_end_matches('\r')
+            .chars()
+            .count();
+        let Some(line_end) = buffer.position_to_char(Position::new(line, content_chars)) else {
+            return;
+        };
+        let le = buffer.line_ending().as_str().to_string();
+        self.doc_mut()
+            .editor
+            .set_selection(Selection::cursor(line_end));
+        let payload = format!("{le}{indent}");
+        self.doc_mut().editor.insert(&payload);
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.mark_dirty_if_clean();
+        self.window.request_redraw();
+    }
+
+    /// Cmd-Shift-Enter: insert a blank line above and land the caret on it.
+    fn insert_blank_line_above(&mut self) {
+        let indent = self.current_line_indent();
+        let head = self.doc().editor.selections().primary().head;
+        let buffer = self.doc().editor.buffer();
+        let line = buffer.char_to_position(head).line;
+        let Some(line_start) = buffer.position_to_char(Position::new(line, 0)) else {
+            return;
+        };
+        let le = buffer.line_ending().as_str().to_string();
+        let le_chars = le.chars().count();
+        self.doc_mut()
+            .editor
+            .set_selection(Selection::cursor(line_start));
+        let payload = format!("{indent}{le}");
+        self.doc_mut().editor.insert(&payload);
+        // After insert, caret is past the newline (start of the *original*
+        // line, now shifted down). Step back over the newline so the user
+        // lands on the new blank line, after the indent.
+        for _ in 0..le_chars {
+            self.doc_mut().editor.move_left(false);
+        }
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.mark_dirty_if_clean();
         self.window.request_redraw();
     }
 
