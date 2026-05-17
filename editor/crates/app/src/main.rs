@@ -678,7 +678,14 @@ Click to place the caret; drag to select; wheel to scroll.\n\
 struct State {
     window: Arc<Window>,
     gpu: GpuContext,
+    /// Quads for the editor + chrome layer (selection / carets / gutter
+    /// / tab strip / sidebar / status bar). Drawn first.
     quads: QuadRenderer,
+    /// Quads for the floating-overlay layer (find bar / hover popup /
+    /// completion popup / command palette). Drawn after the main layer
+    /// AND after the main text, so popup backgrounds correctly occlude
+    /// the editor text behind them.
+    overlay_quads: QuadRenderer,
     /// Shared across every `TextStack` (editor, palette, find, tabs, close,
     /// status). `FontSystem::new()` walks the OS font directory once —
     /// ~80ms cold — so building one and lending it out is much cheaper than
@@ -721,8 +728,12 @@ struct State {
     /// reshaping N digits/newlines on every keystroke.
     gutter_lines: usize,
 
-    /// The scene rebuilt from `editor` whenever it changes.
+    /// The scene rebuilt from `editor` whenever it changes — everything
+    /// in the editor / chrome layer.
     scene: Scene,
+    /// Scene for the overlay layer (popups + find bar). Rebuilt
+    /// alongside `scene` so the two stay in sync.
+    overlay_scene: Scene,
 
     /// Window scale factor; physical = logical * scale.
     scale: f32,
@@ -859,6 +870,7 @@ impl State {
         let size = window.inner_size();
         let gpu = GpuContext::new(window.clone());
         let quads = QuadRenderer::new(&gpu.device, gpu.format());
+        let overlay_quads = QuadRenderer::new(&gpu.device, gpu.format());
 
         let font_size_pt = settings.editor.font_size;
         let line_height_pt = settings.editor.line_height;
@@ -972,6 +984,12 @@ impl State {
             size.width as f32,
             size.height as f32,
         )));
+        let overlay_scene = Scene::new(SceneNode::group(Rect::new(
+            0.0,
+            0.0,
+            size.width as f32,
+            size.height as f32,
+        )));
 
         // Hover popup text — same width budget as the find bar for a
         // similar "tight inline tooltip" feel.
@@ -1017,6 +1035,7 @@ impl State {
             window,
             gpu,
             quads,
+            overlay_quads,
             font_system,
             swash_cache,
             text_gpu,
@@ -1030,6 +1049,7 @@ impl State {
             gutter_text,
             gutter_lines: 0,
             scene,
+            overlay_scene,
             scale,
             text_inset_x: gutter_width,
             text_inset_y: (TAB_BAR_HEIGHT_DIP + TEXT_TOP_GAP_DIP) * scale,
@@ -4500,24 +4520,32 @@ impl State {
             quad_color(&et.status_bg),
         ));
 
-        // Find bar panel.
+        self.scene = Scene::new(root);
+        self.rebuild_overlay_scene();
+    }
+
+    /// Rebuild the overlay-layer scene — floating panels that draw on
+    /// top of the editor text (find bar, hover popup, completion
+    /// popup, palette). Kept in a separate `Scene` + `QuadRenderer`
+    /// so the editor text doesn't bleed through the opaque
+    /// `overlay_bg` panels.
+    fn rebuild_overlay_scene(&mut self) {
+        let w = self.gpu.surface_config.width as f32;
+        let h = self.gpu.surface_config.height as f32;
+        let et = self.theme.editor.clone();
+        let mut root = SceneNode::group(Rect::new(0.0, 0.0, w, h));
+
         if self.doc().find.is_some() {
             root.push_child(SceneNode::quad(
                 self.find_panel_rect(),
                 quad_color(&et.overlay_bg),
             ));
         }
-
-        // Hover popup — anchored under the caret. Drawn before the palette
-        // overlay so the palette still wins focus when both are open.
         if self.hover_popup.is_some() {
             if let Some(rect) = self.hover_panel_rect() {
                 root.push_child(SceneNode::quad(rect, quad_color(&et.overlay_bg)));
             }
         }
-
-        // Completion popup — same anchor logic as the hover popup,
-        // plus a selection-row highlight quad.
         if self.completion.is_some() {
             if let Some(rect) = self.completion_panel_rect() {
                 root.push_child(SceneNode::quad(rect, quad_color(&et.overlay_bg)));
@@ -4526,8 +4554,6 @@ impl State {
                 root.push_child(SceneNode::quad(rect, quad_color(&et.palette_selection_bg)));
             }
         }
-
-        // Palette overlay on top of everything else.
         if self.palette.is_some() {
             root.push_child(SceneNode::quad(
                 Rect::new(0.0, 0.0, w, h),
@@ -4545,7 +4571,7 @@ impl State {
             }
         }
 
-        self.scene = Scene::new(root);
+        self.overlay_scene = Scene::new(root);
     }
 
     /// Selection highlight rectangles.
@@ -4732,6 +4758,13 @@ impl State {
             &self.gpu.device,
             &self.gpu.queue,
             &self.scene,
+            self.gpu.surface_config.width as f32,
+            self.gpu.surface_config.height as f32,
+        );
+        self.overlay_quads.prepare(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &self.overlay_scene,
             self.gpu.surface_config.width as f32,
             self.gpu.surface_config.height as f32,
         );
@@ -4962,8 +4995,13 @@ impl State {
             default_color: status_fg,
             custom_glyphs: &[],
         });
+        // ── Overlay-layer text — drawn AFTER the main editor text in
+        // a separate `prepare`/`render` pass so the popups' panel
+        // backgrounds (also overlay-layer quads) correctly occlude
+        // the editor text behind them.
+        let mut overlay_text_areas: Vec<TextArea> = Vec::with_capacity(4);
         if let Some((fx, fy)) = find_xy {
-            text_areas.push(TextArea {
+            overlay_text_areas.push(TextArea {
                 buffer: &self.find_text.buffer,
                 left: fx,
                 top: fy,
@@ -4974,7 +5012,7 @@ impl State {
             });
         }
         if let Some((px, py)) = palette_xy {
-            text_areas.push(TextArea {
+            overlay_text_areas.push(TextArea {
                 buffer: &self.palette_text.buffer,
                 left: px,
                 top: py,
@@ -4985,7 +5023,6 @@ impl State {
             });
         }
         if let Some((hx, hy)) = self.hover_text_origin() {
-            // Clip to the panel rect so long markdown doesn't bleed past.
             let panel = self
                 .hover_panel_rect()
                 .expect("hover_text_origin implies hover_panel_rect");
@@ -4995,7 +5032,7 @@ impl State {
                 right: panel.max_x() as i32,
                 bottom: panel.max_y() as i32,
             };
-            text_areas.push(TextArea {
+            overlay_text_areas.push(TextArea {
                 buffer: &self.hover_text.buffer,
                 left: hx,
                 top: hy,
@@ -5006,10 +5043,6 @@ impl State {
             });
         }
         if let Some((cx, cy)) = self.completion_text_origin() {
-            // The completion_text stack only holds the *visible* rows
-            // (popup.scroll..popup.scroll+max_rows), so no scroll offset
-            // is needed — the buffer's row 0 lines up with the popup's
-            // top row already.
             let panel = self
                 .completion_panel_rect()
                 .expect("completion_text_origin implies completion_panel_rect");
@@ -5019,7 +5052,7 @@ impl State {
                 right: panel.max_x() as i32,
                 bottom: panel.max_y() as i32,
             };
-            text_areas.push(TextArea {
+            overlay_text_areas.push(TextArea {
                 buffer: &self.completion_text.buffer,
                 left: cx,
                 top: cy,
@@ -5043,6 +5076,18 @@ impl State {
                 &mut self.swash_cache,
             )
             .expect("text prepare failed");
+        self.text_gpu
+            .overlay_renderer
+            .prepare(
+                &self.gpu.device,
+                &self.gpu.queue,
+                &mut self.font_system,
+                &mut self.text_gpu.atlas,
+                &self.text_gpu.viewport,
+                overlay_text_areas,
+                &mut self.swash_cache,
+            )
+            .expect("overlay text prepare failed");
         t.text_prepare = frame_start.elapsed();
 
         let Some(frame) = self.gpu.acquire() else {
@@ -5052,7 +5097,7 @@ impl State {
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("clear + carets + text"),
+                label: Some("clear + main + overlay"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -5067,13 +5112,19 @@ impl State {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            // Editor quads first (tab strip backdrops + selection + carets +
-            // overlay panels); then every text region in one render call.
+            // Z-order: main quads → main text → overlay quads → overlay text.
+            // The two-pair structure ensures popup backgrounds occlude
+            // editor text and popup text sits on top of its backdrop.
             self.quads.render(&mut pass);
             self.text_gpu
                 .renderer
                 .render(&self.text_gpu.atlas, &self.text_gpu.viewport, &mut pass)
                 .expect("text render failed");
+            self.overlay_quads.render(&mut pass);
+            self.text_gpu
+                .overlay_renderer
+                .render(&self.text_gpu.atlas, &self.text_gpu.viewport, &mut pass)
+                .expect("overlay text render failed");
         }
         self.gpu.queue.submit(Some(encoder.finish()));
         frame.present();
