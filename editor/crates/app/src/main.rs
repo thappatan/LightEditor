@@ -2212,6 +2212,10 @@ impl State {
         let flash_label = filename_for_flash(&path);
         match std::fs::read_to_string(&path) {
             Ok(content) => {
+                // Always store an absolute path: the LSP layer turns it into
+                // a `file://` URL, which requires absolute, and tools like
+                // rust-analyzer use the URI to anchor workspace lookups.
+                let path = std::fs::canonicalize(&path).unwrap_or(path);
                 let new_doc = Document::from_file(path, &content);
                 if self.doc().is_pristine_scratch() {
                     self.docs[self.active] = new_doc;
@@ -4560,7 +4564,11 @@ fn main() {
         Some(arg) => {
             let path = PathBuf::from(arg);
             match std::fs::read_to_string(&path) {
-                Ok(content) => (content, Some(path)),
+                // Canonicalize so the rest of the app (LSP, file-watcher,
+                // tab labels) deals with an absolute path. file:// URLs
+                // require absolute, and rust-analyzer hangs its workspace
+                // lookup on the URI.
+                Ok(content) => (content, Some(std::fs::canonicalize(&path).unwrap_or(path))),
                 Err(e) => {
                     log::error!("could not read {}: {}", path.display(), e);
                     (WELCOME_TEXT.to_string(), None)

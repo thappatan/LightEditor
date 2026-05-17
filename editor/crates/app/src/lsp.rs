@@ -260,6 +260,11 @@ impl LspState {
     /// isn't an absolute file path (untitled scratch docs).
     pub fn did_open(&mut self, path: &Path, lang: Language, version: i32, text: String) {
         let Some(uri) = path_to_uri(path) else {
+            log::warn!(
+                "LSP: skipping didOpen — path {:?} cannot be turned into a file:// URI \
+                 (relative path? canonicalize before passing in)",
+                path,
+            );
             return;
         };
         let Some(kind) = self.ensure_server(lang, path) else {
