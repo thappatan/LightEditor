@@ -13,12 +13,14 @@
 
 use std::path::{Path, PathBuf};
 
-/// Directories that are uninteresting to a code editor by default. Hard-
-/// coded for v1; surfacing as a setting is a follow-up. Public so the
-/// file-tree watcher in `main.rs` can ignore filesystem churn inside
-/// these dirs (build artifacts, dependency installs, git operations
-/// fire dozens of events a second otherwise).
-pub const HIDDEN_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "build"];
+/// Built-in default hidden-dir list. The user-facing source of truth
+/// is `settings.toml`'s `[file_tree] hidden_dirs = [...]` (see
+/// [`editor_config::FileTreeSettings`]); this constant just keeps
+/// the unit tests' seed list in sync with the config crate's defaults
+/// without taking a dev-dependency on it.
+#[allow(dead_code)]
+pub const DEFAULT_HIDDEN_DIRS: &[&str] =
+    &[".git", "node_modules", "target", ".next", "dist", "build"];
 
 /// One visible row in the sidebar.
 pub struct TreeNode {
@@ -65,14 +67,20 @@ pub struct FileTree {
     /// Vertical scroll position in physical pixels, kept per-tree so the
     /// user's place is preserved across hide/show.
     pub scroll_y: f32,
+    /// Directory names hidden from the listing. Sourced from
+    /// `settings.toml`'s `[file_tree] hidden_dirs = [...]`; defaults
+    /// to [`DEFAULT_HIDDEN_DIRS`] when nothing is set.
+    pub hidden_dirs: Vec<String>,
 }
 
 impl FileTree {
     /// Build a tree rooted at `root` with its top-level entries already
     /// loaded. The sidebar starts hidden — callers flip `visible` when
-    /// the user toggles it (e.g. via Cmd-B).
-    pub fn new(root: PathBuf) -> Self {
-        let nodes = read_children(&root, 0);
+    /// the user toggles it (e.g. via Cmd-B). `hidden_dirs` is the list
+    /// of directory basenames the listing should skip; pass the
+    /// effective `settings.file_tree.hidden_dirs`.
+    pub fn new(root: PathBuf, hidden_dirs: Vec<String>) -> Self {
+        let nodes = read_children(&root, 0, &hidden_dirs);
         Self {
             visible: false,
             focused: false,
@@ -80,6 +88,7 @@ impl FileTree {
             root,
             nodes,
             scroll_y: 0.0,
+            hidden_dirs,
         }
     }
 
@@ -140,7 +149,7 @@ impl FileTree {
     /// [`reload_preserving_expansion`](Self::reload_preserving_expansion).
     #[allow(dead_code)]
     pub fn reload(&mut self) {
-        self.nodes = read_children(&self.root, 0);
+        self.nodes = read_children(&self.root, 0, &self.hidden_dirs);
         self.clamp_selection();
     }
 
@@ -162,7 +171,7 @@ impl FileTree {
             .collect();
 
         // 2. Rebuild from the root's top-level entries.
-        self.nodes = read_children(&self.root, 0);
+        self.nodes = read_children(&self.root, 0, &self.hidden_dirs);
 
         // 3. Walk depth-first re-expanding the dirs we remembered. The
         //    flat-vec layout guarantees parents come before children,
@@ -177,7 +186,7 @@ impl FileTree {
                     self.nodes[i].kind = NodeKind::Directory { expanded: true };
                     let parent_path = self.nodes[i].path.clone();
                     let parent_depth = self.nodes[i].depth;
-                    let children = read_children(&parent_path, parent_depth + 1);
+                    let children = read_children(&parent_path, parent_depth + 1, &self.hidden_dirs);
                     self.nodes.splice(i + 1..i + 1, children);
                 }
             }
@@ -229,7 +238,7 @@ impl FileTree {
         let parent = &self.nodes[idx];
         let parent_path = parent.path.clone();
         let parent_depth = parent.depth;
-        let children = read_children(&parent_path, parent_depth + 1);
+        let children = read_children(&parent_path, parent_depth + 1, &self.hidden_dirs);
         // Splice the children in immediately after the parent — this is
         // why the node list is flat: rendering is then a single linear
         // pass over `self.nodes`.
@@ -259,10 +268,10 @@ pub enum ClickResult {
 }
 
 /// Read directory entries at `dir`, sort directories before files (each
-/// group alphabetical, case-insensitive), and skip the names in
-/// [`HIDDEN_DIRS`]. Errors (permission denied, path gone) return an
+/// group alphabetical, case-insensitive), and skip names in
+/// `hidden_dirs`. Errors (permission denied, path gone) return an
 /// empty vec so the UI degrades gracefully.
-fn read_children(dir: &Path, depth: usize) -> Vec<TreeNode> {
+fn read_children(dir: &Path, depth: usize, hidden_dirs: &[String]) -> Vec<TreeNode> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -270,10 +279,10 @@ fn read_children(dir: &Path, depth: usize) -> Vec<TreeNode> {
         .filter_map(|e| e.ok())
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            // Cheap hardcoded filter — leading dot dirs (other than the
-            // ones we want to surface for config like `.env`) are kept;
-            // only the well-known noisy ones are dropped by name.
-            if HIDDEN_DIRS.contains(&name.as_str()) {
+            // Filter against the user's hidden-dirs list. Leading-dot
+            // dirs that don't appear in the list (`.env`, `.lighteditor`,
+            // …) still show up so config / dotfile workflows work.
+            if hidden_dirs.iter().any(|d| d == &name) {
                 return None;
             }
             let path = entry.path();
@@ -322,6 +331,12 @@ mod tests {
         path
     }
 
+    /// The same list the [`Default`] impl of `FileTreeSettings` uses —
+    /// kept inline so the unit tests don't need a config dep.
+    fn default_hidden() -> Vec<String> {
+        DEFAULT_HIDDEN_DIRS.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn root_lists_entries_sorted_dirs_first() {
         let root = tempdir();
@@ -330,7 +345,7 @@ mod tests {
         std::fs::create_dir(root.join("alpha-dir")).unwrap();
         std::fs::write(root.join("zzz-file.txt"), "").unwrap();
 
-        let tree = FileTree::new(root.clone());
+        let tree = FileTree::new(root.clone(), default_hidden());
         let names: Vec<&str> = tree.nodes.iter().map(|n| n.name.as_str()).collect();
         // dirs (alpha) before files; each group alphabetical
         assert_eq!(
@@ -348,7 +363,7 @@ mod tests {
         std::fs::create_dir(root.join("node_modules")).unwrap();
         std::fs::create_dir(root.join("target")).unwrap();
 
-        let tree = FileTree::new(root.clone());
+        let tree = FileTree::new(root.clone(), default_hidden());
         let names: Vec<&str> = tree.nodes.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, vec!["src"]);
         std::fs::remove_dir_all(&root).ok();
@@ -362,7 +377,7 @@ mod tests {
         std::fs::write(root.join("inner/b.txt"), "").unwrap();
         std::fs::write(root.join("outside.txt"), "").unwrap();
 
-        let mut tree = FileTree::new(root.clone());
+        let mut tree = FileTree::new(root.clone(), default_hidden());
         assert_eq!(tree.nodes.len(), 2);
         let _ = tree.click(0); // expand inner/
         assert_eq!(tree.nodes.len(), 4);
@@ -379,7 +394,7 @@ mod tests {
     fn clicking_a_file_yields_open_file() {
         let root = tempdir();
         std::fs::write(root.join("hello.rs"), "").unwrap();
-        let mut tree = FileTree::new(root.clone());
+        let mut tree = FileTree::new(root.clone(), default_hidden());
         match tree.click(0) {
             ClickResult::OpenFile(p) => assert_eq!(p, root.join("hello.rs")),
             other => panic!("expected OpenFile, got {other:?}"),
@@ -393,7 +408,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "").unwrap();
         std::fs::write(root.join("b.txt"), "").unwrap();
         std::fs::write(root.join("c.txt"), "").unwrap();
-        let mut tree = FileTree::new(root.clone());
+        let mut tree = FileTree::new(root.clone(), default_hidden());
         assert_eq!(tree.selected, None);
 
         tree.select_next();
@@ -413,7 +428,7 @@ mod tests {
         let root = tempdir();
         std::fs::write(root.join("a.txt"), "").unwrap();
         std::fs::write(root.join("b.txt"), "").unwrap();
-        let mut tree = FileTree::new(root.clone());
+        let mut tree = FileTree::new(root.clone(), default_hidden());
 
         tree.select_prev();
         // Nothing was selected → seed at the *last* row, not the first.
@@ -432,7 +447,7 @@ mod tests {
         std::fs::create_dir(root.join("inner")).unwrap();
         std::fs::write(root.join("inner/x.txt"), "").unwrap();
         std::fs::write(root.join("y.txt"), "").unwrap();
-        let mut tree = FileTree::new(root.clone());
+        let mut tree = FileTree::new(root.clone(), default_hidden());
         // [inner, y.txt]
         tree.selected = Some(0);
         let r = tree.activate_selected();
@@ -456,7 +471,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "").unwrap();
         std::fs::write(root.join("b.txt"), "").unwrap();
         std::fs::write(root.join("c.txt"), "").unwrap();
-        let mut tree = FileTree::new(root.clone());
+        let mut tree = FileTree::new(root.clone(), default_hidden());
         tree.selected = Some(2);
 
         // Drop the bottom file and reload — selection was off the end.
@@ -478,7 +493,7 @@ mod tests {
         std::fs::create_dir(root.join("inner")).unwrap();
         std::fs::write(root.join("inner/a.txt"), "").unwrap();
         std::fs::write(root.join("other.txt"), "").unwrap();
-        let mut tree = FileTree::new(root.clone());
+        let mut tree = FileTree::new(root.clone(), default_hidden());
         // [inner, other.txt]
         let _ = tree.click(0); // expand inner/
         assert_eq!(tree.nodes.len(), 3);
@@ -506,7 +521,7 @@ mod tests {
         std::fs::create_dir(root.join("doomed")).unwrap();
         std::fs::write(root.join("doomed/x.txt"), "").unwrap();
         std::fs::write(root.join("survivor.txt"), "").unwrap();
-        let mut tree = FileTree::new(root.clone());
+        let mut tree = FileTree::new(root.clone(), default_hidden());
         let _ = tree.click(0); // expand doomed/
         assert_eq!(tree.nodes.len(), 3);
 
@@ -523,7 +538,7 @@ mod tests {
         let root = tempdir();
         std::fs::write(root.join("a.txt"), "").unwrap();
         std::fs::write(root.join("b.txt"), "").unwrap();
-        let mut tree = FileTree::new(root.clone());
+        let mut tree = FileTree::new(root.clone(), default_hidden());
         let _ = tree.click(1);
         assert_eq!(tree.selected, Some(1));
         std::fs::remove_dir_all(&root).ok();
