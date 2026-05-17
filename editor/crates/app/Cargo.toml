@@ -25,4 +25,7 @@ dirs = { workspace = true }
 notify = { workspace = true }
 arboard = { workspace = true }
 editor-syntax = { workspace = true }
+editor-lsp-client = { workspace = true }
+lsp-types = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }

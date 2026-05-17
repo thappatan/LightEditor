@@ -1,0 +1,13 @@
+[package]
+name = "editor-lsp-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lsp-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+url = { workspace = true }

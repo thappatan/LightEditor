@@ -19,7 +19,7 @@ members = [
     "crates/buffer",           # text buffer (ropey)
     "crates/editor-core",      # editing operations
     "crates/syntax",           # tree-sitter
-    # "crates/lsp-client",     # LSP protocol
+    "crates/lsp-client",       # LSP protocol
     # "crates/dap-client",     # DAP protocol
     # "crates/git",            # git integration (git2)
     # "crates/terminal",       # terminal emulator (alacritty_terminal)
@@ -90,8 +90,11 @@ tree-sitter-bash = "0.23"
 tree-sitter-lua = "0.2"
 tree-sitter-ruby = "0.23"
 editor-syntax = { path = "crates/syntax" }
+editor-lsp-client = { path = "crates/lsp-client" }
+lsp-types = "0.95"
+serde_json = "1"
+url = "2"
 # tokio = { version = "1", features = ["full"] }
-# lsp-types = "0.95"
 # git2 = "0.18"
 # nucleo = "0.5"
 # reqwest = { version = "0.12", features = ["json", "stream"] }
