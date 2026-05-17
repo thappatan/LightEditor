@@ -13,6 +13,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// Minimum gap between consecutive `textDocument/didChange` sends per
+/// document. Without this, every keystroke triggers a fresh
+/// rust-analyzer re-analysis and the resulting CPU contention spikes
+/// keystroke latency well past the 33 ms hard limit (spec §8). 100 ms
+/// is short enough that the user doesn't notice the lag in diagnostics
+/// and long enough to coalesce a typing burst into one analysis pass.
+const DIDCHANGE_DEBOUNCE: Duration = Duration::from_millis(100);
 
 use editor_lsp_client::lsp_types::{
     self, notification::Notification as _, Diagnostic, GotoDefinitionResponse, Hover, Location,
@@ -132,6 +141,19 @@ struct Slot {
     /// didOpens received before the server finished initializing — flushed
     /// once it does.
     pending_opens: Vec<PendingOpen>,
+    /// When we last shipped a `textDocument/didChange` for each open URI.
+    /// Used by the debouncer to skip a send when the previous one is
+    /// still fresh.
+    last_didchange_at: HashMap<Url, Instant>,
+    /// Most recent didChange that the debouncer postponed. Flushed by
+    /// [`drain`](LspState::drain) once the debounce window has passed.
+    pending_change: Option<PendingChange>,
+}
+
+struct PendingChange {
+    uri: Url,
+    version: i32,
+    text: String,
 }
 
 struct PendingOpen {
@@ -271,6 +293,8 @@ impl LspState {
                 init_id,
                 open_uris: HashSet::new(),
                 pending_opens: Vec::new(),
+                last_didchange_at: HashMap::new(),
+                pending_change: None,
             },
         );
         Some(kind)
@@ -339,9 +363,28 @@ impl LspState {
             // language we don't sync. Skip silently.
             return;
         }
-        if let Err(e) = slot.client.did_change_full(uri, version, text) {
-            log::warn!("LSP: didChange failed for {kind:?}: {e}");
+        // Debounce: if we sent a didChange for this URI very recently,
+        // park the new one. The `drain` loop will flush it once the
+        // debounce window has passed — coalescing a typing burst into
+        // one analysis instead of N.
+        let too_soon = slot
+            .last_didchange_at
+            .get(&uri)
+            .is_some_and(|t| t.elapsed() < DIDCHANGE_DEBOUNCE);
+        if too_soon {
+            slot.pending_change = Some(PendingChange {
+                uri,
+                version,
+                text,
+            });
+            return;
         }
+        if let Err(e) = slot.client.did_change_full(uri.clone(), version, text) {
+            log::warn!("LSP: didChange failed for {kind:?}: {e}");
+            return;
+        }
+        slot.last_didchange_at.insert(uri, Instant::now());
+        slot.pending_change = None;
     }
 
     pub fn did_save(&mut self, path: &Path, lang: Language, text: Option<String>) {
@@ -466,6 +509,25 @@ impl LspState {
         for kind in crashed {
             self.slots.remove(&kind);
             events.push(LspEvent::ServerExited { kind });
+        }
+        // Flush any debounced didChange that has aged past the window.
+        for (kind, slot) in self.slots.iter_mut() {
+            let due = match slot.pending_change.as_ref() {
+                Some(p) => slot
+                    .last_didchange_at
+                    .get(&p.uri)
+                    .map_or(true, |t| t.elapsed() >= DIDCHANGE_DEBOUNCE),
+                None => false,
+            };
+            if due {
+                let pc = slot.pending_change.take().expect("checked above");
+                let uri = pc.uri.clone();
+                if let Err(e) = slot.client.did_change_full(pc.uri, pc.version, pc.text) {
+                    log::warn!("LSP: deferred didChange failed for {kind:?}: {e}");
+                } else {
+                    slot.last_didchange_at.insert(uri, Instant::now());
+                }
+            }
         }
         events
     }
