@@ -17,7 +17,9 @@ mod find_in_files;
 mod git;
 mod lsp;
 mod palette;
+mod terminal;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,6 +71,10 @@ enum AppEvent {
     /// publishDiagnostics arriving during an idle window would not surface
     /// until the next user interaction.
     LspPoll,
+    /// The embedded terminal's grid changed (output arrived, title
+    /// updated, child exited). Triggers a redraw — the actual grid
+    /// read happens during `render()` while holding the term lock.
+    TerminalWakeup,
 }
 
 /// How long a "settings reloaded" flash stays on the status bar.
@@ -312,6 +318,15 @@ const DIAG_DOT_DIP: f32 = 6.0;
 /// the shaped text (see `refresh_file_tree_text`).
 const SIDEBAR_WIDTH_DIP: f32 = 240.0;
 const SIDEBAR_PAD_X_DIP: f32 = 8.0;
+
+/// Embedded terminal pane (M3) — bottom-anchored pane, fixed height
+/// for v1 with drag-to-resize a follow-up.
+const TERMINAL_HEIGHT_DIP: f32 = 260.0;
+/// Number of default rows the shell starts with — the renderer
+/// re-derives true cell count from pixel height once cells are
+/// measured, but the shell needs *some* answer at spawn time.
+const TERMINAL_INITIAL_ROWS: u16 = 12;
+const TERMINAL_INITIAL_COLS: u16 = 100;
 
 /// Find-in-files panel (M3) — large centred overlay with the input
 /// row at the top and matched lines below.
@@ -888,6 +903,12 @@ struct State {
     /// Dedicated TextStack for the find-in-files panel (input row +
     /// status row + matched lines).
     find_in_files_text: TextStack,
+    /// Embedded terminal pane (M3) — `Some` while a shell is running.
+    /// Visibility toggles via `Cmd-J`; the shell stays alive across
+    /// hide/show so scrollback survives.
+    terminal: Option<terminal::TerminalPane>,
+    /// Dedicated TextStack for the terminal pane's grid contents.
+    terminal_text: TextStack,
 
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
@@ -1072,6 +1093,15 @@ impl State {
             "",
         );
 
+        let terminal_text = TextStack::new(
+            &mut font_system,
+            size.width as f32,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "",
+        );
+
         // Derive the sidebar's root from the active doc's workspace
         // (the same find_project_root walk the LSP layer uses), falling
         // back to CWD when no doc has a path yet.
@@ -1134,6 +1164,8 @@ impl State {
             file_tree_text,
             find_in_files: None,
             find_in_files_text,
+            terminal: None,
+            terminal_text,
             tab_spaces,
             theme,
             pending_keystroke: None,
@@ -1465,6 +1497,13 @@ impl State {
                         self.toggle_file_tree();
                         return;
                     }
+                    "j" => {
+                        // Cmd-J toggles the embedded terminal pane,
+                        // matching VS Code's "Toggle Panel" muscle
+                        // memory. Spawns the shell on first open.
+                        self.toggle_terminal();
+                        return;
+                    }
                     "i" if !alt => {
                         // Cmd-I requests an LSP hover at the caret. The
                         // response paints a popup once it arrives via
@@ -1564,6 +1603,17 @@ impl State {
         let shift = self.modifiers.shift_key();
         let alt = self.modifiers.alt_key();
         let cmd = is_cmd_or_ctrl(self.modifiers);
+
+        // Embedded terminal claims keys while it has focus — except
+        // shortcuts (cmd / ctrl + something) which still belong to
+        // the host so Cmd-J can hide it, Cmd-S still saves, etc.
+        let terminal_active = self
+            .terminal
+            .as_ref()
+            .is_some_and(|t| t.visible && t.focused);
+        if terminal_active && !cmd && !alt && self.route_key_to_terminal(&event) {
+            return;
+        }
 
         // Find-in-files panel intercepts every key while open — typing
         // edits the query, Enter runs / opens, ↑/↓ navigate, Tab flips
@@ -2584,7 +2634,7 @@ impl State {
     /// Returns zero-area when the sidebar is hidden.
     fn sidebar_rect(&self) -> Rect {
         let top = TAB_BAR_HEIGHT_DIP * self.scale;
-        let bottom = self.gpu.surface_config.height as f32 - STATUS_BAR_HEIGHT_DIP * self.scale;
+        let bottom = self.editor_bottom_y();
         Rect::new(0.0, top, self.sidebar_width(), (bottom - top).max(0.0))
     }
 
@@ -2776,6 +2826,162 @@ impl State {
         };
         self.find_in_files_text
             .set_content(&mut self.font_system, &text);
+    }
+
+    // ── Embedded terminal (Cmd-J) ─────────────────────────────────────────
+
+    /// Toggle the bottom terminal pane. Spawns the shell lazily on
+    /// first open; subsequent toggles just flip visibility so
+    /// scrollback survives. Focus follows visibility — showing the
+    /// pane grabs the keyboard.
+    fn toggle_terminal(&mut self) {
+        if let Some(term) = self.terminal.as_mut() {
+            term.visible = !term.visible;
+            term.focused = term.visible;
+            self.recompute_text_inset(); // editor width is unaffected, but other layout may shift
+            self.scene_dirty = true;
+            self.window.request_redraw();
+            return;
+        }
+        // First open: spawn the shell rooted at the project root.
+        let cwd = Some(self.file_tree.root.clone());
+        let pane_height = TERMINAL_HEIGHT_DIP * self.scale;
+        let cell_w = self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale;
+        let cell_h = self.line_height();
+        match terminal::TerminalPane::spawn(
+            self.flash_proxy.clone(),
+            cwd,
+            TERMINAL_INITIAL_COLS,
+            TERMINAL_INITIAL_ROWS,
+            cell_w,
+            cell_h,
+            pane_height,
+        ) {
+            Ok(pane) => {
+                self.terminal = Some(pane);
+                self.refresh_terminal_text();
+                self.scene_dirty = true;
+                self.window.request_redraw();
+            }
+            Err(e) => {
+                log::warn!("terminal spawn failed: {e}");
+                self.set_status_flash(format!("terminal: {e}"));
+            }
+        }
+    }
+
+    /// Currently-rendered pane height in physical pixels, or 0 when
+    /// the terminal is hidden or unspawned.
+    fn terminal_pane_height(&self) -> f32 {
+        match &self.terminal {
+            Some(t) if t.visible => t.height_px,
+            _ => 0.0,
+        }
+    }
+
+    /// Bounds rect for the terminal pane, in physical pixels.
+    fn terminal_pane_rect(&self) -> Rect {
+        let h = self.terminal_pane_height();
+        let surface_w = self.gpu.surface_config.width as f32;
+        let surface_h = self.gpu.surface_config.height as f32;
+        let status_h = STATUS_BAR_HEIGHT_DIP * self.scale;
+        let top = (surface_h - status_h - h).max(0.0);
+        Rect::new(0.0, top, surface_w, h)
+    }
+
+    /// Snapshot the terminal grid into the terminal_text TextStack
+    /// for the next frame. Called from the render path when the
+    /// terminal is visible and there's a wakeup pending.
+    fn refresh_terminal_text(&mut self) {
+        let Some(pane) = self.terminal.as_ref() else {
+            return;
+        };
+        let text = {
+            let term = pane.term.lock();
+            let grid = term.grid();
+            let mut s = String::with_capacity(pane.cols * pane.rows + pane.rows);
+            // Iterate visible rows in display order. The grid's
+            // display offset (set by scrolling) shifts which rows
+            // are visible — for v1 we render the *current* visible
+            // window from the top of the screen down.
+            use alacritty_terminal::grid::Dimensions as _;
+            let display_offset = grid.display_offset();
+            let total_rows = grid.screen_lines();
+            for screen_row in 0..total_rows {
+                let line =
+                    alacritty_terminal::index::Line(screen_row as i32 - display_offset as i32);
+                if screen_row > 0 {
+                    s.push('\n');
+                }
+                for col in 0..grid.columns() {
+                    let cell = &grid[line][alacritty_terminal::index::Column(col)];
+                    let c = cell.c;
+                    // Drop the trailing space of a wide-char's right
+                    // half (alacritty stores a 0 there).
+                    if c == '\0' {
+                        s.push(' ');
+                    } else {
+                        s.push(c);
+                    }
+                }
+            }
+            s
+        };
+        self.terminal_text.set_content(&mut self.font_system, &text);
+    }
+
+    /// Translate a winit key event into the byte sequence a PTY
+    /// expects for that key, and send it. Returns `true` when the
+    /// key was claimed by the terminal (so the caller short-circuits
+    /// the normal editor key handler).
+    fn route_key_to_terminal(&mut self, event: &KeyEvent) -> bool {
+        let Some(pane) = self.terminal.as_ref() else {
+            return false;
+        };
+        if !pane.visible || !pane.focused {
+            return false;
+        }
+        // Cmd-J still toggles the pane; let it fall through.
+        if let Key::Character(c) = &event.logical_key {
+            if is_cmd_or_ctrl(self.modifiers) && c.eq_ignore_ascii_case("j") {
+                return false;
+            }
+        }
+        let bytes: Cow<'static, [u8]> = match &event.logical_key {
+            Key::Named(NamedKey::Enter) => Cow::Borrowed(b"\r"),
+            Key::Named(NamedKey::Backspace) => Cow::Borrowed(b"\x7f"),
+            Key::Named(NamedKey::Tab) => Cow::Borrowed(b"\t"),
+            Key::Named(NamedKey::Escape) => Cow::Borrowed(b"\x1b"),
+            Key::Named(NamedKey::ArrowUp) => Cow::Borrowed(b"\x1b[A"),
+            Key::Named(NamedKey::ArrowDown) => Cow::Borrowed(b"\x1b[B"),
+            Key::Named(NamedKey::ArrowRight) => Cow::Borrowed(b"\x1b[C"),
+            Key::Named(NamedKey::ArrowLeft) => Cow::Borrowed(b"\x1b[D"),
+            Key::Named(NamedKey::Home) => Cow::Borrowed(b"\x1b[H"),
+            Key::Named(NamedKey::End) => Cow::Borrowed(b"\x1b[F"),
+            Key::Named(NamedKey::Delete) => Cow::Borrowed(b"\x1b[3~"),
+            Key::Named(NamedKey::PageUp) => Cow::Borrowed(b"\x1b[5~"),
+            Key::Named(NamedKey::PageDown) => Cow::Borrowed(b"\x1b[6~"),
+            Key::Named(NamedKey::Space) => Cow::Borrowed(b" "),
+            _ => {
+                // Printable text comes via `event.text`.
+                if let Some(text) = event.text.as_deref() {
+                    if !text.is_empty() {
+                        Cow::Owned(text.as_bytes().to_vec())
+                    } else {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+        };
+        pane.write(bytes);
+        // The PTY may echo back asynchronously — we'll repaint when
+        // the wakeup event arrives. Mark the scene dirty pre-emptively
+        // so the caret feels responsive.
+        self.scene_dirty = true;
+        self.window.request_redraw();
+        true
     }
 
     /// Geometry of the find-in-files panel — centred horizontally,
@@ -4633,11 +4839,22 @@ impl State {
     }
 
     /// Visible height of the editor viewport in physical pixels — the surface
-    /// minus the tab strip on top and the status bar on the bottom.
+    /// minus the tab strip on top, the status bar on the bottom, and the
+    /// terminal pane (when visible) above the status bar.
     fn visible_height(&self) -> f32 {
         self.gpu.surface_config.height as f32
             - self.text_inset_y
             - STATUS_BAR_HEIGHT_DIP * self.scale
+            - self.terminal_pane_height()
+    }
+
+    /// Bottom y of the editor surface (above the terminal pane, if any,
+    /// then above the status bar). Used by the gutter/sidebar/text bounds
+    /// to clip rendering above the pane.
+    fn editor_bottom_y(&self) -> f32 {
+        self.gpu.surface_config.height as f32
+            - STATUS_BAR_HEIGHT_DIP * self.scale
+            - self.terminal_pane_height()
     }
 
     /// The largest valid scroll offset — content height beyond the viewport.
@@ -4746,7 +4963,7 @@ impl State {
         // Gutter backdrop — a slim column on the left of the editor
         // text, slightly darker so the line numbers read as belonging
         // to a chrome region rather than the buffer.
-        let gutter_h = (h - self.text_inset_y - STATUS_BAR_HEIGHT_DIP * self.scale).max(0.0);
+        let gutter_h = (self.editor_bottom_y() - self.text_inset_y).max(0.0);
         let sidebar_w = self.sidebar_width();
         root.push_child(SceneNode::quad(
             Rect::new(
@@ -4945,6 +5162,16 @@ impl State {
         let find_match_color = quad_color(&et.find_match_bg);
         for rect in self.match_highlight_rects() {
             root.push_child(SceneNode::quad(rect, find_match_color));
+        }
+
+        // Terminal pane backdrop — sits above the status bar and
+        // below the editor area. A slightly darker fill so it reads
+        // as a separate chrome region.
+        if self.terminal_pane_height() > 0.0 {
+            root.push_child(SceneNode::quad(
+                self.terminal_pane_rect(),
+                quad_color(&et.gutter_bg),
+            ));
         }
 
         // Status bar backdrop — opaque so it covers any text that scrolled
@@ -5239,12 +5466,13 @@ impl State {
         // Editor text clips to the viewport between the tab strip and the
         // status bar; otherwise scrolled glyphs would bleed into both bars
         // (which are drawn as quads underneath the text pass).
-        let status_bar_h = STATUS_BAR_HEIGHT_DIP * self.scale;
         let editor_text_bounds = TextBounds {
             left: 0,
             top: self.text_inset_y as i32,
             right: surface_w as i32,
-            bottom: (surface_h as f32 - status_bar_h) as i32,
+            // Clip above the terminal pane too — without this, scrolled
+            // editor glyphs paint underneath the pane's backdrop.
+            bottom: self.editor_bottom_y() as i32,
         };
 
         // All text — editor / tabs / close ×s / status / find / palette —
@@ -5321,7 +5549,13 @@ impl State {
         let gutter_left = self.sidebar_width() + GUTTER_PAD_LEFT_DIP * self.scale;
         let line_height = self.line_height();
         let viewport_top = self.text_inset_y;
-        let viewport_bottom = surface_h as f32 - status_bar_h;
+        let viewport_bottom = self.editor_bottom_y();
+
+        // Snapshot the terminal's grid into its TextStack *before*
+        // the text_areas Vec borrows TextStack buffers immutably.
+        if self.terminal_pane_height() > 0.0 {
+            self.refresh_terminal_text();
+        }
 
         let mut text_areas: Vec<TextArea> = Vec::with_capacity(8 + docs_len);
         text_areas.push(TextArea {
@@ -5428,6 +5662,25 @@ impl State {
                 scale: 1.0,
                 bounds: strip_bounds,
                 default_color: color,
+                custom_glyphs: &[],
+            });
+        }
+        if self.terminal_pane_height() > 0.0 {
+            let pane = self.terminal_pane_rect();
+            let pad = 6.0 * self.scale;
+            let bounds = TextBounds {
+                left: pane.min_x() as i32,
+                top: pane.min_y() as i32,
+                right: pane.max_x() as i32,
+                bottom: pane.max_y() as i32,
+            };
+            text_areas.push(TextArea {
+                buffer: &self.terminal_text.buffer,
+                left: pane.min_x() + pad,
+                top: pane.min_y() + pad,
+                scale: 1.0,
+                bounds,
+                default_color: editor_color,
                 custom_glyphs: &[],
             });
         }
@@ -5749,6 +6002,12 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::LspPoll => {
                 if let Some(state) = self.state.as_mut() {
                     state.poll_lsp();
+                }
+            }
+            AppEvent::TerminalWakeup => {
+                if let Some(state) = self.state.as_mut() {
+                    state.scene_dirty = true;
+                    state.window.request_redraw();
                 }
             }
         }
