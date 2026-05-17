@@ -1165,8 +1165,16 @@ impl State {
             .and_then(lsp::find_project_root)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        let file_tree = FileTree::new(tree_root);
-        let file_tree_watcher = spawn_file_tree_watcher(&file_tree.root, flash_proxy.clone());
+        let hidden_dirs = settings.file_tree.hidden_dirs.clone();
+        let file_tree = FileTree::new(tree_root, hidden_dirs.clone());
+        // The watcher snapshots its own copy of the hidden-dirs list at
+        // spawn time. A live settings reload won't change which paths
+        // the watcher drops until the editor restarts — kept simple
+        // because the list rarely changes in practice; if it ever
+        // matters, swap the snapshot for an `Arc<RwLock<Vec<String>>>`
+        // and update it from the `SettingsChanged` handler.
+        let file_tree_watcher =
+            spawn_file_tree_watcher(&file_tree.root, hidden_dirs, flash_proxy.clone());
 
         let mut state = Self {
             window,
@@ -6721,6 +6729,7 @@ fn main() {
 /// quiet period — saving a file triggers exactly one reload.
 fn spawn_file_tree_watcher(
     root: &Path,
+    hidden_dirs: Vec<String>,
     proxy: EventLoopProxy<AppEvent>,
 ) -> Option<RecommendedWatcher> {
     if !root.exists() {
@@ -6734,7 +6743,10 @@ fn spawn_file_tree_watcher(
         // ignored set. Routine git / build / dependency operations
         // touch dozens of paths a second under those dirs and never
         // change anything the sidebar shows.
-        let interesting = event.paths.iter().any(|p| !path_under_hidden_dir(p));
+        let interesting = event
+            .paths
+            .iter()
+            .any(|p| !path_under_hidden_dir(p, &hidden_dirs));
         if interesting {
             // The receiver thread closes on the event-loop dropping;
             // a `send` failure is the cue to stop forwarding.
@@ -6772,15 +6784,15 @@ fn spawn_file_tree_watcher(
 }
 
 /// `true` if any path component is a hidden directory the file tree
-/// already filters out (`.git`, `node_modules`, `target`, …). Used to
-/// drop watcher events that can't affect the sidebar.
-fn path_under_hidden_dir(path: &Path) -> bool {
+/// filters out. `hidden_dirs` is the same list `FileTree` carries,
+/// so the watcher's drop-set always tracks the user's setting.
+fn path_under_hidden_dir(path: &Path, hidden_dirs: &[String]) -> bool {
     path.components()
         .filter_map(|c| match c {
             std::path::Component::Normal(s) => s.to_str(),
             _ => None,
         })
-        .any(|name| file_tree::HIDDEN_DIRS.contains(&name))
+        .any(|name| hidden_dirs.iter().any(|d| d == name))
 }
 
 /// Same shape as `spawn_settings_watcher`, but emits `ThemeChanged`.

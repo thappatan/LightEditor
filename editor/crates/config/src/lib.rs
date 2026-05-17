@@ -20,6 +20,7 @@ pub use theme::{parse_hex_color, EditorTheme, SyntaxTheme, Theme};
 #[serde(default)]
 pub struct Settings {
     pub editor: EditorSettings,
+    pub file_tree: FileTreeSettings,
 }
 
 /// Editor-section settings — type, spacing, indentation.
@@ -47,6 +48,34 @@ impl Default for EditorSettings {
     }
 }
 
+/// File-tree sidebar settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileTreeSettings {
+    /// Directory names hidden from the sidebar by default. Matches any
+    /// directory whose basename appears in this list, at any depth in
+    /// the workspace. The matching watcher filter also uses this list
+    /// to drop noisy filesystem events that fire under these paths.
+    pub hidden_dirs: Vec<String>,
+}
+
+impl Default for FileTreeSettings {
+    fn default() -> Self {
+        // The list that shipped hardcoded before settings landed —
+        // a fresh install behaves identically.
+        Self {
+            hidden_dirs: vec![
+                ".git".into(),
+                "node_modules".into(),
+                "target".into(),
+                ".next".into(),
+                "dist".into(),
+                "build".into(),
+            ],
+        }
+    }
+}
+
 /// A partial settings document — every field optional. Used for the
 /// per-workspace override file, where a sparse document means "only override
 /// the fields I name; leave the rest at the user/default value".
@@ -54,6 +83,8 @@ impl Default for EditorSettings {
 pub struct PartialSettings {
     #[serde(default)]
     pub editor: PartialEditorSettings,
+    #[serde(default)]
+    pub file_tree: PartialFileTreeSettings,
 }
 
 /// Editor-section partial settings — every field optional.
@@ -65,6 +96,16 @@ pub struct PartialEditorSettings {
     pub line_height: Option<f32>,
     #[serde(default)]
     pub tab_size: Option<usize>,
+}
+
+/// File-tree partial settings — every field optional. Workspace
+/// override of `hidden_dirs` replaces the user's list wholesale
+/// rather than concatenating; sparse partials still work since the
+/// field is wrapped in `Option`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct PartialFileTreeSettings {
+    #[serde(default)]
+    pub hidden_dirs: Option<Vec<String>>,
 }
 
 impl Settings {
@@ -80,6 +121,9 @@ impl Settings {
         }
         if let Some(v) = partial.editor.tab_size {
             self.editor.tab_size = v;
+        }
+        if let Some(v) = partial.file_tree.hidden_dirs.clone() {
+            self.file_tree.hidden_dirs = v;
         }
     }
 
@@ -166,6 +210,9 @@ mod tests {
                 line_height: 26.0,
                 tab_size: 2,
             },
+            file_tree: FileTreeSettings {
+                hidden_dirs: vec!["target".into(), "node_modules".into()],
+            },
         };
         let text = toml::to_string(&original).unwrap();
         let parsed: Settings = toml::from_str(&text).unwrap();
@@ -207,12 +254,15 @@ mod tests {
                 line_height: None,
                 tab_size: Some(2),
             },
+            file_tree: PartialFileTreeSettings { hidden_dirs: None },
         };
         s.merge(&partial);
         assert_eq!(s.editor.font_size, 20.0);
         // line_height was None → unchanged
         assert_eq!(s.editor.line_height, 22.0);
         assert_eq!(s.editor.tab_size, 2);
+        // hidden_dirs partial was None → list still the default.
+        assert_eq!(s.file_tree, FileTreeSettings::default());
     }
 
     #[test]
@@ -223,10 +273,27 @@ mod tests {
                 line_height: 26.0,
                 tab_size: 2,
             },
+            file_tree: FileTreeSettings {
+                hidden_dirs: vec!["custom".into()],
+            },
         };
         let before = s.clone();
         s.merge(&PartialSettings::default());
         assert_eq!(s, before);
+    }
+
+    #[test]
+    fn merge_partial_hidden_dirs_replaces_list() {
+        let mut s = Settings::default();
+        let partial = PartialSettings {
+            editor: PartialEditorSettings::default(),
+            file_tree: PartialFileTreeSettings {
+                hidden_dirs: Some(vec!["target".into()]),
+            },
+        };
+        s.merge(&partial);
+        // The override replaces wholesale, not concatenates.
+        assert_eq!(s.file_tree.hidden_dirs, vec!["target".to_string()]);
     }
 
     #[test]
