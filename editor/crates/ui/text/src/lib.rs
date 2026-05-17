@@ -30,13 +30,18 @@ fn default_attrs() -> Attrs<'static> {
 
 /// GPU-side text resources shared across every `TextStack` in an app.
 ///
-/// Creating these for each stack burns ~50ms/stack of wgpu setup *and*
-/// duplicates the glyph atlas — one shared instance lets the editor batch
-/// all text into a single `prepare`/`render` per frame.
+/// One `viewport` + one `atlas` is shared between two `TextRenderer`s:
+/// the `renderer` draws the editor/chrome layer, and `overlay_renderer`
+/// draws floating panels (hover, completion, palette, find) **after**
+/// the main layer so their text doesn't get covered by editor glyphs
+/// rasterised in the same batch. A single `TextRenderer.prepare` call
+/// replaces the renderer's vertex buffer, so two prepares can't be
+/// interleaved with renders inside one pass — hence two instances.
 pub struct TextGpu {
     pub viewport: Viewport,
     pub atlas: TextAtlas,
     pub renderer: TextRenderer,
+    pub overlay_renderer: TextRenderer,
 }
 
 impl TextGpu {
@@ -46,10 +51,13 @@ impl TextGpu {
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
         let renderer =
             TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
+        let overlay_renderer =
+            TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
         Self {
             viewport,
             atlas,
             renderer,
+            overlay_renderer,
         }
     }
 }

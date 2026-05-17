@@ -22,7 +22,7 @@ close_button         = "#565f89"
 status_bg            = "#16161e"
 status_fg            = "#737aa2"
 
-overlay_bg           = "#1f2335f5"
+overlay_bg           = "#1f2335ff"
 overlay_scrim        = "#0000008a"
 palette_selection_bg = "#7aa2f750"
 
