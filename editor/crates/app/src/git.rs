@@ -160,11 +160,13 @@ mod tests {
     use std::process::Command;
 
     fn make_repo() -> PathBuf {
-        let n: u32 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("editor-app-git-{n}"));
+        // (PID, atomic counter) avoids collisions when CI runs tests in
+        // parallel — `subsec_nanos` is not unique enough on fast boxes.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let pid = std::process::id();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("editor-app-git-{pid}-{n}"));
         std::fs::create_dir_all(&path).unwrap();
         // libgit2 needs a real repo with a HEAD; init + commit one file.
         let run = |args: &[&str]| {
@@ -262,13 +264,11 @@ mod tests {
 
     #[test]
     fn file_outside_a_repo_returns_empty() {
-        let tmp = std::env::temp_dir().join(format!(
-            "editor-app-git-no-repo-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let pid = std::process::id();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("editor-app-git-no-repo-{pid}-{n}"));
         std::fs::create_dir_all(&tmp).unwrap();
         let path = tmp.join("x.txt");
         std::fs::write(&path, "anything\n").unwrap();
