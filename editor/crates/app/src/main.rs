@@ -11,6 +11,7 @@
 // find/replace, the file tree. Those are later M1 / M2 work.
 
 mod document;
+mod file_tree;
 mod find;
 mod lsp;
 mod palette;
@@ -30,6 +31,7 @@ use editor_ui_text::glyphon::{
     Attrs, Color, FontSystem, Resolution, SwashCache, TextArea, TextBounds,
 };
 use editor_ui_text::{TextGpu, TextStack};
+use file_tree::{ClickResult, FileTree, NodeKind};
 use find::{FindBar, FindFocus};
 use lsp::{LspEvent, LspState};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -301,6 +303,12 @@ const COMPLETION_MAX_ROWS: usize = 10;
 
 /// Width of the diagnostic indicator drawn in the gutter, in logical px.
 const DIAG_DOT_DIP: f32 = 6.0;
+
+/// File-tree sidebar (M3) — fixed width for v1, resizable drag-handle
+/// is a follow-up. Per-depth indent is rendered as leading spaces in
+/// the shaped text (see `refresh_file_tree_text`).
+const SIDEBAR_WIDTH_DIP: f32 = 240.0;
+const SIDEBAR_PAD_X_DIP: f32 = 8.0;
 
 /// Subdirectory under the user's XDG config dir that holds settings.toml.
 const CONFIG_SUBDIR: &str = "lighteditor";
@@ -820,6 +828,13 @@ struct State {
     /// Dedicated TextStack for the completion popup's item list.
     completion_text: TextStack,
 
+    /// File-tree sidebar (M3). Holds the loaded node list + scroll
+    /// position; visibility lives on the struct itself so toggling on
+    /// and off is instant once it's been opened once.
+    file_tree: FileTree,
+    /// Dedicated TextStack for the sidebar's row labels.
+    file_tree_text: TextStack,
+
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
     /// Rolling 1-second frame-time window (spec §8).
@@ -978,6 +993,26 @@ impl State {
             "",
         );
 
+        let file_tree_text = TextStack::new(
+            &mut font_system,
+            (SIDEBAR_WIDTH_DIP - 2.0 * SIDEBAR_PAD_X_DIP) * scale,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "",
+        );
+
+        // Derive the sidebar's root from the active doc's workspace
+        // (the same find_project_root walk the LSP layer uses), falling
+        // back to CWD when no doc has a path yet.
+        let tree_root = doc
+            .file_path
+            .as_deref()
+            .and_then(lsp::find_project_root)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let file_tree = FileTree::new(tree_root);
+
         let mut state = Self {
             window,
             gpu,
@@ -1023,6 +1058,8 @@ impl State {
             hover_text,
             completion: None,
             completion_text,
+            file_tree,
+            file_tree_text,
             tab_spaces,
             theme,
             pending_keystroke: None,
@@ -1346,6 +1383,10 @@ impl State {
                         self.select_all();
                         return;
                     }
+                    "b" => {
+                        self.toggle_file_tree();
+                        return;
+                    }
                     "i" if !alt => {
                         // Cmd-I requests an LSP hover at the caret. The
                         // response paints a popup once it arrives via
@@ -1661,6 +1702,13 @@ impl State {
         }
         if let Some(idx) = self.tab_at_pixel(mx, my) {
             self.switch_tab(idx);
+            return;
+        }
+        if self.in_sidebar(mx, my) {
+            if let Some(row) = self.file_tree_row_at(my) {
+                self.handle_sidebar_click(row);
+            }
+            self.last_click = None;
             return;
         }
         if self.in_gutter(mx, my) {
@@ -2315,7 +2363,121 @@ impl State {
     /// Is the physical-pixel point inside the gutter strip?
     fn in_gutter(&self, x: f32, y: f32) -> bool {
         let bottom = self.gpu.surface_config.height as f32 - STATUS_BAR_HEIGHT_DIP * self.scale;
-        x >= 0.0 && x < self.text_inset_x && y >= self.text_inset_y && y < bottom
+        x >= self.sidebar_width() && x < self.text_inset_x && y >= self.text_inset_y && y < bottom
+    }
+
+    /// Current width of the file-tree sidebar in physical pixels, or 0
+    /// when it's hidden. Helper for the layout maths below.
+    fn sidebar_width(&self) -> f32 {
+        if self.file_tree.visible {
+            SIDEBAR_WIDTH_DIP * self.scale
+        } else {
+            0.0
+        }
+    }
+
+    /// Is the physical-pixel point inside the file-tree sidebar?
+    fn in_sidebar(&self, x: f32, y: f32) -> bool {
+        if !self.file_tree.visible {
+            return false;
+        }
+        let sidebar_top = TAB_BAR_HEIGHT_DIP * self.scale;
+        let sidebar_bottom =
+            self.gpu.surface_config.height as f32 - STATUS_BAR_HEIGHT_DIP * self.scale;
+        x >= 0.0 && x < self.sidebar_width() && y >= sidebar_top && y < sidebar_bottom
+    }
+
+    /// Bounds rect for the file-tree sidebar's body, in physical pixels.
+    /// Returns zero-area when the sidebar is hidden.
+    fn sidebar_rect(&self) -> Rect {
+        let top = TAB_BAR_HEIGHT_DIP * self.scale;
+        let bottom = self.gpu.surface_config.height as f32 - STATUS_BAR_HEIGHT_DIP * self.scale;
+        Rect::new(0.0, top, self.sidebar_width(), (bottom - top).max(0.0))
+    }
+
+    /// Toggle the sidebar's visibility and recompute the editor's left
+    /// inset so the gutter + text shift to make room (or reclaim it).
+    fn toggle_file_tree(&mut self) {
+        self.file_tree.visible = !self.file_tree.visible;
+        self.recompute_text_inset();
+        if self.file_tree.visible {
+            self.refresh_file_tree_text();
+        }
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Recompute `text_inset_x` and the wrap width on the editor text
+    /// stack — call after anything that changes the sidebar's width
+    /// (toggle, scale change, font resize).
+    fn recompute_text_inset(&mut self) {
+        let font = self.text.font_size_pt();
+        let gutter_width = gutter_outer_width(font, self.scale);
+        let right_pad = TEXT_INSET_DIP * self.scale;
+        self.text_inset_x = self.sidebar_width() + gutter_width;
+        self.text_padding = self.text_inset_x + right_pad;
+        let surface_w = self.gpu.surface_config.width as f32;
+        self.text.set_width(
+            &mut self.font_system,
+            (surface_w - self.text_padding).max(0.0),
+        );
+    }
+
+    /// Rebuild the file-tree text stack from the current node list.
+    /// Indents nest visually via leading spaces; the marker `▾`/`▸`
+    /// distinguishes expanded vs collapsed directories.
+    fn refresh_file_tree_text(&mut self) {
+        let mut s = String::with_capacity(self.file_tree.nodes.len() * 24);
+        for (i, node) in self.file_tree.nodes.iter().enumerate() {
+            if i > 0 {
+                s.push('\n');
+            }
+            // Two spaces per depth level keeps the indent crisp without
+            // burning columns to bigger files.
+            for _ in 0..node.depth {
+                s.push_str("  ");
+            }
+            let marker = match node.kind {
+                NodeKind::Directory { expanded: true } => "▾ ",
+                NodeKind::Directory { expanded: false } => "▸ ",
+                NodeKind::File => "  ",
+            };
+            s.push_str(marker);
+            s.push_str(&node.name);
+        }
+        self.file_tree_text.set_content(&mut self.font_system, &s);
+    }
+
+    /// Hit-test a physical-pixel point against the sidebar's rows.
+    /// Returns the node index, or `None` when the point is outside the
+    /// row strip or past the loaded items.
+    fn file_tree_row_at(&self, y: f32) -> Option<usize> {
+        if !self.file_tree.visible {
+            return None;
+        }
+        let top = TAB_BAR_HEIGHT_DIP * self.scale;
+        let line_h = self.line_height();
+        if y < top {
+            return None;
+        }
+        let row = ((y - top + self.file_tree.scroll_y) / line_h) as usize;
+        (row < self.file_tree.nodes.len()).then_some(row)
+    }
+
+    /// Forward a sidebar click to the tree's state machine, opening a
+    /// file or toggling a directory accordingly. Refreshes the shaped
+    /// text on any change.
+    fn handle_sidebar_click(&mut self, row: usize) {
+        match self.file_tree.click(row) {
+            ClickResult::Nothing => {
+                self.refresh_file_tree_text();
+                self.scene_dirty = true;
+                self.window.request_redraw();
+            }
+            ClickResult::OpenFile(path) => {
+                self.open_path(path);
+            }
+        }
     }
 
     /// Select the logical line under `y`. Reuses the editor's shaped layout
@@ -4128,12 +4290,46 @@ impl State {
             }
         }
 
-        // Gutter backdrop — a slim column on the left, slightly darker than
-        // the editor surface so the line numbers read as belonging to a
-        // chrome region rather than the buffer.
+        // File-tree sidebar backdrop, drawn first so the gutter and any
+        // selection highlights stack on top.
+        if self.file_tree.visible {
+            root.push_child(SceneNode::quad(
+                self.sidebar_rect(),
+                quad_color(&et.gutter_bg),
+            ));
+            // Selection-row highlight: when one of the visible nodes
+            // points at the active doc, draw a faint underlay so the
+            // user can see "what they're editing now" at a glance.
+            if let Some(active_path) = self.doc().file_path.clone() {
+                if let Some(idx) = self
+                    .file_tree
+                    .nodes
+                    .iter()
+                    .position(|n| n.path == active_path)
+                {
+                    let top = TAB_BAR_HEIGHT_DIP * self.scale;
+                    let line_h = self.line_height();
+                    let y = top + (idx as f32) * line_h - self.file_tree.scroll_y;
+                    root.push_child(SceneNode::quad(
+                        Rect::new(0.0, y, self.sidebar_width(), line_h),
+                        quad_color(&et.active_line_bg),
+                    ));
+                }
+            }
+        }
+
+        // Gutter backdrop — a slim column on the left of the editor
+        // text, slightly darker so the line numbers read as belonging
+        // to a chrome region rather than the buffer.
         let gutter_h = (h - self.text_inset_y - STATUS_BAR_HEIGHT_DIP * self.scale).max(0.0);
+        let sidebar_w = self.sidebar_width();
         root.push_child(SceneNode::quad(
-            Rect::new(0.0, self.text_inset_y, self.text_inset_x, gutter_h),
+            Rect::new(
+                sidebar_w,
+                self.text_inset_y,
+                (self.text_inset_x - sidebar_w).max(0.0),
+                gutter_h,
+            ),
             quad_color(&et.gutter_bg),
         ));
 
@@ -4707,6 +4903,25 @@ impl State {
             default_color: label_color,
             custom_glyphs: &[],
         });
+        if self.file_tree.visible {
+            let sidebar = self.sidebar_rect();
+            let pad_x = SIDEBAR_PAD_X_DIP * self.scale;
+            let sidebar_bounds = TextBounds {
+                left: sidebar.min_x() as i32,
+                top: sidebar.min_y() as i32,
+                right: sidebar.max_x() as i32,
+                bottom: sidebar.max_y() as i32,
+            };
+            text_areas.push(TextArea {
+                buffer: &self.file_tree_text.buffer,
+                left: sidebar.min_x() + pad_x,
+                top: sidebar.min_y() - self.file_tree.scroll_y,
+                scale: 1.0,
+                bounds: sidebar_bounds,
+                default_color: editor_color,
+                custom_glyphs: &[],
+            });
+        }
         let hovered_close = self.hovered_close;
         for i in 0..docs_len {
             let slot_x = i as f32 * slot_w;

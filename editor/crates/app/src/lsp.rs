@@ -71,7 +71,7 @@ impl ServerKind {
 /// loads cross-crate information only when pointed at the latter. The
 /// `.git` ceiling stops us from accidentally jumping out of one project
 /// into a parent monorepo.
-fn find_project_root(start: &Path) -> Option<PathBuf> {
+pub(crate) fn find_project_root(start: &Path) -> Option<PathBuf> {
     const MARKERS: &[&str] = &[
         "Cargo.toml",
         "package.json",
