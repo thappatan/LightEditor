@@ -12,7 +12,8 @@
 use std::ops::Range;
 use std::path::Path;
 
-use tree_sitter::{Language as TsLanguage, Node, Parser};
+use editor_buffer::BufferDelta;
+use tree_sitter::{InputEdit, Language as TsLanguage, Node, Parser, Point, Tree};
 
 /// Languages we have a grammar for. New entries plug into `for_path`,
 /// `ts_language`, and the per-language `classify_*` function selected by
@@ -103,11 +104,20 @@ pub struct Highlight {
     pub category: HighlightCategory,
 }
 
-/// A reusable parser bound to one language. `highlight` re-parses the whole
-/// text every call — incremental parsing via stored old-tree is a follow-up.
+/// A reusable parser bound to one language.
+///
+/// `highlight` parses the text and stashes the resulting `Tree` for the next
+/// call. Feeding edits via [`apply_edit`](Highlighter::apply_edit) between
+/// parses lets tree-sitter touch only the changed region instead of
+/// reparsing the whole file — typically sub-millisecond on long buffers.
+/// Wholesale buffer replacements (undo, redo, file reload) must be signalled
+/// via [`reset`](Highlighter::reset) so the stale tree is dropped.
 pub struct Highlighter {
     parser: Parser,
     lang: Language,
+    /// Most recent parse tree, with any pending edits already applied via
+    /// `tree.edit()`. `None` after construction or after `reset`.
+    old_tree: Option<Tree>,
 }
 
 impl Highlighter {
@@ -116,17 +126,52 @@ impl Highlighter {
     pub fn new(lang: Language) -> Result<Self, tree_sitter::LanguageError> {
         let mut parser = Parser::new();
         parser.set_language(&lang.ts_language())?;
-        Ok(Self { parser, lang })
+        Ok(Self {
+            parser,
+            lang,
+            old_tree: None,
+        })
+    }
+
+    /// Record one buffer edit against the cached parse tree. Cheap (O(log n)
+    /// inside tree-sitter); call once per [`BufferDelta`] the editor emits
+    /// before the next [`highlight`](Highlighter::highlight) call. No-op
+    /// when there is no cached tree yet — the next parse will be from
+    /// scratch anyway.
+    pub fn apply_edit(&mut self, delta: &BufferDelta) {
+        if let Some(tree) = &mut self.old_tree {
+            tree.edit(&InputEdit {
+                start_byte: delta.start_byte,
+                old_end_byte: delta.old_end_byte,
+                new_end_byte: delta.new_end_byte,
+                start_position: point_of(delta.start_point),
+                old_end_position: point_of(delta.old_end_point),
+                new_end_position: point_of(delta.new_end_point),
+            });
+        }
+    }
+
+    /// Discard the cached parse tree. Use after undo/redo or any other
+    /// wholesale buffer replacement, so the next `highlight` reparses from
+    /// scratch instead of trying to reconcile with a stale tree.
+    pub fn reset(&mut self) {
+        self.old_tree = None;
     }
 
     /// Parse `text` and return every interesting leaf node as a `Highlight`.
     /// Empty input returns an empty `Vec`. Tree-sitter parse failure
     /// (e.g. invalid UTF-8 in source) is also treated as no highlights.
+    ///
+    /// When a cached tree is present (with edits already applied), the
+    /// parse is incremental — tree-sitter only re-examines the affected
+    /// subtrees.
     pub fn highlight(&mut self, text: &str) -> Vec<Highlight> {
         if text.is_empty() {
+            // An empty buffer has no meaningful tree to cache.
+            self.old_tree = None;
             return Vec::new();
         }
-        let Some(tree) = self.parser.parse(text, None) else {
+        let Some(tree) = self.parser.parse(text, self.old_tree.as_ref()) else {
             return Vec::new();
         };
         let byte_to_char = build_byte_to_char_map(text);
@@ -140,8 +185,13 @@ impl Highlighter {
             classifier,
             &mut out,
         );
+        self.old_tree = Some(tree);
         out
     }
+}
+
+fn point_of(p: editor_buffer::BytePoint) -> Point {
+    Point::new(p.row, p.column)
 }
 
 /// Build a `byte → char` lookup over `text`. Length = `text.len() + 1`.
@@ -965,6 +1015,75 @@ fn x() {}
         let src = "function greet() { return 1; }";
         let hs = highlights_of(Language::TypeScript, src);
         assert!(hs.iter().any(|h| h.category == HighlightCategory::Function));
+    }
+
+    // ── incremental parsing ───────────────────────────────────────────────
+
+    #[test]
+    fn first_highlight_call_caches_a_tree() {
+        let mut h = Highlighter::new(Language::Rust).unwrap();
+        assert!(h.old_tree.is_none(), "fresh highlighter has no cached tree");
+        h.highlight("let x = 1;");
+        assert!(h.old_tree.is_some(), "highlight caches the parse tree");
+    }
+
+    #[test]
+    fn reset_drops_the_cached_tree() {
+        let mut h = Highlighter::new(Language::Rust).unwrap();
+        h.highlight("let x = 1;");
+        h.reset();
+        assert!(h.old_tree.is_none());
+    }
+
+    #[test]
+    fn empty_text_clears_the_cached_tree() {
+        let mut h = Highlighter::new(Language::Rust).unwrap();
+        h.highlight("let x = 1;");
+        assert!(h.old_tree.is_some());
+        h.highlight("");
+        assert!(h.old_tree.is_none(), "empty input drops the stale tree");
+    }
+
+    #[test]
+    fn apply_edit_without_cached_tree_is_a_noop() {
+        let mut h = Highlighter::new(Language::Rust).unwrap();
+        // Construct a delta by hand — it should not panic with no cached tree.
+        let delta = BufferDelta {
+            start_byte: 0,
+            old_end_byte: 0,
+            new_end_byte: 1,
+            start_point: editor_buffer::BytePoint { row: 0, column: 0 },
+            old_end_point: editor_buffer::BytePoint { row: 0, column: 0 },
+            new_end_point: editor_buffer::BytePoint { row: 0, column: 1 },
+        };
+        h.apply_edit(&delta);
+        assert!(h.old_tree.is_none());
+    }
+
+    #[test]
+    fn incremental_reparse_produces_same_highlights_as_full_reparse() {
+        // Start with one buffer, parse it, apply an edit + reparse;
+        // compare with a fresh highlighter that parses the post-edit text
+        // from scratch.
+        let before = "fn a() { let x = 1; }";
+        let after = "fn a() { let xx = 1; }"; // insert one char "x" at byte 14
+        let mut incremental = Highlighter::new(Language::Rust).unwrap();
+        incremental.highlight(before);
+        let delta = BufferDelta {
+            start_byte: 14,
+            old_end_byte: 14,
+            new_end_byte: 15,
+            start_point: editor_buffer::BytePoint { row: 0, column: 14 },
+            old_end_point: editor_buffer::BytePoint { row: 0, column: 14 },
+            new_end_point: editor_buffer::BytePoint { row: 0, column: 15 },
+        };
+        incremental.apply_edit(&delta);
+        let incremental_hs = incremental.highlight(after);
+
+        let mut fresh = Highlighter::new(Language::Rust).unwrap();
+        let fresh_hs = fresh.highlight(after);
+
+        assert_eq!(incremental_hs, fresh_hs);
     }
 
     #[test]

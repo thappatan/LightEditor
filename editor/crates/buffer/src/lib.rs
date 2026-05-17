@@ -9,9 +9,11 @@
 //! except where a name says `_byte`.
 
 mod buffer;
+mod delta;
 mod line_ending;
 mod position;
 
 pub use buffer::TextBuffer;
+pub use delta::{BufferDelta, BytePoint};
 pub use line_ending::LineEnding;
 pub use position::Position;

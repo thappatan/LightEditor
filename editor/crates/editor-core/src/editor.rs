@@ -1,10 +1,20 @@
 //! The editor — a buffer, its selections, and an undo history, with the
 //! editing and movement operations that tie them together (spec §4.1.1).
 
-use editor_buffer::{Position, TextBuffer};
+use editor_buffer::{BufferDelta, Position, TextBuffer};
 use unicode_segmentation::GraphemeCursor;
 
 use crate::{Selection, SelectionSet, UndoTree};
+
+/// Edits accumulated since the last drain, plus a flag set when the buffer
+/// was replaced wholesale (undo/redo). A `tree_invalidated == true` means
+/// the deltas can be ignored — the caller should reset any cached parse
+/// tree and reparse from scratch.
+#[derive(Debug, Clone, Default)]
+pub struct PendingEdits {
+    pub tree_invalidated: bool,
+    pub edits: Vec<BufferDelta>,
+}
 
 /// A text buffer plus its multi-cursor selection state and tree-based undo
 /// history.
@@ -22,6 +32,17 @@ pub struct Editor {
     /// changes the buffer text. Callers cache derived data keyed on this
     /// number and skip recomputation when it hasn't moved.
     revision: u64,
+    /// Edits accumulated since the last [`take_pending_edits`] call. Drained
+    /// by the syntax highlighter so its cached parse tree can be updated
+    /// incrementally instead of re-parsed from scratch.
+    ///
+    /// [`take_pending_edits`]: Editor::take_pending_edits
+    pending_edits: Vec<BufferDelta>,
+    /// Set when the buffer was replaced wholesale (undo/redo): callers
+    /// should drop any cached parse tree because `pending_edits` no longer
+    /// describes the path from the previously-parsed text to the current
+    /// text.
+    tree_invalidated: bool,
 }
 
 impl Editor {
@@ -52,6 +73,18 @@ impl Editor {
     /// on the buffer's current text.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Drain edits accumulated since the last call (and whether the cached
+    /// parse tree should be reset). Callers feed the deltas into the syntax
+    /// highlighter so it can update its tree incrementally; if
+    /// `tree_invalidated` is `true` the deltas are discarded and the tree
+    /// is rebuilt from scratch.
+    pub fn take_pending_edits(&mut self) -> PendingEdits {
+        PendingEdits {
+            tree_invalidated: std::mem::take(&mut self.tree_invalidated),
+            edits: std::mem::take(&mut self.pending_edits),
+        }
     }
 
     // ── edit operations (applied at every selection) ──────────────────────
@@ -311,7 +344,7 @@ impl Editor {
         };
         let region_start = block_start.min(adj_start);
         let region_end = block_end.max(adj_end);
-        self.buffer.replace(region_start..region_end, &replacement);
+        self.record_replace(region_start..region_end, &replacement);
 
         // Track the selection: shift anchor and head by (signed) the
         // adjacent line's length in the right direction.
@@ -367,7 +400,7 @@ impl Editor {
             let Some(line_start) = self.buffer.position_to_char(Position::new(line, 0)) else {
                 continue;
             };
-            self.buffer.insert(line_start, indent);
+            self.record_insert(line_start, indent);
             if anchor >= line_start {
                 anchor += indent_len;
             }
@@ -410,7 +443,7 @@ impl Editor {
             let Some(line_start) = self.buffer.position_to_char(Position::new(line, 0)) else {
                 continue;
             };
-            self.buffer.remove(line_start..line_start + to_remove);
+            self.record_remove(line_start..line_start + to_remove);
             if anchor > line_start {
                 anchor = anchor.saturating_sub(to_remove);
             }
@@ -478,7 +511,7 @@ impl Editor {
                     continue;
                 };
                 let remove_at = line_start + leading_ws;
-                self.buffer.remove(remove_at..remove_at + total);
+                self.record_remove(remove_at..remove_at + total);
                 if anchor > remove_at {
                     anchor = anchor.saturating_sub(total);
                 }
@@ -505,7 +538,7 @@ impl Editor {
                     continue;
                 };
                 let insert_at = line_start + leading_ws;
-                self.buffer.insert(insert_at, &payload);
+                self.record_insert(insert_at, &payload);
                 if anchor >= insert_at {
                     anchor += payload_chars;
                 }
@@ -599,6 +632,7 @@ impl Editor {
                 self.buffer = buffer;
                 self.selections = selections;
                 self.revision = self.revision.wrapping_add(1);
+                self.invalidate_tree();
                 true
             }
             None => false,
@@ -613,6 +647,7 @@ impl Editor {
                 self.buffer = buffer;
                 self.selections = selections;
                 self.revision = self.revision.wrapping_add(1);
+                self.invalidate_tree();
                 true
             }
             None => false,
@@ -656,7 +691,7 @@ impl Editor {
             let (range, text) = &plans[i];
             let old_len = range.len();
             let new_len = text.chars().count();
-            self.buffer.replace(range.clone(), text);
+            self.record_replace(range.clone(), text);
             sels[i] = Selection::cursor(range.start + new_len);
 
             // Everything after edit `i` sat past `range.start`, so it shifts.
@@ -755,6 +790,48 @@ impl Editor {
         self.undo
             .commit(self.buffer.clone(), self.selections.clone());
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Apply `text` over `range` (in `char`s) on the buffer and capture the
+    /// resulting `BufferDelta` so callers (the syntax highlighter) can
+    /// update a cached parse tree without reparsing the whole text. Every
+    /// direct buffer write funnels through here.
+    fn record_replace(&mut self, range: std::ops::Range<usize>, text: &str) {
+        let start_char = range.start;
+        let start_byte = self.buffer.char_to_byte(start_char);
+        let start_point = self.buffer.byte_point(start_char);
+        let old_end_byte = self.buffer.char_to_byte(range.end);
+        let old_end_point = self.buffer.byte_point(range.end);
+        self.buffer.replace(range, text);
+        let new_end_char = start_char + text.chars().count();
+        let new_end_byte = self.buffer.char_to_byte(new_end_char);
+        let new_end_point = self.buffer.byte_point(new_end_char);
+        self.pending_edits.push(BufferDelta {
+            start_byte,
+            old_end_byte,
+            new_end_byte,
+            start_point,
+            old_end_point,
+            new_end_point,
+        });
+    }
+
+    /// Convenience wrapper for a pure insertion.
+    fn record_insert(&mut self, char_idx: usize, text: &str) {
+        self.record_replace(char_idx..char_idx, text);
+    }
+
+    /// Convenience wrapper for a pure deletion.
+    fn record_remove(&mut self, range: std::ops::Range<usize>) {
+        self.record_replace(range, "");
+    }
+
+    /// Mark the cached parse tree as invalid (used by undo/redo when the
+    /// whole buffer is replaced). Any unsent edits are dropped because they
+    /// no longer describe the path to the current text.
+    fn invalidate_tree(&mut self) {
+        self.pending_edits.clear();
+        self.tree_invalidated = true;
     }
 
     /// Number of `char`s in `line`, excluding any trailing `\n` or `\r\n`.
@@ -892,6 +969,8 @@ impl From<TextBuffer> for Editor {
             selections,
             undo,
             revision: 0,
+            pending_edits: Vec::new(),
+            tree_invalidated: false,
         }
     }
 }
@@ -1419,6 +1498,100 @@ mod tests {
         ed.move_left(false);
         ed.move_right(true);
         assert_eq!(ed.revision(), r0);
+    }
+
+    // ── pending edits (for incremental syntax parsing) ────────────────────
+
+    #[test]
+    fn insert_records_a_pure_insertion_delta() {
+        let mut ed = Editor::new();
+        ed.insert("hi");
+        let drained = ed.take_pending_edits();
+        assert!(!drained.tree_invalidated);
+        assert_eq!(drained.edits.len(), 1);
+        let d = drained.edits[0];
+        // Pure insertion at offset 0 of an empty buffer.
+        assert_eq!(d.start_byte, 0);
+        assert_eq!(d.old_end_byte, 0);
+        assert_eq!(d.new_end_byte, 2);
+        assert_eq!(d.start_point.row, 0);
+        assert_eq!(d.new_end_point.column, 2);
+    }
+
+    #[test]
+    fn backspace_records_a_pure_deletion_delta() {
+        let mut ed = Editor::from("hi");
+        ed.set_selection(Selection::cursor(2));
+        ed.take_pending_edits(); // discard the no-op drain after seed
+        ed.backspace();
+        let drained = ed.take_pending_edits();
+        let d = drained.edits[0];
+        // Deletion: old_end > start_byte; new_end == start_byte.
+        assert_eq!(d.start_byte, 1);
+        assert_eq!(d.old_end_byte, 2);
+        assert_eq!(d.new_end_byte, 1);
+    }
+
+    #[test]
+    fn deltas_use_utf8_byte_offsets() {
+        // "ก" — 3 UTF-8 bytes; inserting "x" between the two clusters
+        // should put start_byte at byte 3, not char 1.
+        let mut ed = Editor::from("กก");
+        ed.set_selection(Selection::cursor(1));
+        ed.take_pending_edits();
+        ed.insert("x");
+        let d = ed.take_pending_edits().edits[0];
+        assert_eq!(d.start_byte, 3);
+        assert_eq!(d.new_end_byte, 4);
+    }
+
+    #[test]
+    fn multi_cursor_insert_records_one_delta_per_caret() {
+        let mut ed = Editor::from("a\nb\nc");
+        ed.add_selection(Selection::cursor(2));
+        ed.add_selection(Selection::cursor(4));
+        ed.take_pending_edits();
+        ed.insert("> ");
+        let drained = ed.take_pending_edits();
+        assert_eq!(drained.edits.len(), 3);
+        // Back-to-front: highest byte offset comes first.
+        assert!(drained.edits[0].start_byte > drained.edits[1].start_byte);
+    }
+
+    #[test]
+    fn undo_invalidates_tree_and_drops_pending_edits() {
+        let mut ed = Editor::from("a");
+        ed.insert("b");
+        ed.undo();
+        let drained = ed.take_pending_edits();
+        assert!(drained.tree_invalidated);
+        assert!(drained.edits.is_empty());
+    }
+
+    #[test]
+    fn take_pending_edits_clears_state() {
+        let mut ed = Editor::new();
+        ed.insert("x");
+        let first = ed.take_pending_edits();
+        assert_eq!(first.edits.len(), 1);
+        let second = ed.take_pending_edits();
+        assert!(second.edits.is_empty());
+        assert!(!second.tree_invalidated);
+    }
+
+    #[test]
+    fn indent_lines_records_one_delta_per_line() {
+        let mut ed = Editor::from("a\nb\nc");
+        ed.set_selection(Selection::new(0, ed.text().chars().count()));
+        ed.take_pending_edits();
+        ed.indent_lines("  ");
+        let drained = ed.take_pending_edits();
+        assert_eq!(drained.edits.len(), 3);
+        // Each delta is a pure insertion.
+        for d in &drained.edits {
+            assert_eq!(d.old_end_byte, d.start_byte);
+            assert_eq!(d.new_end_byte - d.start_byte, 2);
+        }
     }
 
     #[test]

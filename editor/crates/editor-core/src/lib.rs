@@ -12,12 +12,13 @@ mod selection;
 mod selection_set;
 mod undo;
 
-pub use editor::Editor;
+pub use editor::{Editor, PendingEdits};
 pub use selection::Selection;
 pub use selection_set::SelectionSet;
 pub use undo::UndoTree;
 
 // Re-exported: callers placing selections from pixel coordinates (mouse input)
 // need `Position` to talk to the buffer; `LineEnding` is exposed so status-bar
-// UI can name the dominant convention without depending on `editor-buffer`.
-pub use editor_buffer::{LineEnding, Position};
+// UI can name the dominant convention without depending on `editor-buffer`;
+// `BufferDelta` flows from edits → the syntax crate's incremental parser.
+pub use editor_buffer::{BufferDelta, BytePoint, LineEnding, Position};
