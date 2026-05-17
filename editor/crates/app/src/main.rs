@@ -13,6 +13,7 @@
 mod document;
 mod file_tree;
 mod find;
+mod find_in_files;
 mod git;
 mod lsp;
 mod palette;
@@ -34,6 +35,7 @@ use editor_ui_text::glyphon::{
 use editor_ui_text::{TextGpu, TextStack};
 use file_tree::{ClickResult, FileTree, NodeKind};
 use find::{FindBar, FindFocus};
+use find_in_files::FindInFiles;
 use lsp::{LspEvent, LspState};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use palette::{Command, CommandPalette};
@@ -310,6 +312,15 @@ const DIAG_DOT_DIP: f32 = 6.0;
 /// the shaped text (see `refresh_file_tree_text`).
 const SIDEBAR_WIDTH_DIP: f32 = 240.0;
 const SIDEBAR_PAD_X_DIP: f32 = 8.0;
+
+/// Find-in-files panel (M3) — large centred overlay with the input
+/// row at the top and matched lines below.
+const FIND_FILES_WIDTH_DIP: f32 = 760.0;
+const FIND_FILES_HEIGHT_DIP: f32 = 500.0;
+const FIND_FILES_PAD_DIP: f32 = 12.0;
+/// Result rows offset within the panel — input row + status row + a
+/// blank divider row leaves results starting at row 3.
+const FIND_FILES_HEADER_ROWS: usize = 3;
 
 /// Subdirectory under the user's XDG config dir that holds settings.toml.
 const CONFIG_SUBDIR: &str = "lighteditor";
@@ -615,6 +626,18 @@ fn severity_rank(s: lsp_types::DiagnosticSeverity) -> u8 {
     }
 }
 
+/// Adjust the find-in-files panel's scroll so `selected` is inside
+/// the `visible`-row window. Handles both directions: selection past
+/// the bottom edge pulls scroll forward; selection above the top
+/// edge pulls it back.
+fn scroll_into_view(f: &mut FindInFiles, visible: usize) {
+    if f.selected < f.scroll {
+        f.scroll = f.selected;
+    } else if f.selected >= f.scroll + visible {
+        f.scroll = f.selected + 1 - visible;
+    }
+}
+
 /// Pick a quad colour for one git-gutter line status. Conventions match
 /// VS Code: green added / blue modified / red deletion wedge. Themable
 /// later via a dedicated section in the theme TOML; hardcoded for v1.
@@ -858,6 +881,13 @@ struct State {
     file_tree: FileTree,
     /// Dedicated TextStack for the sidebar's row labels.
     file_tree_text: TextStack,
+    /// Find-in-files overlay (M3). `Some` while the panel is open;
+    /// `None` once the user dismisses it. Re-opening builds a fresh
+    /// state — there's no value in remembering an old query.
+    find_in_files: Option<FindInFiles>,
+    /// Dedicated TextStack for the find-in-files panel (input row +
+    /// status row + matched lines).
+    find_in_files_text: TextStack,
 
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
@@ -1033,6 +1063,15 @@ impl State {
             "",
         );
 
+        let find_in_files_text = TextStack::new(
+            &mut font_system,
+            (FIND_FILES_WIDTH_DIP - 2.0 * FIND_FILES_PAD_DIP) * scale,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "",
+        );
+
         // Derive the sidebar's root from the active doc's workspace
         // (the same find_project_root walk the LSP layer uses), falling
         // back to CWD when no doc has a path yet.
@@ -1093,6 +1132,8 @@ impl State {
             completion_text,
             file_tree,
             file_tree_text,
+            find_in_files: None,
+            find_in_files_text,
             tab_spaces,
             theme,
             pending_keystroke: None,
@@ -1352,7 +1393,11 @@ impl State {
                 let alt = self.modifiers.alt_key();
                 match lower.as_str() {
                     "f" => {
-                        if self.doc().find.is_some() {
+                        // Cmd-Shift-F → project-wide search; Cmd-F →
+                        // find in the current buffer.
+                        if self.modifiers.shift_key() {
+                            self.toggle_find_in_files();
+                        } else if self.doc().find.is_some() {
                             self.close_find();
                         } else {
                             self.open_find();
@@ -1519,6 +1564,92 @@ impl State {
         let shift = self.modifiers.shift_key();
         let alt = self.modifiers.alt_key();
         let cmd = is_cmd_or_ctrl(self.modifiers);
+
+        // Find-in-files panel intercepts every key while open — typing
+        // edits the query, Enter runs / opens, ↑/↓ navigate, Tab flips
+        // focus, Esc dismisses.
+        if self.find_in_files.is_some() {
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.find_in_files = None;
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let input_focused =
+                        self.find_in_files.as_ref().is_some_and(|f| f.input_focused);
+                    if input_focused {
+                        self.run_find_in_files();
+                    } else {
+                        self.open_selected_find_result();
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::Tab) => {
+                    if let Some(f) = self.find_in_files.as_mut() {
+                        f.input_focused = !f.input_focused;
+                    }
+                    self.refresh_find_in_files_text();
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    let visible = self.find_in_files_visible_rows();
+                    if let Some(f) = self.find_in_files.as_mut() {
+                        f.input_focused = false;
+                        f.select_next();
+                        scroll_into_view(f, visible);
+                    }
+                    self.refresh_find_in_files_text();
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    let visible = self.find_in_files_visible_rows();
+                    if let Some(f) = self.find_in_files.as_mut() {
+                        f.input_focused = false;
+                        f.select_prev();
+                        scroll_into_view(f, visible);
+                    }
+                    self.refresh_find_in_files_text();
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(f) = self.find_in_files.as_mut() {
+                        if f.input_focused {
+                            f.query.pop();
+                        }
+                    }
+                    self.refresh_find_in_files_text();
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                    return;
+                }
+                _ => {
+                    // Printable input → append to query when input is
+                    // focused. Modifiers (cmd/ctrl/alt) other than
+                    // shift fall through so Cmd-Shift-F can re-toggle.
+                    if cmd || alt {
+                        // Let the outer matcher handle it.
+                    } else if let Some(text) = event.text.as_deref() {
+                        if let Some(f) = self.find_in_files.as_mut() {
+                            if f.input_focused && !text.is_empty() {
+                                f.query.push_str(text);
+                                self.refresh_find_in_files_text();
+                                self.scene_dirty = true;
+                                self.window.request_redraw();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Completion popup intercepts navigation + accept + dismiss keys.
         // Runs before the main matcher so Enter accepts the suggestion
@@ -1729,6 +1860,35 @@ impl State {
             return;
         };
         self.note_activity();
+        // Find-in-files panel claims clicks first while open — clicking
+        // a result row opens that file; clicking the input row focuses
+        // it; clicking outside the panel dismisses it.
+        if self.find_in_files.is_some() {
+            if let Some(row) = self.find_in_files_row_at(mx, my) {
+                if let Some(f) = self.find_in_files.as_mut() {
+                    f.selected = row;
+                    f.input_focused = false;
+                }
+                self.open_selected_find_result();
+                return;
+            }
+            let panel = self.find_in_files_panel_rect();
+            if !panel.contains(Point::new(mx, my)) {
+                self.find_in_files = None;
+                self.scene_dirty = true;
+                self.window.request_redraw();
+                return;
+            }
+            // Click inside the panel but not on a result — focus the
+            // input so the user can keep typing.
+            if let Some(f) = self.find_in_files.as_mut() {
+                f.input_focused = true;
+            }
+            self.refresh_find_in_files_text();
+            self.scene_dirty = true;
+            self.window.request_redraw();
+            return;
+        }
         if let Some(idx) = self.tab_close_at_pixel(mx, my) {
             self.close_tab_at(idx);
             return;
@@ -2511,6 +2671,165 @@ impl State {
                 self.open_path(path);
             }
         }
+    }
+
+    // ── Find-in-files (Cmd-Shift-F) ───────────────────────────────────────
+
+    /// Open or close the find-in-files overlay. Opening starts with a
+    /// blank query focused on the input row.
+    fn toggle_find_in_files(&mut self) {
+        if self.find_in_files.is_some() {
+            self.find_in_files = None;
+        } else {
+            self.find_in_files = Some(FindInFiles::new());
+            self.refresh_find_in_files_text();
+        }
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Run the project-wide search with the current query and refresh
+    /// the panel. Root is `file_tree.root` (which is the same project
+    /// root the LSP uses).
+    fn run_find_in_files(&mut self) {
+        let root = self.file_tree.root.clone();
+        let Some(f) = self.find_in_files.as_mut() else {
+            return;
+        };
+        f.results = find_in_files::search(&f.query, &root);
+        f.selected = 0;
+        f.scroll = 0;
+        // Move focus to the results list so Enter now opens; ↑/↓
+        // navigate; Tab can flip back to the input to refine the query.
+        f.input_focused = f.results.is_empty();
+        self.refresh_find_in_files_text();
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Open the currently-selected match and close the panel.
+    fn open_selected_find_result(&mut self) {
+        let Some(f) = self.find_in_files.as_ref() else {
+            return;
+        };
+        let Some(m) = f.results.get(f.selected) else {
+            return;
+        };
+        let path = m.path.clone();
+        let target_line = m.line;
+        self.find_in_files = None;
+        self.open_path(path);
+        // Jump the caret to the matching line. `open_path` activates
+        // the doc; resolve the line's char index and set the selection.
+        let buf = self.docs[self.active].editor.buffer();
+        if let Some(char_idx) = buf.position_to_char(Position::new(target_line, 0)) {
+            self.docs[self.active]
+                .editor
+                .set_selection(Selection::cursor(char_idx));
+            self.follow_caret = true;
+            self.scene_dirty = true;
+            self.window.request_redraw();
+        }
+    }
+
+    /// Reshape the find-in-files panel's text from the current state.
+    /// Only the visible window of result rows is fed to cosmic-text —
+    /// scrolling through a 500-match list stays cheap because the
+    /// shape budget is bounded by `find_in_files_visible_rows()`.
+    /// Layout: row 0 = "Search: <query>", row 1 = status, row 2 blank,
+    /// row 3..N = results inside the visible window.
+    fn refresh_find_in_files_text(&mut self) {
+        let visible = self.find_in_files_visible_rows();
+        let workspace = self.file_tree.root.clone();
+        let text = {
+            let Some(f) = self.find_in_files.as_ref() else {
+                return;
+            };
+            let mut s = String::with_capacity(64 + visible * 80);
+            // Caret marker on the input line shows focus state at a
+            // glance: solid ▎ when typing, dim when results have focus.
+            let caret = if f.input_focused { '▎' } else { ' ' };
+            s.push_str(&format!("Search: {}{caret}\n", f.query));
+            if f.results.is_empty() {
+                s.push_str(if f.query.is_empty() {
+                    "type a query and press Enter\n"
+                } else {
+                    "no matches (press Enter to search)\n"
+                });
+            } else {
+                let end = (f.scroll + visible).min(f.results.len());
+                s.push_str(&format!(
+                    "{} match(es), showing {}-{} — ↑↓ navigates, wheel pages, Enter opens, Esc closes\n",
+                    f.results.len(),
+                    f.scroll + 1,
+                    end,
+                ));
+            }
+            s.push('\n');
+            let end = (f.scroll + visible).min(f.results.len());
+            for m in &f.results[f.scroll..end] {
+                let rel = m.path.strip_prefix(&workspace).unwrap_or(&m.path).display();
+                let trimmed = m.line_text.trim();
+                s.push_str(&format!("{rel}:{} {trimmed}\n", m.line + 1));
+            }
+            s
+        };
+        self.find_in_files_text
+            .set_content(&mut self.font_system, &text);
+    }
+
+    /// Geometry of the find-in-files panel — centred horizontally,
+    /// pinned a third of the way down vertically.
+    fn find_in_files_panel_rect(&self) -> Rect {
+        let w = FIND_FILES_WIDTH_DIP * self.scale;
+        let h = FIND_FILES_HEIGHT_DIP * self.scale;
+        let surface_w = self.gpu.surface_config.width as f32;
+        let surface_h = self.gpu.surface_config.height as f32;
+        let left = ((surface_w - w) / 2.0).max(0.0);
+        let top = (surface_h / 4.0).max(40.0 * self.scale);
+        Rect::new(left, top, w, h)
+    }
+
+    fn find_in_files_text_origin(&self) -> (f32, f32) {
+        let panel = self.find_in_files_panel_rect();
+        let pad = FIND_FILES_PAD_DIP * self.scale;
+        (panel.min_x() + pad, panel.min_y() + pad)
+    }
+
+    /// Selection-row rect for the currently-highlighted result. None
+    /// when focus is on the input row (no result highlight) or the
+    /// list is empty.
+    fn find_in_files_selection_rect(&self) -> Option<Rect> {
+        let f = self.find_in_files.as_ref()?;
+        if f.input_focused || f.results.is_empty() {
+            return None;
+        }
+        let panel = self.find_in_files_panel_rect();
+        let pad = FIND_FILES_PAD_DIP * self.scale;
+        let line_h = self.line_height();
+        let visible_idx = f.selected.checked_sub(f.scroll)?;
+        let row = FIND_FILES_HEADER_ROWS + visible_idx;
+        let y = panel.min_y() + pad + (row as f32) * line_h;
+        Some(Rect::new(panel.min_x(), y, panel.size.width, line_h))
+    }
+
+    /// Hit-test a click against the find-in-files panel. Returns the
+    /// result index if the click landed on one of the result rows.
+    fn find_in_files_row_at(&self, x: f32, y: f32) -> Option<usize> {
+        let f = self.find_in_files.as_ref()?;
+        let panel = self.find_in_files_panel_rect();
+        if !panel.contains(Point::new(x, y)) {
+            return None;
+        }
+        let pad = FIND_FILES_PAD_DIP * self.scale;
+        let line_h = self.line_height();
+        let local_y = y - panel.min_y() - pad;
+        let row = (local_y / line_h) as i32 - FIND_FILES_HEADER_ROWS as i32;
+        if row < 0 {
+            return None;
+        }
+        let idx = row as usize + f.scroll;
+        (idx < f.results.len()).then_some(idx)
     }
 
     /// Select the logical line under `y`. Reuses the editor's shaped layout
@@ -4236,8 +4555,21 @@ impl State {
         self.window.request_redraw();
     }
 
-    /// Mouse wheel: scroll the active document vertically.
+    /// Mouse wheel: scroll the find-in-files panel if the pointer is
+    /// inside it; otherwise scroll the active document vertically.
     fn handle_scroll(&mut self, delta_y: f32) {
+        // Find-in-files panel claims wheel events while open and the
+        // pointer is over it — otherwise scroll wheel just falls
+        // through to the editor.
+        if self.find_in_files.is_some() {
+            if let Some((mx, my)) = self.mouse_pos {
+                let panel = self.find_in_files_panel_rect();
+                if panel.contains(Point::new(mx, my)) {
+                    self.scroll_find_in_files(delta_y);
+                    return;
+                }
+            }
+        }
         let max = self.max_scroll();
         let current = self.doc().scroll_y;
         let new = (current - delta_y).clamp(0.0, max);
@@ -4246,6 +4578,47 @@ impl State {
             self.scene_dirty = true;
             self.window.request_redraw();
         }
+    }
+
+    /// Scroll the find-in-files results list by the wheel-equivalent
+    /// number of rows.
+    fn scroll_find_in_files(&mut self, delta_y: f32) {
+        let line_h = self.line_height();
+        // Convert pixel delta to row delta (round up so even a small
+        // wheel tick advances one row).
+        let row_delta = (delta_y / line_h).round() as i32;
+        if row_delta == 0 {
+            return;
+        }
+        let visible = self.find_in_files_visible_rows();
+        let max_scroll = {
+            let Some(f) = self.find_in_files.as_ref() else {
+                return;
+            };
+            f.results.len().saturating_sub(visible)
+        };
+        if let Some(f) = self.find_in_files.as_mut() {
+            let new = (f.scroll as i32 - row_delta).clamp(0, max_scroll as i32) as usize;
+            if new == f.scroll {
+                return;
+            }
+            f.scroll = new;
+        }
+        self.refresh_find_in_files_text();
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// How many result rows fit inside the panel given its height and
+    /// the current line metric. At least 1 so the math doesn't divide
+    /// by zero on a too-small window.
+    fn find_in_files_visible_rows(&self) -> usize {
+        let panel = self.find_in_files_panel_rect();
+        let pad = FIND_FILES_PAD_DIP * self.scale;
+        let inner_h = (panel.size.height - 2.0 * pad).max(0.0);
+        let line_h = self.line_height();
+        let total_rows = (inner_h / line_h) as usize;
+        total_rows.saturating_sub(FIND_FILES_HEADER_ROWS).max(1)
     }
 
     /// Total shaped text height in physical pixels — visual, not logical:
@@ -4629,6 +5002,21 @@ impl State {
                     highlight,
                     quad_color(&et.palette_selection_bg),
                 ));
+            }
+        }
+        if self.find_in_files.is_some() {
+            // Scrim dims the editor behind the search panel so the
+            // focus is unambiguous.
+            root.push_child(SceneNode::quad(
+                Rect::new(0.0, 0.0, w, h),
+                quad_color(&et.overlay_scrim),
+            ));
+            root.push_child(SceneNode::quad(
+                self.find_in_files_panel_rect(),
+                quad_color(&et.overlay_bg),
+            ));
+            if let Some(rect) = self.find_in_files_selection_rect() {
+                root.push_child(SceneNode::quad(rect, quad_color(&et.palette_selection_bg)));
             }
         }
 
@@ -5122,6 +5510,25 @@ impl State {
                 buffer: &self.completion_text.buffer,
                 left: cx,
                 top: cy,
+                scale: 1.0,
+                bounds,
+                default_color: editor_color,
+                custom_glyphs: &[],
+            });
+        }
+        if self.find_in_files.is_some() {
+            let (fx, fy) = self.find_in_files_text_origin();
+            let panel = self.find_in_files_panel_rect();
+            let bounds = TextBounds {
+                left: panel.min_x() as i32,
+                top: panel.min_y() as i32,
+                right: panel.max_x() as i32,
+                bottom: panel.max_y() as i32,
+            };
+            overlay_text_areas.push(TextArea {
+                buffer: &self.find_in_files_text.buffer,
+                left: fx,
+                top: fy,
                 scale: 1.0,
                 bounds,
                 default_color: editor_color,
