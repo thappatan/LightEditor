@@ -12,8 +12,10 @@
 
 mod document;
 mod find;
+mod lsp;
 mod palette;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,7 +23,7 @@ use std::time::{Duration, Instant};
 use document::Document;
 use editor_config::{parse_hex_color, Settings, Theme};
 use editor_core::{LineEnding, Position, Selection};
-use editor_syntax::{Highlight, HighlightCategory};
+use editor_syntax::{Highlight, HighlightCategory, Language};
 use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Point, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{
@@ -29,6 +31,7 @@ use editor_ui_text::glyphon::{
 };
 use editor_ui_text::{TextGpu, TextStack};
 use find::{FindBar, FindFocus};
+use lsp::{LspEvent, LspState};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use palette::{Command, CommandPalette};
 use wgpu::{
@@ -57,6 +60,10 @@ enum AppEvent {
     /// handler decides whether to flip visibility (skips when recent
     /// interaction).
     CaretTick,
+    /// Periodic poke to drain LSP server stdout queues. Without this,
+    /// publishDiagnostics arriving during an idle window would not surface
+    /// until the next user interaction.
+    LspPoll,
 }
 
 /// How long a "settings reloaded" flash stays on the status bar.
@@ -65,6 +72,17 @@ const FLASH_DURATION: Duration = Duration::from_millis(2000);
 /// Half-cycle of the caret blink — solid for this long, then hidden for the
 /// same. 530ms matches VSCode's smooth-blink cadence.
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+/// One in-flight hover popup. `anchor_char` lets the popup follow the
+/// caret through scrolls without reshaping. The shaped body lives on the
+/// `hover_text` TextStack — this struct holds only the anchor.
+struct HoverPopup {
+    anchor_char: usize,
+}
+
+/// How often the LSP polling thread fires. 100 ms is fast enough that
+/// diagnostics appear immediately to the eye, and slow enough that idle
+/// CPU stays near zero.
+const LSP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// After any interaction (keystroke / click), the caret stays solid for at
 /// least this long so it never blinks during active typing.
 const CARET_BLINK_PAUSE: Duration = Duration::from_millis(500);
@@ -140,6 +158,16 @@ const PALETTE_PAD_DIP: f32 = 12.0;
 const FIND_WIDTH_DIP: f32 = 480.0;
 const FIND_TOP_DIP: f32 = 16.0;
 const FIND_PAD_DIP: f32 = 8.0;
+
+/// Hover-popup overlay (LSP) — wraps the server's reply at this width.
+const HOVER_WIDTH_DIP: f32 = 480.0;
+const HOVER_PAD_DIP: f32 = 8.0;
+/// Maximum rendered height. Long hovers from rust-analyzer are clipped
+/// rather than scrolled — scrolling is a follow-up.
+const HOVER_MAX_HEIGHT_DIP: f32 = 240.0;
+
+/// Width of the diagnostic indicator drawn in the gutter, in logical px.
+const DIAG_DOT_DIP: f32 = 6.0;
 
 /// Subdirectory under the user's XDG config dir that holds settings.toml.
 const CONFIG_SUBDIR: &str = "lighteditor";
@@ -416,6 +444,49 @@ fn filename_for_flash(p: &Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
+/// Flatten an LSP `HoverContents` (one of three shapes — string, marked
+/// string, or marked-string array) into a single plain-text body the
+/// hover popup can render. Markdown is *not* rendered yet; it shows as
+/// raw markup.
+fn hover_contents_to_string(c: &lsp_types::HoverContents) -> String {
+    use lsp_types::{HoverContents, MarkedString};
+    let to_text = |m: &MarkedString| match m {
+        MarkedString::String(s) => s.clone(),
+        MarkedString::LanguageString(ls) => ls.value.clone(),
+    };
+    match c {
+        HoverContents::Scalar(s) => to_text(s),
+        HoverContents::Array(items) => items.iter().map(to_text).collect::<Vec<_>>().join("\n\n"),
+        HoverContents::Markup(m) => m.value.clone(),
+    }
+}
+
+/// Rank a `DiagnosticSeverity` so the "highest" (most severe) one can be
+/// picked when several diagnostics share a line. Lower number wins.
+fn severity_rank(s: lsp_types::DiagnosticSeverity) -> u8 {
+    match s {
+        lsp_types::DiagnosticSeverity::ERROR => 0,
+        lsp_types::DiagnosticSeverity::WARNING => 1,
+        lsp_types::DiagnosticSeverity::INFORMATION => 2,
+        lsp_types::DiagnosticSeverity::HINT => 3,
+        _ => 4,
+    }
+}
+
+/// Pick a quad colour for one diagnostic severity. Uses the theme's syntax
+/// strings so themes can override the palette later; for now, fall back
+/// to fixed hexes if any are missing.
+fn diagnostic_color(severity: Option<lsp_types::DiagnosticSeverity>) -> SceneColor {
+    let hex = match severity {
+        Some(lsp_types::DiagnosticSeverity::ERROR) => "#f44747",
+        Some(lsp_types::DiagnosticSeverity::WARNING) => "#cca700",
+        Some(lsp_types::DiagnosticSeverity::INFORMATION) => "#3794ff",
+        Some(lsp_types::DiagnosticSeverity::HINT) => "#a0a0a0",
+        _ => "#a0a0a0",
+    };
+    quad_color(hex)
+}
+
 /// Width of the text shaped into `stack` in physical pixels — the maximum
 /// `x + width` over every glyph in every layout run. Used to right-align
 /// short captions whose width depends on the content (e.g. "Ln L, Col C").
@@ -594,6 +665,23 @@ struct State {
     /// from a detached sleeper thread. Clone-cheap.
     flash_proxy: EventLoopProxy<AppEvent>,
 
+    /// Document version per-file for LSP didChange — LSP requires a
+    /// monotonically-increasing counter. Bumped each time we send a
+    /// didChange to a server.
+    lsp_doc_version: HashMap<PathBuf, i32>,
+
+    /// Language Server Protocol state — per-server connections, pending
+    /// requests, and the diagnostics map (spec §3.5, §4.2). Empty until a
+    /// file in a supported language is opened; then the matching server is
+    /// spawned lazily.
+    lsp: LspState,
+    /// Hover popup state when a server's hover response is visible. The
+    /// String is the rendered markup; the (line, col) is the caret-anchor
+    /// position the popup should hang under.
+    hover_popup: Option<HoverPopup>,
+    /// Dedicated TextStack for the hover overlay's body.
+    hover_text: TextStack,
+
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
     /// Rolling 1-second frame-time window (spec §8).
@@ -732,6 +820,25 @@ impl State {
             size.height as f32,
         )));
 
+        // Hover popup text — same width budget as the find bar for a
+        // similar "tight inline tooltip" feel.
+        let hover_text = TextStack::new(
+            &mut font_system,
+            (HOVER_WIDTH_DIP - 2.0 * HOVER_PAD_DIP) * scale,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "",
+        );
+
+        // LSP rooted at the initial file's parent directory when possible —
+        // multi-root + per-workspace promotion is a follow-up (spec §4.1.5).
+        let workspace_root = doc
+            .file_path
+            .as_deref()
+            .and_then(|p| p.parent())
+            .and_then(editor_lsp_client::path_to_uri);
+
         let mut state = Self {
             window,
             gpu,
@@ -771,6 +878,10 @@ impl State {
             caret_visible: true,
             last_interaction: Instant::now(),
             flash_proxy,
+            lsp_doc_version: HashMap::new(),
+            lsp: LspState::new(workspace_root),
+            hover_popup: None,
+            hover_text,
             tab_spaces,
             theme,
             pending_keystroke: None,
@@ -781,6 +892,9 @@ impl State {
         };
         state.refresh_tabs_text();
         state.rebuild_scene();
+        // Introduce the initial document to its LSP server (no-op when
+        // there is no file path or no server for its language).
+        state.lsp_did_open_doc(0);
         state
     }
 
@@ -1091,6 +1205,14 @@ impl State {
                         self.select_all();
                         return;
                     }
+                    "i" if !alt => {
+                        // Cmd-I requests an LSP hover at the caret. The
+                        // response paints a popup once it arrives via
+                        // `poll_lsp`. No-op when no server is wired for
+                        // the active document's language.
+                        self.request_hover();
+                        return;
+                    }
                     "c" => {
                         self.copy_selection();
                         return;
@@ -1177,7 +1299,13 @@ impl State {
         let mut text_changed = true;
         let handled = match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
-                self.collapse_selection_to_primary();
+                // Escape dismisses the hover popup first (when one is open);
+                // otherwise it collapses the multi-cursor selection set.
+                if self.hover_popup.is_some() {
+                    self.hover_popup = None;
+                } else {
+                    self.collapse_selection_to_primary();
+                }
                 text_changed = false;
                 true
             }
@@ -1279,6 +1407,12 @@ impl State {
                 text_changed = false;
                 true
             }
+            // F12 — goto-definition for the symbol at the caret (LSP).
+            Key::Named(NamedKey::F12) => {
+                self.request_definition();
+                text_changed = false;
+                true
+            }
             // Printable character input — winit gives us the resolved text.
             _ => match &event.text {
                 Some(text) if !text.is_empty() => {
@@ -1299,6 +1433,10 @@ impl State {
                 self.doc_mut().dirty = true;
                 self.update_title();
                 self.refresh_tabs_text();
+            }
+            // A text edit invalidates the hover popup's anchor; dismiss.
+            if text_changed {
+                self.hover_popup = None;
             }
             // If the find bar is open, the match list now reflects the old text.
             if text_changed && self.doc().find.is_some() {
@@ -1361,6 +1499,12 @@ impl State {
             self.doc_mut()
                 .editor
                 .set_selection(Selection::cursor(char_idx));
+        }
+        // Cmd-click is the canonical "go to definition" shortcut. Place
+        // the caret first (so the LSP request lands at the click spot)
+        // and then fire the request — the response jumps the caret onward.
+        if is_cmd_or_ctrl(self.modifiers) && !alt {
+            self.request_definition();
         }
         self.scene_dirty = true;
         self.follow_caret = true;
@@ -2027,6 +2171,7 @@ impl State {
     /// Write the active document to its path, or prompt for one with a Save As
     /// dialog when there is none.
     fn save_to_file(&mut self) {
+        let path_was_new = self.doc().file_path.is_none();
         let path = match self.doc().file_path.clone() {
             Some(p) => p,
             None => match rfd::FileDialog::new().save_file() {
@@ -2047,6 +2192,14 @@ impl State {
                 self.update_title();
                 self.refresh_tabs_text();
                 self.set_status_flash(format!("saved · {label}"));
+                // First save of an untitled doc: introduce it to the LSP
+                // server now that it has a path. Subsequent saves are a
+                // plain didSave.
+                if path_was_new {
+                    self.lsp_did_open_doc(self.active);
+                } else {
+                    self.lsp_did_save_active();
+                }
                 self.scene_dirty = true;
                 self.window.request_redraw();
             }
@@ -2081,6 +2234,7 @@ impl State {
                 self.refresh_tabs_text();
                 self.refresh_find_text();
                 self.set_status_flash(format!("opened · {flash_label}"));
+                self.lsp_did_open_doc(self.active);
                 self.window.request_redraw();
             }
             Err(e) => {
@@ -2141,6 +2295,9 @@ impl State {
     fn close_active_tab(&mut self) {
         if !self.confirm_unsaved("Close tab") {
             return;
+        }
+        if let Some(path) = self.doc().file_path.clone() {
+            self.lsp_did_close_path(&path);
         }
         self.docs.remove(self.active);
         if self.docs.is_empty() {
@@ -2326,8 +2483,18 @@ impl State {
             .as_ref()
             .filter(|(_, t)| t.elapsed() < FLASH_DURATION)
             .map(|(s, _)| s.clone());
-        let left = flash
-            .unwrap_or_else(|| format!("{label}  ·  {language}  ·  Spaces: {indent}  ·  {le}"));
+        let counts = self.lsp.diagnostic_counts();
+        let diag_suffix = if counts.total() > 0 {
+            format!(
+                "  ·  ⚠ {}/{}/{}/{}",
+                counts.errors, counts.warnings, counts.info, counts.hints
+            )
+        } else {
+            String::new()
+        };
+        let left = flash.unwrap_or_else(|| {
+            format!("{label}  ·  {language}  ·  Spaces: {indent}  ·  {le}{diag_suffix}")
+        });
         let right = format!(
             "{find_prefix}Ln {}, Col {}  ·  {} lines",
             pos.line + 1,
@@ -2337,6 +2504,205 @@ impl State {
 
         self.status_left.set_content(&mut self.font_system, &left);
         self.status_right.set_content(&mut self.font_system, &right);
+    }
+
+    // ── LSP wiring ────────────────────────────────────────────────────────
+
+    /// Drain LSP server queues, react to any actionable events. Wired to a
+    /// 100ms timer so diagnostics published while the user is idle still
+    /// show up immediately.
+    fn poll_lsp(&mut self) {
+        let events = self.lsp.drain();
+        if events.is_empty() {
+            return;
+        }
+        let mut want_redraw = false;
+        for ev in events {
+            match ev {
+                LspEvent::DiagnosticsUpdated { path: _ } => {
+                    want_redraw = true;
+                }
+                LspEvent::Hover { doc_path, result } => {
+                    self.handle_lsp_hover(doc_path, result);
+                    want_redraw = true;
+                }
+                LspEvent::Definition {
+                    doc_path,
+                    locations,
+                } => {
+                    self.handle_lsp_definition(doc_path, locations);
+                    want_redraw = true;
+                }
+                LspEvent::ServerExited { kind } => {
+                    log::warn!("LSP server {kind:?} exited");
+                    self.set_status_flash(format!("LSP {kind:?} disconnected"));
+                    want_redraw = true;
+                }
+            }
+        }
+        if want_redraw {
+            self.scene_dirty = true;
+            self.window.request_redraw();
+        }
+    }
+
+    /// Look up the open document whose `file_path` equals `path`. Used to
+    /// route LSP responses back to the originating tab.
+    fn doc_idx_for_path(&self, path: &Path) -> Option<usize> {
+        self.docs
+            .iter()
+            .position(|d| d.file_path.as_deref() == Some(path))
+    }
+
+    /// Send `textDocument/didOpen` for the document at `idx`. No-op when
+    /// the doc has no file path or no server is wired.
+    fn lsp_did_open_doc(&mut self, idx: usize) {
+        let Some(path) = self.docs[idx].file_path.clone() else {
+            return;
+        };
+        let Some(lang) = Language::for_path(&path) else {
+            return;
+        };
+        let text = self.docs[idx].editor.text();
+        let version = *self.lsp_doc_version.entry(path.clone()).or_insert(0) + 1;
+        self.lsp_doc_version.insert(path.clone(), version);
+        self.lsp.did_open(&path, lang, version, text);
+    }
+
+    /// Send `textDocument/didChange` for the active doc. Called from the
+    /// render path right after the editor revision moves.
+    fn lsp_did_change_active(&mut self) {
+        let Some(path) = self.doc().file_path.clone() else {
+            return;
+        };
+        let Some(lang) = Language::for_path(&path) else {
+            return;
+        };
+        let text = self.doc().editor.text();
+        let v = self.lsp_doc_version.entry(path.clone()).or_insert(0);
+        *v += 1;
+        let version = *v;
+        self.lsp.did_change(&path, lang, version, text);
+    }
+
+    /// Send `textDocument/didSave` for the active doc.
+    fn lsp_did_save_active(&mut self) {
+        let Some(path) = self.doc().file_path.clone() else {
+            return;
+        };
+        let Some(lang) = Language::for_path(&path) else {
+            return;
+        };
+        let text = self.doc().editor.text();
+        self.lsp.did_save(&path, lang, Some(text));
+    }
+
+    /// Send `textDocument/didClose` for the given file. Called before a
+    /// tab is removed from `docs`.
+    fn lsp_did_close_path(&mut self, path: &Path) {
+        let Some(lang) = Language::for_path(path) else {
+            return;
+        };
+        self.lsp.did_close(path, lang);
+        self.lsp_doc_version.remove(path);
+    }
+
+    /// Trigger a `textDocument/hover` request at the primary caret of the
+    /// active doc. The response will be handled asynchronously in
+    /// [`poll_lsp`](Self::poll_lsp).
+    fn request_hover(&mut self) {
+        let Some(path) = self.doc().file_path.clone() else {
+            return;
+        };
+        let Some(lang) = Language::for_path(&path) else {
+            return;
+        };
+        let head = self.doc().editor.selections().primary().head;
+        let pos = self.doc().editor.buffer().char_to_position(head);
+        let lsp_pos = lsp_types::Position {
+            line: pos.line as u32,
+            character: pos.column as u32,
+        };
+        // Hover is anchored to the current caret; remember which char we
+        // asked about so the popup follows scrolling.
+        if self.lsp.request_hover(&path, lang, lsp_pos).is_some() {
+            self.hover_popup = None;
+        }
+    }
+
+    /// Trigger a `textDocument/definition` request at the primary caret.
+    fn request_definition(&mut self) {
+        let Some(path) = self.doc().file_path.clone() else {
+            return;
+        };
+        let Some(lang) = Language::for_path(&path) else {
+            return;
+        };
+        let head = self.doc().editor.selections().primary().head;
+        let pos = self.doc().editor.buffer().char_to_position(head);
+        let lsp_pos = lsp_types::Position {
+            line: pos.line as u32,
+            character: pos.column as u32,
+        };
+        self.lsp.request_definition(&path, lang, lsp_pos);
+    }
+
+    fn handle_lsp_hover(&mut self, doc_path: PathBuf, result: Option<lsp_types::Hover>) {
+        if self.doc().file_path.as_deref() != Some(&doc_path) {
+            return; // user switched tabs since the request
+        }
+        let Some(hover) = result else {
+            self.set_status_flash("no hover info".to_string());
+            return;
+        };
+        let text = hover_contents_to_string(&hover.contents);
+        if text.is_empty() {
+            self.set_status_flash("no hover info".to_string());
+            return;
+        }
+        let anchor = self.doc().editor.selections().primary().head;
+        self.hover_text.set_content(&mut self.font_system, &text);
+        self.hover_popup = Some(HoverPopup {
+            anchor_char: anchor,
+        });
+    }
+
+    fn handle_lsp_definition(&mut self, doc_path: PathBuf, locations: Vec<lsp_types::Location>) {
+        if self.doc().file_path.as_deref() != Some(&doc_path) {
+            return;
+        }
+        let Some(loc) = locations.into_iter().next() else {
+            self.set_status_flash("no definition".to_string());
+            return;
+        };
+        let Ok(target) = loc.uri.to_file_path() else {
+            return;
+        };
+        let line = loc.range.start.line as usize;
+        let col = loc.range.start.character as usize;
+        if let Some(idx) = self.doc_idx_for_path(&target) {
+            // Already open — just jump there.
+            self.switch_tab(idx);
+            let buf = self.docs[self.active].editor.buffer();
+            if let Some(char_idx) = buf.position_to_char(Position::new(line, col)) {
+                self.docs[self.active]
+                    .editor
+                    .set_selection(Selection::cursor(char_idx));
+                self.follow_caret = true;
+                self.scene_dirty = true;
+            }
+        } else {
+            // Open the file in a new tab, then jump.
+            self.open_path(target);
+            let buf = self.docs[self.active].editor.buffer();
+            if let Some(char_idx) = buf.position_to_char(Position::new(line, col)) {
+                self.docs[self.active]
+                    .editor
+                    .set_selection(Selection::cursor(char_idx));
+                self.follow_caret = true;
+                self.scene_dirty = true;
+            }
+        }
     }
 
     /// Rebuild the tab-strip TextStack: one line, each label padded to
@@ -2614,6 +2980,23 @@ impl State {
     /// the doc at index `i` survives, it becomes active; otherwise the first
     /// surviving doc wins. An empty result is replaced by a fresh scratch.
     fn retain_docs(&mut self, keep_flags: &[bool], preferred_active: Option<usize>) {
+        // Send didClose for every doc we're about to drop. Collect paths
+        // first so iteration doesn't overlap the mutable LSP calls.
+        let to_close: Vec<PathBuf> = self
+            .docs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| {
+                if !keep_flags[i] {
+                    d.file_path.clone()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for p in to_close {
+            self.lsp_did_close_path(&p);
+        }
         let mut new_docs = Vec::with_capacity(self.docs.len());
         let mut new_active = 0;
         for (i, doc) in self.docs.drain(..).enumerate() {
@@ -2688,6 +3071,7 @@ impl State {
         let Some(path) = rfd::FileDialog::new().save_file() else {
             return;
         };
+        let old_path = self.doc().file_path.clone();
         let text = self.doc().editor.text();
         match std::fs::write(&path, &text) {
             Ok(()) => {
@@ -2701,6 +3085,12 @@ impl State {
                 self.update_title();
                 self.refresh_tabs_text();
                 self.set_status_flash(format!("saved · {label}"));
+                // If the path changed, the LSP server's view of the old
+                // path is stale — close it. Then introduce the new one.
+                if let Some(old) = old_path {
+                    self.lsp_did_close_path(&old);
+                }
+                self.lsp_did_open_doc(self.active);
                 self.scene_dirty = true;
                 self.window.request_redraw();
             }
@@ -3018,6 +3408,36 @@ impl State {
         (panel.min_x() + pad, panel.min_y() + pad)
     }
 
+    /// Hover popup geometry: hangs one line below the caret, snapping into
+    /// the viewport if it would overflow the right edge. Returns `None`
+    /// when the caret is offscreen or no popup is active.
+    fn hover_panel_rect(&self) -> Option<Rect> {
+        let hover = self.hover_popup.as_ref()?;
+        let (cx, cy) = self.caret_pixel(hover.anchor_char)?;
+        let scroll = self.doc().scroll_y;
+        let line_h = self.line_height();
+        let pad = HOVER_PAD_DIP * self.scale;
+        let width = HOVER_WIDTH_DIP * self.scale;
+        let max_h = HOVER_MAX_HEIGHT_DIP * self.scale;
+        // Caret pixel is in scroll-local coords (returned by caret_pixel
+        // includes the line_top offset only). Anchor the popup just under
+        // the caret line.
+        let top = self.text_inset_y + cy - scroll + line_h + 4.0 * self.scale;
+        // Measure the shaped hover text height (each layout run is one
+        // visual line at line_h) and cap at max_h.
+        let lines = self.hover_text.buffer.layout_runs().count().max(1) as f32;
+        let height = (lines * line_h + 2.0 * pad).min(max_h);
+        let surface_w = self.gpu.surface_config.width as f32;
+        let left = (self.text_inset_x + cx).min(surface_w - width - pad);
+        Some(Rect::new(left.max(0.0), top, width, height))
+    }
+
+    fn hover_text_origin(&self) -> Option<(f32, f32)> {
+        let panel = self.hover_panel_rect()?;
+        let pad = HOVER_PAD_DIP * self.scale;
+        Some((panel.min_x() + pad, panel.min_y() + pad))
+    }
+
     fn match_highlight_rects(&self) -> Vec<Rect> {
         let Some(find) = self.doc().find.as_ref() else {
             return Vec::new();
@@ -3240,6 +3660,46 @@ impl State {
             quad_color(&et.gutter_bg),
         ));
 
+        // Diagnostic dots — one per line with at least one LSP diagnostic,
+        // coloured by the highest-severity diagnostic on that line. Sits at
+        // the left edge of the gutter so it doesn't compete with the line
+        // numbers.
+        if let Some(path) = self.doc().file_path.clone() {
+            if let Some(diags) = self.lsp.diagnostics_for(&path) {
+                let scroll = self.doc().scroll_y;
+                let line_h = self.line_height();
+                let dot = DIAG_DOT_DIP * self.scale;
+                let x = (GUTTER_PAD_LEFT_DIP * self.scale - dot * 0.5).max(2.0);
+                let mut per_line: HashMap<u32, lsp_types::DiagnosticSeverity> = HashMap::new();
+                for d in diags {
+                    let line = d.range.start.line;
+                    let sev = d
+                        .severity
+                        .unwrap_or(lsp_types::DiagnosticSeverity::INFORMATION);
+                    per_line
+                        .entry(line)
+                        .and_modify(|cur| {
+                            if severity_rank(sev) < severity_rank(*cur) {
+                                *cur = sev;
+                            }
+                        })
+                        .or_insert(sev);
+                }
+                for (line, sev) in per_line {
+                    let y_top = self.text_inset_y + (line as f32) * line_h - scroll;
+                    // Skip dots that scrolled out of the gutter.
+                    if y_top + line_h < self.text_inset_y || y_top > self.text_inset_y + gutter_h {
+                        continue;
+                    }
+                    let y = y_top + (line_h - dot) * 0.5;
+                    root.push_child(SceneNode::quad(
+                        Rect::new(x, y, dot, dot),
+                        diagnostic_color(Some(sev)),
+                    ));
+                }
+            }
+        }
+
         // Active line backdrop — a faint full-width row at every visual run
         // of the logical line where the primary caret sits. Behind the
         // selection so the selection's brighter blue still reads.
@@ -3373,6 +3833,14 @@ impl State {
                 self.find_panel_rect(),
                 quad_color(&et.overlay_bg),
             ));
+        }
+
+        // Hover popup — anchored under the caret. Drawn before the palette
+        // overlay so the palette still wins focus when both are open.
+        if self.hover_popup.is_some() {
+            if let Some(rect) = self.hover_panel_rect() {
+                root.push_child(SceneNode::quad(rect, quad_color(&et.overlay_bg)));
+            }
         }
 
         // Palette overlay on top of everything else.
@@ -3550,6 +4018,10 @@ impl State {
                 self.text.set_content(&mut self.font_system, &new_text);
             }
             self.text_dirty = false;
+            // Ship the new full text to the LSP server for the active doc.
+            // Cheap path: when no server is wired for this language, the
+            // helper short-circuits.
+            self.lsp_did_change_active();
         }
         if self.scene_dirty {
             if self.follow_caret {
@@ -3795,6 +4267,27 @@ impl State {
                 custom_glyphs: &[],
             });
         }
+        if let Some((hx, hy)) = self.hover_text_origin() {
+            // Clip to the panel rect so long markdown doesn't bleed past.
+            let panel = self
+                .hover_panel_rect()
+                .expect("hover_text_origin implies hover_panel_rect");
+            let hover_bounds = TextBounds {
+                left: panel.min_x() as i32,
+                top: panel.min_y() as i32,
+                right: panel.max_x() as i32,
+                bottom: panel.max_y() as i32,
+            };
+            text_areas.push(TextArea {
+                buffer: &self.hover_text.buffer,
+                left: hx,
+                top: hy,
+                scale: 1.0,
+                bounds: hover_bounds,
+                default_color: editor_color,
+                custom_glyphs: &[],
+            });
+        }
 
         self.text_gpu.viewport.update(&self.gpu.queue, resolution);
         self.text_gpu
@@ -3982,6 +4475,11 @@ impl ApplicationHandler<AppEvent> for App {
                     state.tick_caret();
                 }
             }
+            AppEvent::LspPoll => {
+                if let Some(state) = self.state.as_mut() {
+                    state.poll_lsp();
+                }
+            }
         }
     }
 
@@ -4122,6 +4620,7 @@ fn main() {
         .and_then(|p| spawn_theme_watcher(p, event_loop.create_proxy()));
     // Caret-blink heartbeat — one detached thread for the app lifetime.
     spawn_caret_blink_thread(event_loop.create_proxy());
+    spawn_lsp_poll_thread(event_loop.create_proxy());
 
     let mut app = App::new(
         initial_text,
@@ -4175,6 +4674,18 @@ fn spawn_theme_watcher(
 /// Detach a background thread that fires `AppEvent::CaretTick` every
 /// `CARET_BLINK_INTERVAL`. The thread exits cleanly when the event loop
 /// goes away (subsequent `send_event` calls return Err).
+/// Detach a background thread that fires `AppEvent::LspPoll` every
+/// `LSP_POLL_INTERVAL`. The handler is a no-op when no servers are
+/// spawned — the cost when LSP is unused is the timer wakeup.
+fn spawn_lsp_poll_thread(proxy: EventLoopProxy<AppEvent>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(LSP_POLL_INTERVAL);
+        if proxy.send_event(AppEvent::LspPoll).is_err() {
+            return;
+        }
+    });
+}
+
 fn spawn_caret_blink_thread(proxy: EventLoopProxy<AppEvent>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(CARET_BLINK_INTERVAL);
