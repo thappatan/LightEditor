@@ -1737,6 +1737,52 @@ impl State {
             }
         }
 
+        // File-tree sidebar grabs the navigation keys while it has
+        // focus. Other keystrokes (Cmd-S, find shortcuts, typing into
+        // a focused editor) fall through so the sidebar stays a
+        // *soft* focus — it doesn't steal everything just by being
+        // visible. Esc returns focus to the editor without hiding
+        // the panel; Cmd-B still toggles visibility from anywhere.
+        if self.file_tree.focused && self.file_tree.visible && !cmd && !alt {
+            match &event.logical_key {
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.file_tree.select_next();
+                    self.scroll_selected_into_view();
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.file_tree.select_prev();
+                    self.scroll_selected_into_view();
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    match self.file_tree.activate_selected() {
+                        ClickResult::Nothing => {
+                            self.refresh_file_tree_text();
+                            self.scroll_selected_into_view();
+                            self.scene_dirty = true;
+                            self.window.request_redraw();
+                        }
+                        ClickResult::OpenFile(path) => {
+                            self.open_path(path);
+                        }
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.file_tree.focused = false;
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // Completion popup intercepts navigation + accept + dismiss keys.
         // Runs before the main matcher so Enter accepts the suggestion
         // instead of inserting a newline, etc.
@@ -1960,6 +2006,17 @@ impl State {
             }
             if in_pane {
                 return; // swallow the click — don't fall through to editor
+            }
+        }
+        // Same focus contract for the file-tree sidebar: clicks inside
+        // give it the keyboard, clicks elsewhere hand focus back to
+        // the editor. The panel stays visible either way.
+        if self.file_tree.visible {
+            let in_sidebar = self.in_sidebar(mx, my);
+            if self.file_tree.focused != in_sidebar {
+                self.file_tree.focused = in_sidebar;
+                self.scene_dirty = true;
+                self.window.request_redraw();
             }
         }
         // Find-in-files panel claims clicks first while open — clicking
@@ -2727,14 +2784,53 @@ impl State {
 
     /// Toggle the sidebar's visibility and recompute the editor's left
     /// inset so the gutter + text shift to make room (or reclaim it).
+    /// Showing the sidebar also gives it keyboard focus and seeds the
+    /// selection at row 0 if nothing was selected before, so a user
+    /// who toggles in via Cmd-B can immediately arrow-key around.
     fn toggle_file_tree(&mut self) {
         self.file_tree.visible = !self.file_tree.visible;
         self.recompute_text_inset();
         if self.file_tree.visible {
             self.refresh_file_tree_text();
+            self.file_tree.focused = true;
+            if self.file_tree.selected.is_none() && !self.file_tree.nodes.is_empty() {
+                self.file_tree.selected = Some(0);
+            }
+            self.scroll_selected_into_view();
+        } else {
+            // Hidden panel cannot be focused — clear it so the editor
+            // gets keyboard input on the next keystroke.
+            self.file_tree.focused = false;
         }
         self.scene_dirty = true;
         self.window.request_redraw();
+    }
+
+    /// Scroll the file-tree viewport so the selected row sits inside
+    /// the visible band. Called after every keyboard move and when the
+    /// panel re-opens with a stale selection.
+    fn scroll_selected_into_view(&mut self) {
+        let Some(idx) = self.file_tree.selected else {
+            return;
+        };
+        let line_h = self.line_height();
+        if line_h <= 0.0 {
+            return;
+        }
+        let row_top = (idx as f32) * line_h;
+        let row_bot = row_top + line_h;
+        let view_top = self.file_tree.scroll_y;
+        let body_h = (self.editor_bottom_y() - TAB_BAR_HEIGHT_DIP * self.scale).max(line_h);
+        let view_bot = view_top + body_h;
+        if row_top < view_top {
+            self.file_tree.scroll_y = row_top;
+        } else if row_bot > view_bot {
+            self.file_tree.scroll_y = row_bot - body_h;
+        }
+        // Don't let the scroll go negative when the content is short
+        // enough to fit in view.
+        let max_scroll = ((self.file_tree.nodes.len() as f32) * line_h - body_h).max(0.0);
+        self.file_tree.scroll_y = self.file_tree.scroll_y.clamp(0.0, max_scroll);
     }
 
     /// Recompute `text_inset_x` and the wrap width on the editor text
@@ -5170,7 +5266,9 @@ impl State {
                 self.sidebar_rect(),
                 quad_color(&et.gutter_bg),
             ));
-            // Selection-row highlight: when one of the visible nodes
+            let top = TAB_BAR_HEIGHT_DIP * self.scale;
+            let line_h = self.line_height();
+            // Active-doc highlight: when one of the visible nodes
             // points at the active doc, draw a faint underlay so the
             // user can see "what they're editing now" at a glance.
             if let Some(active_path) = self.doc().file_path.clone() {
@@ -5180,12 +5278,24 @@ impl State {
                     .iter()
                     .position(|n| n.path == active_path)
                 {
-                    let top = TAB_BAR_HEIGHT_DIP * self.scale;
-                    let line_h = self.line_height();
                     let y = top + (idx as f32) * line_h - self.file_tree.scroll_y;
                     root.push_child(SceneNode::quad(
                         Rect::new(0.0, y, self.sidebar_width(), line_h),
                         quad_color(&et.active_line_bg),
+                    ));
+                }
+            }
+            // Keyboard-selection highlight: a brighter bar on the row
+            // the arrow keys last landed on. Painted only while the
+            // panel is focused so it doesn't compete with the editor
+            // caret for the user's attention when the tree is just
+            // sitting there as a reference.
+            if self.file_tree.focused {
+                if let Some(idx) = self.file_tree.selected {
+                    let y = top + (idx as f32) * line_h - self.file_tree.scroll_y;
+                    root.push_child(SceneNode::quad(
+                        Rect::new(0.0, y, self.sidebar_width(), line_h),
+                        quad_color(&et.selection_bg),
                     ));
                 }
             }
