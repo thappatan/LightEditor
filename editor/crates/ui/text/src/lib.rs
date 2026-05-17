@@ -126,104 +126,69 @@ impl TextStack {
     /// shaped glyphs. Concatenating every span's slice MUST equal the full
     /// document text — the caller is responsible for that.
     ///
-    /// This path **diff-updates** the underlying `BufferLine`s rather than
-    /// rebuilding all of them. `BufferLine::set_text` is a no-op when the
-    /// new line text + attrs match the existing entry, so unchanged lines
-    /// keep their shape cache and `shape_until_scroll` re-shapes only the
-    /// lines that actually changed.
+    /// This path diff-updates the underlying `BufferLine`s using a
+    /// longest-common-prefix + longest-common-suffix match. Only the
+    /// middle range — the lines that actually changed — gets rebuilt;
+    /// everything else keeps its shape cache and `shape_until_scroll`
+    /// re-shapes only the dirty lines.
     ///
-    /// On a 4000-line file, one-character edits drop from ~120 ms whole-
-    /// buffer reshape to a sub-millisecond single-line reshape.
+    /// This is what keeps Enter cheap on a long file: positional
+    /// `BufferLine::set_text` would reshape every line after the cursor
+    /// (because their indices all shift down by one), but a suffix match
+    /// notices the trailing lines are identical content at a higher
+    /// index and a single `Vec::splice` does the structural insert
+    /// without touching them.
+    ///
+    /// On a 4000-line buffer:
+    /// - one-char edit inside a line → 1 reshape
+    /// - Enter at line N → 2 reshapes (the split line becomes two)
+    /// - deleting a line → 1 reshape (the surviving merged line)
     pub fn set_content_rich<'a, I>(&mut self, font_system: &mut FontSystem, spans: I)
     where
         I: IntoIterator<Item = (&'a str, Attrs<'a>)>,
     {
         let default = default_attrs();
-        // One line being built up across spans. cosmic-text's AttrsList
-        // stores byte ranges relative to the line, so we track the running
-        // length to translate.
+        // Walk the span stream once, accumulating per-line entries.
+        // Building the full list up front lets the prefix/suffix scan
+        // compare against the existing `buffer.lines` without re-walking
+        // the spans.
+        let mut new_lines: Vec<NewLine> = Vec::with_capacity(self.buffer.lines.len() + 1);
         let mut line_text = String::new();
         let mut line_attrs = AttrsList::new(&default);
-        let mut line_idx = 0usize;
 
         for (slice, attrs) in spans {
             let mut remainder = slice;
-            // Split the slice on newlines and emit a finished line each
-            // time we cross one.
             while let Some(nl) = remainder.find('\n') {
                 let (head, rest) = remainder.split_at(nl);
-                self.append_span(&mut line_text, &mut line_attrs, head, &attrs, &default);
-                // CRLF: the '\r' is in `head`'s tail; strip it and use
-                // CrLf for the ending so cosmic-text shapes a clean line.
+                append_span(&mut line_text, &mut line_attrs, head, &attrs, &default);
                 let ending = if line_text.ends_with('\r') {
                     line_text.pop();
-                    // Drop any attrs span the popped '\r' was inside —
-                    // `set_text` doesn't care about out-of-range spans,
-                    // so this stays a no-op.
                     LineEnding::CrLf
                 } else {
                     LineEnding::Lf
                 };
-                self.commit_line(
-                    line_idx,
-                    &line_text,
+                new_lines.push(NewLine {
+                    text: std::mem::take(&mut line_text),
                     ending,
-                    std::mem::replace(&mut line_attrs, AttrsList::new(&default)),
-                );
-                line_text.clear();
-                line_idx += 1;
+                    attrs: std::mem::replace(&mut line_attrs, AttrsList::new(&default)),
+                });
                 remainder = &rest[1..]; // skip the '\n'
             }
-            // Whatever's left has no newline — append and continue.
             if !remainder.is_empty() {
-                self.append_span(&mut line_text, &mut line_attrs, remainder, &attrs, &default);
+                append_span(&mut line_text, &mut line_attrs, remainder, &attrs, &default);
             }
         }
-        // The final line (after the last newline, or the only line)
-        // commits with no ending.
-        self.commit_line(line_idx, &line_text, LineEnding::None, line_attrs);
-        line_idx += 1;
+        // The trailing line (no terminating newline) — always emitted,
+        // even when empty, so a doc ending in '\n' keeps cosmic-text's
+        // "one empty line follows" invariant.
+        new_lines.push(NewLine {
+            text: line_text,
+            ending: LineEnding::None,
+            attrs: line_attrs,
+        });
 
-        // Trim any leftover lines from a previous longer document.
-        self.buffer.lines.truncate(line_idx);
+        diff_apply(&mut self.buffer.lines, new_lines);
         self.buffer.shape_until_scroll(font_system, false);
-    }
-
-    /// Append `slice` to the in-progress line, recording an attrs span when
-    /// the slice's attrs differ from the line's default.
-    fn append_span(
-        &self,
-        line_text: &mut String,
-        line_attrs: &mut AttrsList,
-        slice: &str,
-        attrs: &Attrs<'_>,
-        default: &Attrs<'_>,
-    ) {
-        if slice.is_empty() {
-            return;
-        }
-        let start = line_text.len();
-        line_text.push_str(slice);
-        if attrs != default {
-            line_attrs.add_span(start..line_text.len(), attrs);
-        }
-    }
-
-    /// Replace `buffer.lines[idx]` with the supplied line, or push a new
-    /// `BufferLine` when `idx` is past the end. `BufferLine::set_text`
-    /// only invalidates the shape cache when text/attrs/ending differ —
-    /// so an unchanged line costs nothing.
-    fn commit_line(&mut self, idx: usize, text: &str, ending: LineEnding, attrs: AttrsList) {
-        if idx < self.buffer.lines.len() {
-            self.buffer.lines[idx].set_text(text, ending, attrs);
-        } else {
-            self.buffer.lines.push(BufferLine::new(
-                text.to_string(),
-                ending,
-                attrs,
-                Shaping::Advanced,
-            ));
-        }
     }
 
     /// Set the wrap width (physical pixels). Height stays unbounded — see
@@ -282,4 +247,67 @@ pub fn new_font_system() -> FontSystem {
 /// Construct a fresh `SwashCache` — same reasoning as `new_font_system`.
 pub fn new_swash_cache() -> SwashCache {
     SwashCache::new()
+}
+
+/// One line ready to slot into `buffer.lines` — owned text + attrs +
+/// line-ending choice. Built up by walking the caller's span stream and
+/// then compared against the existing `BufferLine`s for diffing.
+struct NewLine {
+    text: String,
+    ending: LineEnding,
+    attrs: AttrsList,
+}
+
+impl NewLine {
+    /// Does this line match an existing `BufferLine` byte-for-byte?
+    fn matches(&self, line: &BufferLine) -> bool {
+        line.text() == self.text && line.ending() == self.ending && line.attrs_list() == &self.attrs
+    }
+
+    fn into_buffer_line(self) -> BufferLine {
+        BufferLine::new(self.text, self.ending, self.attrs, Shaping::Advanced)
+    }
+}
+
+/// Append `slice` to the in-progress line, recording an attrs span when
+/// the slice's attrs differ from the line's default.
+fn append_span(
+    line_text: &mut String,
+    line_attrs: &mut AttrsList,
+    slice: &str,
+    attrs: &Attrs<'_>,
+    default: &Attrs<'_>,
+) {
+    if slice.is_empty() {
+        return;
+    }
+    let start = line_text.len();
+    line_text.push_str(slice);
+    if attrs != default {
+        line_attrs.add_span(start..line_text.len(), attrs);
+    }
+}
+
+/// Replace `old` with the smallest `Vec::splice` that turns it into the
+/// content of `new`. The prefix + suffix scans find the largest matching
+/// regions at both ends; the middle range is what actually gets shaped on
+/// the next `shape_until_scroll` call.
+fn diff_apply(old: &mut Vec<BufferLine>, mut new: Vec<NewLine>) {
+    let mut prefix = 0;
+    let prefix_max = old.len().min(new.len());
+    while prefix < prefix_max && new[prefix].matches(&old[prefix]) {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    let suffix_max = old.len().min(new.len()) - prefix;
+    while suffix < suffix_max && new[new.len() - 1 - suffix].matches(&old[old.len() - 1 - suffix]) {
+        suffix += 1;
+    }
+    let old_end = old.len() - suffix;
+    let new_end = new.len() - suffix;
+    let replacement: Vec<BufferLine> = new
+        .drain(prefix..new_end)
+        .map(NewLine::into_buffer_line)
+        .collect();
+    old.splice(prefix..old_end, replacement);
 }
