@@ -8,6 +8,35 @@ adapted to a single-binary workspace pre-1.0.
 
 ## [Unreleased]
 
+### Added — LSP completion
+
+- `textDocument/completion` round trip wired through the existing LSP
+  reader/writer threads. Trigger via Ctrl-Space (cross-platform
+  default) or Cmd-. (macOS-friendly fallback when the Input Source
+  Switcher claims Ctrl-Space).
+- Popup overlay anchored under the caret. Server responses are
+  filtered locally (case-insensitive prefix match against
+  `filter_text` or `label`) as the user keeps typing, and dismiss
+  when the prefix grows out of word characters or the caret moves
+  before the anchor.
+- Keyboard: ↑/↓ navigate (auto-scrolls the visible window when the
+  selection passes its edge), Enter/Tab accept the selected item,
+  Esc dismisses.
+- TextStack capped to the visible window so a 200-item response
+  shapes 10 lines instead of 200; the typing path stays bounded.
+
+### Known issue
+
+Typing or deleting characters that flip tree-sitter's parser state
+(notably an opening `"` that leaves a string unterminated) causes
+a ~150-250 ms render frame on long files: tree-sitter's incremental
+parse has to recover the new tree, and cosmic-text re-shapes every
+`BufferLine` whose highlight categories changed. The fix is
+bounded-height shaping + on-demand reshape for off-screen lines,
+which means refactoring TextStack's scroll/clipping model — punted
+to a follow-up so M2 stays mergeable. Steady-state typing latency
+is unaffected (sits at 5-30 ms).
+
 ### Added — M2 (Smart)
 
 - **Tree-sitter syntax** with 15 grammars: Rust, TypeScript, TSX,

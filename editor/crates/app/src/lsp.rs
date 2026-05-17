@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 const DIDCHANGE_DEBOUNCE: Duration = Duration::from_millis(100);
 
 use editor_lsp_client::lsp_types::{
-    self, notification::Notification as _, Diagnostic, GotoDefinitionResponse, Hover, Location,
+    self, notification::Notification as _, CompletionItem, CompletionResponse,
+    CompletionTriggerKind, Diagnostic, GotoDefinitionResponse, Hover, Location,
     PublishDiagnosticsParams, Url,
 };
 use editor_lsp_client::{path_to_uri, LspClient, Message};
@@ -175,6 +176,13 @@ pub enum PendingRequest {
         /// whether the jump is in-file or cross-file.
         doc_path: PathBuf,
     },
+    Completion {
+        doc_path: PathBuf,
+        /// The caret's char index when the request fired — the receiver
+        /// uses this as the anchor for positioning the popup and as the
+        /// start of the prefix the user has typed so far.
+        anchor_char: usize,
+    },
 }
 
 /// One actionable result the app should react to after [`drain`].
@@ -197,6 +205,12 @@ pub enum LspEvent {
     Definition {
         doc_path: PathBuf,
         locations: Vec<Location>,
+    },
+    /// A completion response arrived for the matching request.
+    Completion {
+        doc_path: PathBuf,
+        anchor_char: usize,
+        items: Vec<CompletionItem>,
     },
     /// The server's stderr / our reader thread died — the slot is gone.
     ServerExited { kind: ServerKind },
@@ -446,6 +460,47 @@ impl LspState {
         }
     }
 
+    /// Send a `textDocument/completion` request. `anchor_char` is the
+    /// caret's char index when the request fired — the response carries
+    /// it back so the popup anchors to the right place even after the
+    /// user has typed more characters in the meantime. Returns the
+    /// request id, or `None` when no server is wired.
+    pub fn request_completion(
+        &mut self,
+        path: &Path,
+        lang: Language,
+        position: lsp_types::Position,
+        anchor_char: usize,
+        trigger: CompletionTriggerKind,
+        trigger_character: Option<String>,
+    ) -> Option<i64> {
+        let uri = path_to_uri(path)?;
+        let kind = ServerKind::for_language(lang)?;
+        let slot = self.slots.get_mut(&kind)?;
+        if !slot.initialized || !slot.open_uris.contains(&uri) {
+            return None;
+        }
+        match slot
+            .client
+            .request_completion(uri, position, trigger, trigger_character)
+        {
+            Ok(id) => {
+                self.pending.insert(
+                    id,
+                    PendingRequest::Completion {
+                        doc_path: path.to_path_buf(),
+                        anchor_char,
+                    },
+                );
+                Some(id)
+            }
+            Err(e) => {
+                log::warn!("LSP: completion request failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Send a `textDocument/definition` request. Returns the request id or
     /// `None` when no server is available.
     pub fn request_definition(
@@ -609,6 +664,24 @@ impl LspState {
                         events.push(LspEvent::Definition {
                             doc_path,
                             locations,
+                        });
+                    }
+                    PendingRequest::Completion {
+                        doc_path,
+                        anchor_char,
+                    } => {
+                        let items = r
+                            .result
+                            .and_then(|v| serde_json::from_value::<CompletionResponse>(v).ok())
+                            .map(|r| match r {
+                                CompletionResponse::Array(items) => items,
+                                CompletionResponse::List(list) => list.items,
+                            })
+                            .unwrap_or_default();
+                        events.push(LspEvent::Completion {
+                            doc_path,
+                            anchor_char,
+                            items,
                         });
                     }
                 }
