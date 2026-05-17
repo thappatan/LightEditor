@@ -33,7 +33,7 @@ use editor_syntax::{Highlight, HighlightCategory, Language};
 use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Point, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{
-    Attrs, Color, FontSystem, Resolution, SwashCache, TextArea, TextBounds,
+    Attrs, Color, Family, FontSystem, Resolution, SwashCache, TextArea, TextBounds,
 };
 use editor_ui_text::{TextGpu, TextStack};
 use file_tree::{ClickResult, FileTree, NodeKind};
@@ -1230,9 +1230,16 @@ impl State {
         let Some(pane_rect) = self.terminal.as_ref().map(|_| self.terminal_pane_rect()) else {
             return;
         };
-        // Terminal text uses the editor's monospace metrics.
-        let cell_w = self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale;
-        let cell_h = self.line_height();
+        // Terminal text uses the editor's monospace metrics. We need the
+        // *actual* glyph advance from cosmic-text here, not the 0.6 ×
+        // font_size approximation — they drift enough that the PTY's
+        // column count and the rendered text disagree on where each
+        // column lands. And we have to measure from `terminal_text`
+        // specifically, not the chrome's buffer, because the two can
+        // pick different monospace faces even when both request
+        // `Family::Monospace`.
+        let cell_w = self.terminal_measured_char_width();
+        let cell_h = self.terminal_measured_line_height();
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return;
         }
@@ -2323,6 +2330,41 @@ impl State {
             .unwrap_or_else(|| self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale)
     }
 
+    /// Glyph advance specifically for the terminal pane. Reading from
+    /// `terminal_text` (rather than the editor's `text` / gutter) keeps
+    /// the cursor's pixel position lock-stepped with whatever cosmic-
+    /// text actually shaped into the pane — the chrome and the pane
+    /// can land on different monospace faces even when both ask for
+    /// `Family::Monospace`, and the editor's set_content_rich shaping
+    /// can pick a different face than the pane's rich-span shaping.
+    /// Falls back to [`measured_char_width`](Self::measured_char_width)
+    /// before the pane has shaped anything (spawn time, hidden pane).
+    fn terminal_measured_char_width(&self) -> f32 {
+        self.terminal_text
+            .buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .find(|g| g.w > 0.0)
+            .map(|g| g.w)
+            .unwrap_or_else(|| self.measured_char_width())
+    }
+
+    /// Vertical advance between terminal rows, in physical pixels.
+    /// Mirrors `terminal_measured_char_width` for the Y axis — the
+    /// cell height the cursor block and the cell-count math need has
+    /// to match the line_height cosmic-text actually used when it
+    /// shaped the pane's rich spans, not what the chrome's TextStack
+    /// thinks its own line height is.
+    fn terminal_measured_line_height(&self) -> f32 {
+        self.terminal_text
+            .buffer
+            .layout_runs()
+            .next()
+            .map(|run| run.line_height)
+            .filter(|h| *h > 0.0)
+            .unwrap_or_else(|| self.line_height())
+    }
+
     /// Find the matching bracket for whichever bracket the primary caret
     /// sits next to. Looks at the char right of the caret first, then the
     /// char left of it. Returns `(this_pos, match_pos)` or `None` when
@@ -2896,8 +2938,13 @@ impl State {
         // First open: spawn the shell rooted at the project root.
         let cwd = Some(self.file_tree.root.clone());
         let pane_height = TERMINAL_HEIGHT_DIP * self.scale;
-        let cell_w = self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale;
-        let cell_h = self.line_height();
+        // Real cosmic-text monospace advance — see comment in
+        // `resync_terminal_cells`. At spawn time `terminal_text` is
+        // empty, so this falls back to the chrome's measurement;
+        // `resync_terminal_cells` re-runs once the first frame has
+        // shaped the pane and the value gets refined.
+        let cell_w = self.terminal_measured_char_width();
+        let cell_h = self.terminal_measured_line_height();
         match terminal::TerminalPane::spawn(
             self.flash_proxy.clone(),
             cwd,
@@ -2953,8 +3000,15 @@ impl State {
         }
         let panel = self.terminal_pane_rect();
         let pad = 6.0 * self.scale;
-        let cell_w = self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale;
-        let cell_h = self.line_height();
+        // Use the pane's own glyph advance so the cursor lands on the
+        // same pixel column the shaped text does. Reading from the
+        // chrome's `text` buffer (or the 0.6 × font_size
+        // approximation) drifts because cosmic-text can resolve
+        // `Family::Monospace` to a different face for the pane than
+        // for the editor, especially when the pane has the rich
+        // colour spans the editor doesn't.
+        let cell_w = self.terminal_measured_char_width();
+        let cell_h = self.terminal_measured_line_height();
         let term = pane.term.lock();
         let grid = term.grid();
         // alacritty stores the cursor as a Line (signed, history-relative)
@@ -3062,13 +3116,18 @@ impl State {
             }
         }
 
-        // Emit spans. Skip `.color()` when the resolved colour matches
-        // the chrome default so the cosmic-text fast path picks up
+        // Emit spans. `Attrs::new()` defaults to `Family::SansSerif`,
+        // and cosmic-text honours that per-span without merging with
+        // the AttrsList's default — so every span must explicitly
+        // re-state monospace or the prompt drifts into a proportional
+        // font and the rendered text no longer lines up with the
+        // PTY's column count. Skip `.color()` when the resolved
+        // colour matches the chrome default so cosmic-text picks up
         // `TextArea.default_color` straight from the renderer.
         let spans: Vec<(&str, Attrs)> = runs
             .iter()
             .map(|(s, c)| {
-                let mut attrs = Attrs::new();
+                let mut attrs = Attrs::new().family(Family::Monospace);
                 if *c != default_fg {
                     attrs = attrs.color(Color::rgb(c.r, c.g, c.b));
                 }
