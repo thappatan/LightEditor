@@ -115,10 +115,14 @@ impl TextStack {
     /// and `Shaping::Advanced`. This is the only path that shapes text — `new`
     /// uses it too — so the font can never drift between the initial render
     /// and a later edit.
+    ///
+    /// Routes through [`set_content_rich`](TextStack::set_content_rich) with
+    /// a single default-attrs span so this path also gets the prefix +
+    /// suffix line diff — important for the gutter, which grows by one
+    /// line when the user hits Enter on a long file but otherwise has
+    /// identical numbering.
     pub fn set_content(&mut self, font_system: &mut FontSystem, text: &str) {
-        self.buffer
-            .set_text(font_system, text, &default_attrs(), Shaping::Advanced, None);
-        self.buffer.shape_until_scroll(font_system, false);
+        self.set_content_rich(font_system, std::iter::once((text, default_attrs())));
     }
 
     /// Reshape the buffer to a sequence of attributed `(slice, attrs)` spans.
