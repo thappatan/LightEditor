@@ -18,6 +18,7 @@ mod git;
 mod lsp;
 mod palette;
 mod terminal;
+mod terminal_palette;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -2975,42 +2976,107 @@ impl State {
     /// Snapshot the terminal grid into the terminal_text TextStack
     /// for the next frame. Called from the render path when the
     /// terminal is visible and there's a wakeup pending.
+    ///
+    /// Per-cell foreground colours are read from the grid and folded
+    /// into `(slice, Attrs)` spans so cosmic-text shapes coloured
+    /// runs in one pass. Background colours and bold-weight / italic /
+    /// underline attributes are *not* honoured in v1 — the renderer
+    /// has no per-cell quad layer yet and the pane uses a single
+    /// monospace face, so all four would need a follow-up.
     fn refresh_terminal_text(&mut self) {
         let Some(pane) = self.terminal.as_ref() else {
             return;
         };
-        let text = {
+        use alacritty_terminal::term::cell::Flags;
+        use terminal_palette::{brighten_named, resolve, PaletteColor};
+
+        // Theme-driven defaults for the three sentinel named colours.
+        // Programs that emit `Named(Foreground)` get the editor's text
+        // colour back, which is what the chrome uses for status / tab
+        // strip too — keeps the pane looking like part of the editor.
+        let unpack = |hex: &str, fallback: [u8; 4]| -> PaletteColor {
+            let [r, g, b, _] = parse_hex_color(hex).unwrap_or(fallback);
+            PaletteColor::new(r, g, b)
+        };
+        let default_fg = unpack(&self.theme.editor.text_fg, [0xEE, 0xEE, 0xEE, 0xFF]);
+        let default_bg = unpack(&self.theme.editor.background, [0x12, 0x12, 0x16, 0xFF]);
+        let default_cursor = unpack(&self.theme.editor.caret, [0xEE, 0xEE, 0xEE, 0xFF]);
+
+        // Build (run_text, run_color) entries in one pass. A new run
+        // starts when the resolved colour differs from the previous
+        // cell, or when we cross a row boundary (the '\n' rides on
+        // its own run so we don't accidentally extend the previous
+        // colour past the line terminator).
+        let mut runs: Vec<(String, PaletteColor)> = Vec::with_capacity(pane.rows * 2);
+        let mut current = String::new();
+        let mut current_color = default_fg;
+
+        {
             let term = pane.term.lock();
             let grid = term.grid();
-            let mut s = String::with_capacity(pane.cols * pane.rows + pane.rows);
-            // Iterate visible rows in display order. The grid's
-            // display offset (set by scrolling) shifts which rows
-            // are visible — for v1 we render the *current* visible
-            // window from the top of the screen down.
             use alacritty_terminal::grid::Dimensions as _;
             let display_offset = grid.display_offset();
             let total_rows = grid.screen_lines();
             for screen_row in 0..total_rows {
+                if screen_row > 0 {
+                    if !current.is_empty() {
+                        runs.push((std::mem::take(&mut current), current_color));
+                    }
+                    runs.push(("\n".to_string(), current_color));
+                }
                 let line =
                     alacritty_terminal::index::Line(screen_row as i32 - display_offset as i32);
-                if screen_row > 0 {
-                    s.push('\n');
-                }
                 for col in 0..grid.columns() {
                     let cell = &grid[line][alacritty_terminal::index::Column(col)];
+                    let flags = cell.flags;
+                    let mut fg = cell.fg;
+                    // Classic xterm behaviour: BOLD brightens the
+                    // named fg colour (8 → 16-colour palette upgrade).
+                    // Indexed and Spec colours pass through.
+                    if flags.contains(Flags::BOLD) {
+                        fg = brighten_named(fg);
+                    }
+                    // INVERSE *should* swap fg/bg. Without a per-cell
+                    // quad layer the swap would paint text in the
+                    // pane's bg colour — i.e. invisible — so we
+                    // ignore the flag for now. Tracked as M3 polish.
+                    let color = resolve(fg, default_fg, default_bg, default_cursor);
+
+                    if color != current_color && !current.is_empty() {
+                        runs.push((std::mem::take(&mut current), current_color));
+                    }
+                    current_color = color;
+
                     let c = cell.c;
                     // Drop the trailing space of a wide-char's right
                     // half (alacritty stores a 0 there).
                     if c == '\0' {
-                        s.push(' ');
+                        current.push(' ');
                     } else {
-                        s.push(c);
+                        current.push(c);
                     }
                 }
             }
-            s
-        };
-        self.terminal_text.set_content(&mut self.font_system, &text);
+            if !current.is_empty() {
+                runs.push((current, current_color));
+            }
+        }
+
+        // Emit spans. Skip `.color()` when the resolved colour matches
+        // the chrome default so the cosmic-text fast path picks up
+        // `TextArea.default_color` straight from the renderer.
+        let spans: Vec<(&str, Attrs)> = runs
+            .iter()
+            .map(|(s, c)| {
+                let mut attrs = Attrs::new();
+                if *c != default_fg {
+                    attrs = attrs.color(Color::rgb(c.r, c.g, c.b));
+                }
+                (s.as_str(), attrs)
+            })
+            .collect();
+        self.terminal_text
+            .set_content_rich(&mut self.font_system, spans);
     }
 
     /// Translate a winit key event into the byte sequence a PTY
