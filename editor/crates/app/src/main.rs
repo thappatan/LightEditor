@@ -326,7 +326,29 @@ const DIAG_DOT_DIP: f32 = 6.0;
 /// File-tree sidebar (M3) — fixed width for v1, resizable drag-handle
 /// is a follow-up. Per-depth indent is rendered as leading spaces in
 /// the shaped text (see `refresh_file_tree_text`).
-const SIDEBAR_WIDTH_DIP: f32 = 240.0;
+/// Initial width of the file-tree sidebar, in DIP. Drag-resize is
+/// driven against this default; the user-chosen width lives on
+/// `State::sidebar_width_dip` from then on.
+const SIDEBAR_DEFAULT_WIDTH_DIP: f32 = 240.0;
+/// Inclusive clamp range for the drag-resize handle.
+const SIDEBAR_MIN_WIDTH_DIP: f32 = 120.0;
+const SIDEBAR_MAX_WIDTH_DIP: f32 = 600.0;
+/// Hit-test thickness for the drag-resize strip on the sidebar's
+/// right edge — half on either side of the edge so the cursor can
+/// grab from either direction. 14 dip ≈ 28 physical px on Retina,
+/// wide enough to grab by feel without the cursor-icon polish.
+const SIDEBAR_RESIZE_HANDLE_DIP: f32 = 14.0;
+/// Width of the visible vertical divider between the sidebar and
+/// the gutter, in DIP. Without this both regions paint the same
+/// `gutter_bg` colour and the user can't see where to grab.
+const SIDEBAR_DIVIDER_DIP: f32 = 1.0;
+/// Wrap width for sidebar / chrome text stacks where we explicitly
+/// don't want soft-wrap. Cosmic-text's `set_size` expects a width so
+/// we hand it one a long filename won't reach; the visible bounds
+/// rectangle still clips anything that runs off the panel.
+/// Wrapping in the file tree would break the `row_index × line_h`
+/// hit-test the click and keyboard-selection paths rely on.
+const NO_WRAP_WIDTH_PX: f32 = 100_000.0;
 const SIDEBAR_PAD_X_DIP: f32 = 8.0;
 
 /// Embedded terminal pane (M3) — bottom-anchored pane, fixed height
@@ -906,6 +928,18 @@ struct State {
     file_tree: FileTree,
     /// Dedicated TextStack for the sidebar's row labels.
     file_tree_text: TextStack,
+    /// Sidebar width in DIP. User-resizable via the drag handle on
+    /// the right edge; seeded to [`SIDEBAR_DEFAULT_WIDTH_DIP`] and
+    /// clamped to `[SIDEBAR_MIN_WIDTH_DIP, SIDEBAR_MAX_WIDTH_DIP]`.
+    /// Stored in logical units so it survives DPI changes (a window
+    /// moved to a Retina display keeps the same visual size).
+    sidebar_width_dip: f32,
+    /// `Some(grab_offset_px)` while the user is dragging the resize
+    /// handle. The grab offset is the distance, in physical pixels,
+    /// between the mouse-down point and the sidebar's right edge —
+    /// so the edge stays glued to the cursor instead of snapping to
+    /// it on the first drag move.
+    sidebar_resize_drag: Option<f32>,
     /// Recursive filesystem watcher rooted at the sidebar's root.
     /// Fires `AppEvent::FileTreeChanged` after a 200 ms quiet period;
     /// the handler reloads with expansion preserved. `None` when
@@ -1091,9 +1125,13 @@ impl State {
             "",
         );
 
+        // Tree rows don't soft-wrap — a long filename clips at the
+        // sidebar's right edge instead of breaking onto a second
+        // visible row. Keeps `idx × line_h` accurate for hit-test
+        // and the keyboard-selection highlight.
         let file_tree_text = TextStack::new(
             &mut font_system,
-            (SIDEBAR_WIDTH_DIP - 2.0 * SIDEBAR_PAD_X_DIP) * scale,
+            NO_WRAP_WIDTH_PX,
             font_size_pt,
             line_height_pt,
             scale,
@@ -1179,6 +1217,8 @@ impl State {
             completion_text,
             file_tree,
             file_tree_text,
+            sidebar_width_dip: SIDEBAR_DEFAULT_WIDTH_DIP,
+            sidebar_resize_drag: None,
             _file_tree_watcher: file_tree_watcher,
             find_in_files: None,
             find_in_files_text,
@@ -2036,6 +2076,19 @@ impl State {
                 self.window.request_redraw();
             }
         }
+        // Drag-resize handle: a click on the strip starts a drag. The
+        // grab offset is the distance from the click point to the
+        // current right edge so the edge stays glued to the cursor
+        // through the drag (otherwise the sidebar would snap a few
+        // pixels on the first move). Tested *before* sidebar/tab/etc.
+        // branches so a click squarely on the edge doesn't also fire
+        // a row open.
+        if self.sidebar_resize_hit(mx, my) {
+            let grab_offset = mx - self.sidebar_width();
+            self.sidebar_resize_drag = Some(grab_offset);
+            self.last_click = None;
+            return;
+        }
         // Find-in-files panel claims clicks first while open — clicking
         // a result row opens that file; clicking the input row focuses
         // it; clicking outside the panel dismisses it.
@@ -2774,10 +2827,49 @@ impl State {
     /// when it's hidden. Helper for the layout maths below.
     fn sidebar_width(&self) -> f32 {
         if self.file_tree.visible {
-            SIDEBAR_WIDTH_DIP * self.scale
+            self.sidebar_width_dip * self.scale
         } else {
             0.0
         }
+    }
+
+    /// `true` if the physical-pixel point lies on the resize handle —
+    /// a thin strip centred on the sidebar's right edge that the user
+    /// drags to widen / narrow the panel. Returns false when the
+    /// sidebar is hidden.
+    fn sidebar_resize_hit(&self, x: f32, y: f32) -> bool {
+        if !self.file_tree.visible {
+            return false;
+        }
+        let edge = self.sidebar_width();
+        let half = SIDEBAR_RESIZE_HANDLE_DIP * self.scale * 0.5;
+        let in_strip = x >= edge - half && x <= edge + half;
+        if !in_strip {
+            return false;
+        }
+        let sidebar_top = TAB_BAR_HEIGHT_DIP * self.scale;
+        let sidebar_bottom = self.editor_bottom_y();
+        y >= sidebar_top && y < sidebar_bottom
+    }
+
+    /// Update the sidebar width from a mouse position while a resize
+    /// drag is in flight. `grab_offset` is the distance the mouse was
+    /// from the right edge when the drag started — preserving it
+    /// stops the edge from snapping to the cursor on the first frame.
+    /// Width is clamped into [`SIDEBAR_MIN_WIDTH_DIP`,
+    /// `SIDEBAR_MAX_WIDTH_DIP`] so the panel can't drag to zero (use
+    /// Cmd-B to hide it) or eat the entire window.
+    fn update_sidebar_width_from_drag(&mut self, mx: f32, grab_offset: f32) {
+        let target_edge_px = (mx - grab_offset).max(0.0);
+        let target_dip = target_edge_px / self.scale;
+        let clamped = target_dip.clamp(SIDEBAR_MIN_WIDTH_DIP, SIDEBAR_MAX_WIDTH_DIP);
+        if (clamped - self.sidebar_width_dip).abs() < 0.5 {
+            return;
+        }
+        self.sidebar_width_dip = clamped;
+        self.recompute_text_inset();
+        self.scene_dirty = true;
+        self.window.request_redraw();
     }
 
     /// Is the physical-pixel point inside the file-tree sidebar?
@@ -2852,7 +2944,11 @@ impl State {
 
     /// Recompute `text_inset_x` and the wrap width on the editor text
     /// stack — call after anything that changes the sidebar's width
-    /// (toggle, scale change, font resize).
+    /// (toggle, scale change, font resize, drag-resize). The sidebar
+    /// text stack itself stays at `NO_WRAP_WIDTH_PX` so long filenames
+    /// clip at the sidebar's right edge instead of wrapping onto a
+    /// second visible row (which would break the row-index hit-test
+    /// and the keyboard-selection highlight).
     fn recompute_text_inset(&mut self) {
         let font = self.text.font_size_pt();
         let gutter_width = gutter_outer_width(font, self.scale);
@@ -3402,6 +3498,7 @@ impl State {
     /// Left-button release: end any drag.
     fn handle_mouse_release(&mut self) {
         self.drag_anchor = None;
+        self.sidebar_resize_drag = None;
     }
 
     /// Write the active document to its path, or prompt for one with a Save As
@@ -5049,6 +5146,14 @@ impl State {
             self.scene_dirty = true;
             self.window.request_redraw();
         }
+        // Sidebar drag-resize: while the resize handle is held, every
+        // mouse move slides the right edge. The branch returns so the
+        // selection-drag path below doesn't also fire on the same
+        // motion.
+        if let Some(grab_offset) = self.sidebar_resize_drag {
+            self.update_sidebar_width_from_drag(x, grab_offset);
+            return;
+        }
         let Some(anchor) = self.drag_anchor else {
             return;
         };
@@ -5120,11 +5225,40 @@ impl State {
                 }
             }
         }
+        // File-tree sidebar claims wheel events when the pointer is
+        // over it, so the tree's own scroll position moves instead of
+        // the editor's scrolling under a stationary tree.
+        if self.file_tree.visible {
+            if let Some((mx, my)) = self.mouse_pos {
+                if self.in_sidebar(mx, my) {
+                    self.scroll_file_tree(delta_y);
+                    return;
+                }
+            }
+        }
         let max = self.max_scroll();
         let current = self.doc().scroll_y;
         let new = (current - delta_y).clamp(0.0, max);
         if new != current {
             self.doc_mut().scroll_y = new;
+            self.scene_dirty = true;
+            self.window.request_redraw();
+        }
+    }
+
+    /// Scroll the file-tree sidebar by the wheel delta. The same
+    /// clamp [`scroll_selected_into_view`](Self::scroll_selected_into_view)
+    /// uses so the panel can't scroll past the bottom of its content.
+    fn scroll_file_tree(&mut self, delta_y: f32) {
+        let line_h = self.line_height();
+        if line_h <= 0.0 {
+            return;
+        }
+        let body_h = (self.editor_bottom_y() - TAB_BAR_HEIGHT_DIP * self.scale).max(line_h);
+        let max = ((self.file_tree.nodes.len() as f32) * line_h - body_h).max(0.0);
+        let new = (self.file_tree.scroll_y - delta_y).clamp(0.0, max);
+        if (new - self.file_tree.scroll_y).abs() > f32::EPSILON {
+            self.file_tree.scroll_y = new;
             self.scene_dirty = true;
             self.window.request_redraw();
         }
@@ -5316,6 +5450,23 @@ impl State {
                     ));
                 }
             }
+            // Vertical divider on the right edge of the sidebar so the
+            // user can see where the drag-resize handle is — without
+            // it the sidebar and gutter share `gutter_bg` and read
+            // visually as one chrome column ending at the gutter's
+            // right edge. The divider rides on top of the sidebar
+            // backdrop and is drawn in the same colour as the active-
+            // line underlay (subtle but distinct).
+            let divider_w = SIDEBAR_DIVIDER_DIP * self.scale;
+            root.push_child(SceneNode::quad(
+                Rect::new(
+                    self.sidebar_width() - divider_w,
+                    top,
+                    divider_w,
+                    self.editor_bottom_y() - top,
+                ),
+                quad_color(&et.active_line_bg),
+            ));
         }
 
         // Gutter backdrop — a slim column on the left of the editor
@@ -5404,7 +5555,9 @@ impl State {
 
         // Active line backdrop — a faint full-width row at every visual run
         // of the logical line where the primary caret sits. Behind the
-        // selection so the selection's brighter blue still reads.
+        // selection so the selection's brighter blue still reads. Starts
+        // at the gutter (after the sidebar) so the bar doesn't paint
+        // over the file-tree panel.
         let active_logical = {
             let head = self.doc().editor.selections().primary().head;
             self.doc().editor.buffer().char_to_position(head).line
@@ -5412,12 +5565,17 @@ impl State {
         let scroll = self.doc().scroll_y;
         let line_h = self.line_height();
         let active_color = quad_color(&et.active_line_bg);
+        let row_left = self.sidebar_width();
+        let row_w = (w - row_left).max(0.0);
         for run in self.text.buffer.layout_runs() {
             if run.line_i != active_logical {
                 continue;
             }
             let y = self.text_inset_y + run.line_top - scroll;
-            root.push_child(SceneNode::quad(Rect::new(0.0, y, w, line_h), active_color));
+            root.push_child(SceneNode::quad(
+                Rect::new(row_left, y, row_w, line_h),
+                active_color,
+            ));
         }
 
         // Indent guides — thin vertical lines every `indent_unit` chars of
