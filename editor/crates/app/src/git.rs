@@ -11,9 +11,9 @@
 //! the gutter just shows no markers, no panic.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use git2::{DiffOptions, Patch, Repository};
+use git2::{DiffOptions, Patch, Repository, StatusOptions};
 
 /// What changed on a given line vs HEAD. Mirrors the standard
 /// editor-gutter convention: green bar (added), blue bar (modified),
@@ -153,6 +153,84 @@ pub fn compute_line_status(path: &Path, current_text: &str) -> HashMap<usize, Gi
     status
 }
 
+/// File-level git status for the workspace, used by the file-tree
+/// sidebar to decorate each row with a single-character marker
+/// (`M`, `?`, `A`, `U`, `D`). Mirrors the short codes from
+/// `git status --porcelain` — one column per file, conflict
+/// trumps everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileGitStatus {
+    /// Modified in the working tree or staged with changes.
+    Modified,
+    /// Newly tracked (staged add) but not committed.
+    Added,
+    /// Present on disk but never staged. Common for new files.
+    Untracked,
+    /// Deleted from disk but still tracked.
+    Deleted,
+    /// Merge conflict — needs the user to resolve.
+    Conflicted,
+}
+
+/// Walk the workspace once and return absolute-path → status for
+/// every file libgit2 considers interesting (anything not ignored
+/// and not "current"). Directories are *not* included; only files.
+/// Returns an empty map when `root` isn't inside a git repo so the
+/// sidebar just shows undecorated rows.
+pub fn compute_workspace_status(root: &Path) -> HashMap<PathBuf, FileGitStatus> {
+    let mut out: HashMap<PathBuf, FileGitStatus> = HashMap::new();
+
+    // Same canonicalisation dance as `compute_line_status`: libgit2
+    // returns a canonical workdir, and the caller's `root` may be a
+    // symlink (macOS `/var` → `/private/var`), so paths need to be
+    // compared in the same canonical form.
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    let Ok(repo) = Repository::discover(&root_canon) else {
+        return out;
+    };
+    let Some(workdir) = repo.workdir() else {
+        return out;
+    };
+    let workdir = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_path_buf());
+
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .include_ignored(false)
+        .recurse_untracked_dirs(true);
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+        return out;
+    };
+
+    for entry in statuses.iter() {
+        let Some(rel) = entry.path() else {
+            continue;
+        };
+        let flags = entry.status();
+        // Conflict wins over every other classification — a file
+        // that's both modified *and* conflicted should show as
+        // conflicted so the user resolves it first.
+        let kind = if flags.is_conflicted() {
+            FileGitStatus::Conflicted
+        } else if flags.is_index_new() {
+            FileGitStatus::Added
+        } else if flags.is_wt_new() {
+            FileGitStatus::Untracked
+        } else if flags.is_wt_modified() || flags.is_index_modified() {
+            FileGitStatus::Modified
+        } else if flags.is_wt_deleted() || flags.is_index_deleted() {
+            FileGitStatus::Deleted
+        } else {
+            // Current / ignored / typechange-only — nothing to show.
+            continue;
+        };
+        out.insert(workdir.join(rel), kind);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +352,53 @@ mod tests {
         std::fs::write(&path, "anything\n").unwrap();
         let status = compute_line_status(&path, "anything\n");
         assert!(status.is_empty());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn workspace_status_flags_modified_added_untracked() {
+        let root = make_repo();
+        // Untracked file straight on disk.
+        std::fs::write(root.join("new.txt"), "hi\n").unwrap();
+        // Modify the seed file (`hello.txt` was committed by make_repo).
+        std::fs::write(root.join("hello.txt"), "alpha\nBETA\ngamma\n").unwrap();
+        // Stage a new file so it shows up as Added (index_new, not wt_new).
+        std::fs::write(root.join("staged.txt"), "x\n").unwrap();
+        let out = Command::new("git")
+            .args(["add", "staged.txt"])
+            .current_dir(&root)
+            .output()
+            .expect("git available");
+        assert!(out.status.success());
+
+        let map = compute_workspace_status(&root);
+        // Canonicalise the expected key the same way the helper does.
+        let canon_root = root.canonicalize().unwrap();
+        assert_eq!(
+            map.get(&canon_root.join("new.txt")),
+            Some(&FileGitStatus::Untracked),
+        );
+        assert_eq!(
+            map.get(&canon_root.join("hello.txt")),
+            Some(&FileGitStatus::Modified),
+        );
+        assert_eq!(
+            map.get(&canon_root.join("staged.txt")),
+            Some(&FileGitStatus::Added),
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn workspace_status_outside_repo_is_empty() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let pid = std::process::id();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("editor-app-git-ws-no-repo-{pid}-{n}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let map = compute_workspace_status(&tmp);
+        assert!(map.is_empty());
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

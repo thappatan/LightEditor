@@ -697,6 +697,36 @@ fn git_marker_color(status: git::GitLineStatus) -> SceneColor {
     quad_color(hex)
 }
 
+/// Pick the text colour for a file-tree status decoration. Uses the
+/// same green / blue / red palette as the gutter so the user reads
+/// "this file is modified" from either side at the same glance.
+/// `Added` reuses green; `Untracked` is yellow so a brand-new file
+/// reads as "needs attention but not yet a change vs HEAD".
+/// `Conflicted` is the same red as `Deleted` for v1.
+fn file_git_status_color(status: git::FileGitStatus) -> Color {
+    let hex = match status {
+        git::FileGitStatus::Modified => "#388bfd",
+        git::FileGitStatus::Added => "#3fb950",
+        git::FileGitStatus::Untracked => "#d29922",
+        git::FileGitStatus::Deleted => "#f85149",
+        git::FileGitStatus::Conflicted => "#f85149",
+    };
+    text_color(hex)
+}
+
+/// Single-character suffix shown after the filename on the tree row.
+/// Mirrors `git status --porcelain` codes so the indicator reads
+/// the same as the user already knows from the CLI.
+fn file_git_status_label(status: git::FileGitStatus) -> &'static str {
+    match status {
+        git::FileGitStatus::Modified => "M",
+        git::FileGitStatus::Added => "A",
+        git::FileGitStatus::Untracked => "?",
+        git::FileGitStatus::Deleted => "D",
+        git::FileGitStatus::Conflicted => "U",
+    }
+}
+
 /// Pick a quad colour for one diagnostic severity. Uses the theme's syntax
 /// strings so themes can override the palette later; for now, fall back
 /// to fixed hexes if any are missing.
@@ -946,6 +976,11 @@ struct State {
     /// `notify` setup failed — the tree still works, just without
     /// auto-refresh on external changes.
     _file_tree_watcher: Option<RecommendedWatcher>,
+    /// Workspace-wide git status: absolute path → `M`/`A`/`?`/`D`/`U`
+    /// marker shown next to the filename in the sidebar. Refreshed on
+    /// tab switch, save, and every file-tree reload. Empty when the
+    /// workspace isn't a git repo, which silently hides the markers.
+    workspace_git_status: HashMap<PathBuf, git::FileGitStatus>,
     /// Find-in-files overlay (M3). `Some` while the panel is open;
     /// `None` once the user dismisses it. Re-opening builds a fresh
     /// state — there's no value in remembering an old query.
@@ -1175,6 +1210,7 @@ impl State {
         // and update it from the `SettingsChanged` handler.
         let file_tree_watcher =
             spawn_file_tree_watcher(&file_tree.root, hidden_dirs, flash_proxy.clone());
+        let workspace_git_status = git::compute_workspace_status(&file_tree.root);
 
         let mut state = Self {
             window,
@@ -1228,6 +1264,7 @@ impl State {
             sidebar_width_dip: SIDEBAR_DEFAULT_WIDTH_DIP,
             sidebar_resize_drag: None,
             _file_tree_watcher: file_tree_watcher,
+            workspace_git_status,
             find_in_files: None,
             find_in_files_text,
             terminal: None,
@@ -2970,29 +3007,73 @@ impl State {
         );
     }
 
+    /// Recompute the workspace-wide git status. Runs libgit2 once over
+    /// the repo at `file_tree.root` and caches the result on `self` —
+    /// the next `refresh_file_tree_text` call paints the markers from
+    /// this cache. Outside a repo the helper returns an empty map and
+    /// the markers silently disappear.
+    fn refresh_workspace_git_status(&mut self) {
+        self.workspace_git_status = git::compute_workspace_status(&self.file_tree.root);
+    }
+
     /// Rebuild the file-tree text stack from the current node list.
     /// Indents nest visually via leading spaces; the marker `▾`/`▸`
-    /// distinguishes expanded vs collapsed directories.
+    /// distinguishes expanded vs collapsed directories; files get a
+    /// single-character git-status suffix when the workspace's status
+    /// cache has an entry for them.
     fn refresh_file_tree_text(&mut self) {
-        let mut s = String::with_capacity(self.file_tree.nodes.len() * 24);
-        for (i, node) in self.file_tree.nodes.iter().enumerate() {
+        // Build per-row body text (indent + marker + name) up front so
+        // the rich-span builder below can borrow stable `&str` slices
+        // from each row's owned String. Status (Option<FileGitStatus>)
+        // rides alongside the body so the suffix gets a coloured span.
+        let row_data: Vec<(String, Option<git::FileGitStatus>)> = self
+            .file_tree
+            .nodes
+            .iter()
+            .map(|node| {
+                let mut s = String::new();
+                // Two spaces per depth level keeps the indent crisp
+                // without burning columns on bigger files.
+                for _ in 0..node.depth {
+                    s.push_str("  ");
+                }
+                let marker = match node.kind {
+                    NodeKind::Directory { expanded: true } => "▾ ",
+                    NodeKind::Directory { expanded: false } => "▸ ",
+                    NodeKind::File => "  ",
+                };
+                s.push_str(marker);
+                s.push_str(&node.name);
+                // Only files get a status marker for v1; surfacing
+                // directory roll-ups (any modified file inside?) needs
+                // a different design and is queued for a follow-up.
+                let status = match node.kind {
+                    NodeKind::File => self.workspace_git_status.get(&node.path).copied(),
+                    _ => None,
+                };
+                (s, status)
+            })
+            .collect();
+
+        let body_attrs = || Attrs::new().family(Family::Monospace);
+        let mut spans: Vec<(&str, Attrs)> = Vec::with_capacity(row_data.len() * 3);
+        for (i, (body, status)) in row_data.iter().enumerate() {
             if i > 0 {
-                s.push('\n');
+                spans.push(("\n", body_attrs()));
             }
-            // Two spaces per depth level keeps the indent crisp without
-            // burning columns to bigger files.
-            for _ in 0..node.depth {
-                s.push_str("  ");
+            spans.push((body.as_str(), body_attrs()));
+            if let Some(s) = status {
+                // Pad with two spaces so the status letter sits a few
+                // pixels off the filename — easier to read at a glance.
+                spans.push(("  ", body_attrs()));
+                spans.push((
+                    file_git_status_label(*s),
+                    body_attrs().color(file_git_status_color(*s)),
+                ));
             }
-            let marker = match node.kind {
-                NodeKind::Directory { expanded: true } => "▾ ",
-                NodeKind::Directory { expanded: false } => "▸ ",
-                NodeKind::File => "  ",
-            };
-            s.push_str(marker);
-            s.push_str(&node.name);
         }
-        self.file_tree_text.set_content(&mut self.font_system, &s);
+        self.file_tree_text
+            .set_content_rich(&mut self.font_system, spans);
     }
 
     /// Hit-test a physical-pixel point against the sidebar's rows.
@@ -6548,6 +6629,12 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::FileTreeChanged => {
                 if let Some(state) = self.state.as_mut() {
                     state.file_tree.reload_preserving_expansion();
+                    // Filesystem activity is also when git status moves
+                    // (saving the active file, a git checkout in the
+                    // terminal pane, etc.), so re-run the workspace
+                    // status query on the same debounce that drove the
+                    // tree reload.
+                    state.refresh_workspace_git_status();
                     // Only re-shape the row labels if the sidebar is
                     // visible — invisible reloads silently keep the
                     // tree warm so it pops up fresh on next Cmd-B.
