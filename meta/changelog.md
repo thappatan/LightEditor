@@ -1,7 +1,23 @@
 # Project Changelog
 
-> Track project management changes (folder structure, milestones, ADRs)
-> Code-level changelog will live in editor/CHANGELOG.md when implementation starts
+> Track project management changes (folder structure, milestones, ADRs).
+> Code-level changelog (per-PR feature/fix detail) lives in
+> [`editor/CHANGELOG.md`](../editor/CHANGELOG.md).
+
+## 2026-05-16 → 2026-05-17 — Sessions 7–8 (M2 Smart)
+
+- **Milestone 2 partial-complete** — diagnostics + hover + goto-def slice through real LSPs ([tasks/milestone-2-smart.md](../tasks/milestone-2-smart.md)). Completion, references, rename, formatting, multi-root LSP deferred to a follow-up milestone.
+- **tree-sitter** integration with 15 grammars (Rust + TS/TSX/JS + JSON + Python + Go + C + Markdown + TOML + YAML + Dart + Bash + Lua + Ruby), incremental reparse via `tree.edit()` and `editor-core::PendingEdits`, per-language context-sensitive classifiers.
+- **LSP client** crate (`editor-lsp-client`) with hand-rolled JSON-RPC framing + reader/writer threads. rust-analyzer + typescript-language-server wired as built-in defaults; binaries missing on PATH disable LSP silently.
+- **Theme engine** — TOML themes (`theme.toml`) with hot-reload, 6 bundled themes (Solarized Dark/Light, Monokai, Gruvbox Dark, Nord, Tokyo Night), in-palette theme picker + "Browse…" file dialog.
+- **Performance pass** — keystroke P99 fell from ~280 ms to ~27 ms on a 4000-line buffer. Root cause was cosmic-text re-shaping the whole buffer per keystroke; fixed with a per-line prefix+suffix-LCS diff in `editor-ui-text` that scopes `BufferLine::set_text` to the lines that actually changed.
+
+## 2026-05-14 → 2026-05-16 — Session 6 (M1 Editable)
+
+- **Milestone 1 complete** — single-file editor that can dogfood itself ([tasks/milestone-1-editable.md](../tasks/milestone-1-editable.md)).
+- Shipped: ropey-backed `editor-core` (multi-cursor, tree-based undo, grapheme-aware movement), retained-mode scene graph (`editor-ui-scene`), wgpu/glyphon text pipeline (`editor-ui-render` + `editor-ui-text`), file I/O + Save All + drag-drop, tab strip with close button + middle-click, command palette (`nucleo`), find/replace in buffer with case + whole-word toggles, status bar with caret + line-count + flash messages, gutter with line numbers + active-line highlight + indent guides.
+- Settings (`editor-config`): TOML at `~/Library/Application Support/lighteditor/settings.toml` + workspace override at `<cwd>/.lighteditor/settings.toml`, file-watched hot-reload via `notify` ([ADR-009](../docs/adr/adr-009-config-format-toml.md)).
+- M1 deferrals (intentionally pushed to M3): file-tree sidebar, embedded terminal, multi-root workspace UX, split panes, find-in-files.
 
 ## 2026-05-14 — Session 5 (M0 Spike)
 
