@@ -2566,19 +2566,24 @@ impl State {
     }
 
     /// Send `textDocument/didChange` for the active doc. Called from the
-    /// render path right after the editor revision moves.
-    fn lsp_did_change_active(&mut self) {
+    /// render path right after the editor revision moves. `text` is the
+    /// shaped buffer text we already materialized for the reshape pass —
+    /// reusing it avoids a second `Rope::to_string()` per keystroke,
+    /// which on a 4000-line file was costing ~10 ms.
+    fn lsp_did_change_active(&mut self, text: &str) {
         let Some(path) = self.doc().file_path.clone() else {
             return;
         };
         let Some(lang) = Language::for_path(&path) else {
             return;
         };
-        let text = self.doc().editor.text();
+        if !self.lsp.has_server(lang) {
+            return;
+        }
         let v = self.lsp_doc_version.entry(path.clone()).or_insert(0);
         *v += 1;
         let version = *v;
-        self.lsp.did_change(&path, lang, version, text);
+        self.lsp.did_change(&path, lang, version, text.to_string());
     }
 
     /// Send `textDocument/didSave` for the active doc.
@@ -4014,10 +4019,10 @@ impl State {
                 self.text.set_content(&mut self.font_system, &new_text);
             }
             self.text_dirty = false;
-            // Ship the new full text to the LSP server for the active doc.
-            // Cheap path: when no server is wired for this language, the
-            // helper short-circuits.
-            self.lsp_did_change_active();
+            // Ship the freshly-materialised text to the LSP server for
+            // the active doc. The helper short-circuits when no server is
+            // wired for this language, so the non-LSP path is free.
+            self.lsp_did_change_active(&new_text);
         }
         if self.scene_dirty {
             if self.follow_caret {

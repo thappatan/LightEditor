@@ -51,14 +51,16 @@ impl ServerKind {
     }
 }
 
-/// Walk up from `start` looking for a file that marks a project root.
-/// Returns the directory containing the first marker, or `None` when we
-/// hit the filesystem root without finding one — in which case the host
-/// passes a null `rootUri` and the server falls back to single-file mode.
+/// Walk up from `start` looking for a directory that marks a project
+/// root. Returns the **topmost** marker location bounded by a git repo
+/// (or the filesystem root if there's no `.git` ancestor).
 ///
-/// Matters most for rust-analyzer: without a Cargo.toml in scope it does
-/// no type-checking, so a file opened from `crates/app/src/main.rs` gets
-/// no diagnostics unless we point the server at the workspace root.
+/// "Topmost wins" is what rust-analyzer needs for Cargo workspaces:
+/// `editor/crates/app/Cargo.toml` is a crate manifest, but
+/// `editor/Cargo.toml` is the workspace manifest, and rust-analyzer
+/// loads cross-crate information only when pointed at the latter. The
+/// `.git` ceiling stops us from accidentally jumping out of one project
+/// into a parent monorepo.
 fn find_project_root(start: &Path) -> Option<PathBuf> {
     const MARKERS: &[&str] = &[
         "Cargo.toml",
@@ -68,16 +70,25 @@ fn find_project_root(start: &Path) -> Option<PathBuf> {
         "pyproject.toml",
         "go.mod",
         "pubspec.yaml",
-        ".git",
     ];
-    let mut p: &Path = start.parent()?;
+    let mut current = start.parent()?;
+    let mut highest: Option<PathBuf> = None;
     loop {
         for marker in MARKERS {
-            if p.join(marker).exists() {
-                return Some(p.to_path_buf());
+            if current.join(marker).exists() {
+                highest = Some(current.to_path_buf());
+                break;
             }
         }
-        p = p.parent()?;
+        // `.git` is the project-tree ceiling: don't jump out of one
+        // repo into its parent.
+        if current.join(".git").exists() {
+            return highest.or_else(|| Some(current.to_path_buf()));
+        }
+        current = match current.parent() {
+            Some(p) => p,
+            None => return highest,
+        };
     }
 }
 
@@ -188,6 +199,16 @@ impl LspState {
     /// known.
     pub fn diagnostics_for(&self, path: &Path) -> Option<&[Diagnostic]> {
         self.diagnostics.get(path).map(|v| v.as_slice())
+    }
+
+    /// Whether a server slot has been spawned for `lang`. Callers use this
+    /// to avoid materialising the buffer text when no server would
+    /// consume it (e.g. opening a Python file before that language has
+    /// any LSP wiring).
+    pub fn has_server(&self, lang: Language) -> bool {
+        ServerKind::for_language(lang)
+            .map(|k| self.slots.contains_key(&k))
+            .unwrap_or(false)
     }
 
     /// Total diagnostics across all open files, broken down by severity.
@@ -626,12 +647,18 @@ mod tests {
     }
 
     #[test]
-    fn find_project_root_walks_up_to_a_marker() {
-        // Use this crate's own layout: src/lsp.rs sits under crates/app/,
-        // which contains Cargo.toml. Walking up should find it.
+    fn find_project_root_prefers_workspace_over_crate() {
+        // CARGO_MANIFEST_DIR == .../editor/crates/app. Walking up from a
+        // source file inside this crate should reach the workspace root
+        // at .../editor (which contains a `[workspace]` Cargo.toml), not
+        // stop at the inner crate Cargo.toml.
         let here = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lsp.rs");
         let root = find_project_root(&here).expect("Cargo.toml exists upward");
-        assert!(root.join("Cargo.toml").is_file());
+        assert_eq!(
+            root.file_name().and_then(|n| n.to_str()),
+            Some("editor"),
+            "expected workspace root, got {root:?}"
+        );
     }
 
     #[test]
