@@ -4,12 +4,14 @@
 //! remain single-instance on [`super::State`]; only the per-document fields
 //! live here.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use editor_core::Editor;
 use editor_syntax::{Highlight, Highlighter, Language};
 
 use crate::find::FindBar;
+use crate::git::GitLineStatus;
 
 pub struct Document {
     pub editor: Editor,
@@ -38,6 +40,14 @@ pub struct Document {
     /// rather than the user-settings `tab_size`. Falls back to 4 for
     /// fresh / un-indented files.
     pub indent_unit: usize,
+    /// Per-line git status vs HEAD, keyed on 0-based line index. Empty
+    /// for files outside a git repo, untitled scratch buffers, and any
+    /// other case where libgit2 couldn't compute a diff.
+    pub git_status: HashMap<usize, GitLineStatus>,
+    /// Editor `revision` at the time `git_status` was computed. `None`
+    /// means "not yet computed" — the render path recomputes when this
+    /// drifts from the current revision.
+    pub git_status_revision: Option<u64>,
 }
 
 impl Document {
@@ -52,6 +62,8 @@ impl Document {
             cached_highlights: Vec::new(),
             cached_revision: None,
             indent_unit: detect_indent_unit(initial_text),
+            git_status: HashMap::new(),
+            git_status_revision: None,
         }
     }
 
@@ -68,6 +80,8 @@ impl Document {
             cached_highlights: Vec::new(),
             cached_revision: None,
             indent_unit,
+            git_status: HashMap::new(),
+            git_status_revision: None,
         }
     }
 

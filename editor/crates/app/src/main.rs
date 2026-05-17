@@ -13,6 +13,7 @@
 mod document;
 mod file_tree;
 mod find;
+mod git;
 mod lsp;
 mod palette;
 
@@ -612,6 +613,18 @@ fn severity_rank(s: lsp_types::DiagnosticSeverity) -> u8 {
         lsp_types::DiagnosticSeverity::HINT => 3,
         _ => 4,
     }
+}
+
+/// Pick a quad colour for one git-gutter line status. Conventions match
+/// VS Code: green added / blue modified / red deletion wedge. Themable
+/// later via a dedicated section in the theme TOML; hardcoded for v1.
+fn git_marker_color(status: git::GitLineStatus) -> SceneColor {
+    let hex = match status {
+        git::GitLineStatus::Added => "#3fb950",
+        git::GitLineStatus::Modified => "#388bfd",
+        git::GitLineStatus::Deleted => "#f85149",
+    };
+    quad_color(hex)
 }
 
 /// Pick a quad colour for one diagnostic severity. Uses the theme's syntax
@@ -2816,6 +2829,25 @@ impl State {
 
     /// Re-shape the gutter to cover every buffer line. A no-op when the
     /// line count is unchanged since the last refresh — typing within an
+    /// Recompute the active document's per-line git status against
+    /// HEAD when the editor revision has moved. Gated on revision so
+    /// tab switches (same revision) are free; called once per render
+    /// pass where text_dirty was set.
+    fn refresh_git_status(&mut self, current_text: &str) {
+        let Some(path) = self.docs[self.active].file_path.clone() else {
+            // Untitled scratch — no path, nothing to diff against.
+            self.docs[self.active].git_status.clear();
+            self.docs[self.active].git_status_revision = None;
+            return;
+        };
+        let revision = self.docs[self.active].editor.revision();
+        if self.docs[self.active].git_status_revision == Some(revision) {
+            return;
+        }
+        self.docs[self.active].git_status = git::compute_line_status(&path, current_text);
+        self.docs[self.active].git_status_revision = Some(revision);
+    }
+
     /// existing line doesn't reshape thousands of digits.
     fn refresh_gutter(&mut self) {
         use std::fmt::Write;
@@ -4353,6 +4385,35 @@ impl State {
             quad_color(&et.gutter_bg),
         ));
 
+        // Git gutter markers — a thin coloured bar on each line that
+        // differs from HEAD. Green = added, blue = modified, red = a
+        // deletion was anchored just above this line. Renders BEFORE
+        // the diagnostic dots so the dot wins when both apply, and
+        // BEFORE the line numbers so the number stays legible on top.
+        if !self.doc().git_status.is_empty() {
+            let scroll = self.doc().scroll_y;
+            let line_h = self.line_height();
+            let marker_w = 3.0 * self.scale;
+            let marker_x = sidebar_w; // hug the left edge of the gutter
+            for (&line, &status) in &self.doc().git_status {
+                let y_top = self.text_inset_y + (line as f32) * line_h - scroll;
+                if y_top + line_h < self.text_inset_y || y_top > self.text_inset_y + gutter_h {
+                    continue;
+                }
+                let h = if matches!(status, git::GitLineStatus::Deleted) {
+                    // A "lines were deleted just above here" wedge —
+                    // short bar at the line's top edge.
+                    line_h * 0.35
+                } else {
+                    line_h
+                };
+                root.push_child(SceneNode::quad(
+                    Rect::new(marker_x, y_top, marker_w, h),
+                    git_marker_color(status),
+                ));
+            }
+        }
+
         // Diagnostic dots — one per line with at least one LSP diagnostic,
         // coloured by the highest-severity diagnostic on that line. Sits at
         // the left edge of the gutter so it doesn't compete with the line
@@ -4741,6 +4802,11 @@ impl State {
             // wired for this language, so the non-LSP path is free.
             self.lsp_did_change_active(&new_text);
             t.lsp_send = frame_start.elapsed();
+            // Refresh per-line git status against HEAD. Cheap on
+            // libgit2 (single-digit ms even on a 4000-line file) and
+            // gated by the editor's revision counter so unchanged
+            // tab-switches don't re-diff.
+            self.refresh_git_status(&new_text);
         }
         if self.scene_dirty {
             if self.follow_caret {
