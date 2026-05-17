@@ -4831,7 +4831,7 @@ impl State {
         // every line stacked vertically) so the matching gutter row lines
         // up with the editor row — clip-bounds to one row hide the rest of
         // the buffer.
-        let gutter_left = GUTTER_PAD_LEFT_DIP * self.scale;
+        let gutter_left = self.sidebar_width() + GUTTER_PAD_LEFT_DIP * self.scale;
         let line_height = self.line_height();
         let viewport_top = self.text_inset_y;
         let viewport_bottom = surface_h as f32 - status_bar_h;
@@ -4862,7 +4862,10 @@ impl State {
             }
             let area_top = row_top - run.line_i as f32 * line_height;
             let bounds = TextBounds {
-                left: 0,
+                // Clip the gutter row to the gutter column only — when
+                // the sidebar is open, leaving `left: 0` would draw the
+                // line number on top of the sidebar's text.
+                left: self.sidebar_width() as i32,
                 top: row_top.max(viewport_top) as i32,
                 right: inset_x as i32,
                 bottom: (row_top + line_height).min(viewport_bottom) as i32,

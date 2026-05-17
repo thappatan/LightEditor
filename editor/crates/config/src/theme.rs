@@ -103,9 +103,11 @@ impl Default for EditorTheme {
             status_bg: "#16161cff".into(),
             status_fg: "#b4b4beff".into(),
 
-            overlay_bg: "#262630f0".into(),
+            // Popups must be fully opaque so the editor's text doesn't
+            // bleed through the palette / completion / hover panel.
+            overlay_bg: "#262630ff".into(),
             overlay_scrim: "#00000060".into(),
-            palette_selection_bg: "#78a0ff50".into(),
+            palette_selection_bg: "#78a0ff60".into(),
 
             find_match_bg: "#ffc83c40".into(),
             indent_guide: "#505064a0".into(),
