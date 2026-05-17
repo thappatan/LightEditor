@@ -685,6 +685,18 @@ fn scroll_into_view(f: &mut FindInFiles, visible: usize) {
     }
 }
 
+/// One run of consecutive terminal cells in a single grid row that
+/// share the same background colour. Stored on `State` between the
+/// grid walk in `refresh_terminal_text` and the pixel-rect emission
+/// in `rebuild_scene`, so the renderer doesn't re-walk the grid.
+#[derive(Debug, Clone)]
+struct TerminalBgRun {
+    row: usize,
+    col_start: usize,
+    col_end: usize,
+    color: terminal_palette::PaletteColor,
+}
+
 /// Pick a quad colour for one git-gutter line status. Conventions match
 /// VS Code: green added / blue modified / red deletion wedge. Themable
 /// later via a dedicated section in the theme TOML; hardcoded for v1.
@@ -994,6 +1006,12 @@ struct State {
     terminal: Option<terminal::TerminalPane>,
     /// Dedicated TextStack for the terminal pane's grid contents.
     terminal_text: TextStack,
+    /// Per-cell background runs for the terminal pane, collected
+    /// during [`refresh_terminal_text`] and converted to pixel
+    /// rects at scene-rebuild time. Consecutive cells in the same
+    /// row with the same bg colour share one run; the default-bg
+    /// sentinel is skipped (the pane fills that already).
+    terminal_bg_runs: Vec<TerminalBgRun>,
 
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
@@ -1269,6 +1287,7 @@ impl State {
             find_in_files_text,
             terminal: None,
             terminal_text,
+            terminal_bg_runs: Vec::new(),
             tab_spaces,
             theme,
             pending_keystroke: None,
@@ -3332,14 +3351,18 @@ impl State {
     /// Per-cell foreground colours are read from the grid and folded
     /// into `(slice, Attrs)` spans so cosmic-text shapes coloured
     /// runs in one pass. Background colours and bold-weight / italic /
-    /// underline attributes are *not* honoured in v1 — the renderer
-    /// has no per-cell quad layer yet and the pane uses a single
-    /// monospace face, so all four would need a follow-up.
+    /// underline attributes are *not* honoured in v1 — the pane uses
+    /// a single monospace face, so weight / style / underline are
+    /// follow-ups. Background colours and INVERSE *are* honoured:
+    /// the background of every cell whose `bg` isn't the pane default
+    /// gets emitted to [`Self::terminal_bg_quads`] so the next
+    /// `rebuild_scene` can paint them under the text.
     fn refresh_terminal_text(&mut self) {
         let Some(pane) = self.terminal.as_ref() else {
             return;
         };
         use alacritty_terminal::term::cell::Flags;
+        use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
         use terminal_palette::{brighten_named, resolve, PaletteColor};
 
         // Theme-driven defaults for the three sentinel named colours.
@@ -3363,6 +3386,14 @@ impl State {
         let mut current = String::new();
         let mut current_color = default_fg;
 
+        // Per-cell background runs are gathered alongside the text
+        // pass: consecutive cells in the same row with the same bg
+        // get one wide quad so a stripe of bg colour is just one
+        // entry. Pane origin / cell size only matter at draw time,
+        // so we collect by `(row, col_start, col_end, palette)` here
+        // and convert to pixel rects in `rebuild_scene`.
+        let mut bg_runs: Vec<TerminalBgRun> = Vec::new();
+
         {
             let term = pane.term.lock();
             let grid = term.grid();
@@ -3378,9 +3409,14 @@ impl State {
                 }
                 let line =
                     alacritty_terminal::index::Line(screen_row as i32 - display_offset as i32);
+
+                // In-flight bg-run state for this row.
+                let mut row_bg: Option<(usize, PaletteColor)> = None;
+
                 for col in 0..grid.columns() {
                     let cell = &grid[line][alacritty_terminal::index::Column(col)];
                     let flags = cell.flags;
+                    let inverse = flags.contains(Flags::INVERSE);
                     let mut fg = cell.fg;
                     // Classic xterm behaviour: BOLD brightens the
                     // named fg colour (8 → 16-colour palette upgrade).
@@ -3388,16 +3424,62 @@ impl State {
                     if flags.contains(Flags::BOLD) {
                         fg = brighten_named(fg);
                     }
-                    // INVERSE *should* swap fg/bg. Without a per-cell
-                    // quad layer the swap would paint text in the
-                    // pane's bg colour — i.e. invisible — so we
-                    // ignore the flag for now. Tracked as M3 polish.
-                    let color = resolve(fg, default_fg, default_bg, default_cursor);
+                    let bg = cell.bg;
+                    // INVERSE swaps fg/bg roles for rendering — the
+                    // glyph paints in the cell's bg colour, the cell
+                    // backdrop in the fg colour.
+                    let (fg_eff, bg_eff) = if inverse { (bg, fg) } else { (fg, bg) };
 
-                    if color != current_color && !current.is_empty() {
+                    let fg_color = resolve(fg_eff, default_fg, default_bg, default_cursor);
+                    if fg_color != current_color && !current.is_empty() {
                         runs.push((std::mem::take(&mut current), current_color));
                     }
-                    current_color = color;
+                    current_color = fg_color;
+
+                    // Background quads: skip the default Background
+                    // sentinel (the pane fills that already), keep
+                    // everything else. INVERSE always emits a quad
+                    // because the swap means even default-fg ends up
+                    // as a coloured backdrop.
+                    let bg_visible =
+                        inverse || !matches!(bg_eff, AnsiColor::Named(NamedColor::Background));
+                    let bg_color = if bg_visible {
+                        Some(resolve(bg_eff, default_fg, default_bg, default_cursor))
+                    } else {
+                        None
+                    };
+
+                    match (row_bg, bg_color) {
+                        (Some((start, prev)), Some(c)) if prev == c => {
+                            // Same colour as the in-flight run; extend.
+                            row_bg = Some((start, prev));
+                            let _ = col;
+                        }
+                        (Some((start, prev)), Some(c)) => {
+                            // Different colour — close the old run, start a new one.
+                            bg_runs.push(TerminalBgRun {
+                                row: screen_row,
+                                col_start: start,
+                                col_end: col,
+                                color: prev,
+                            });
+                            row_bg = Some((col, c));
+                        }
+                        (Some((start, prev)), None) => {
+                            // Bg became default — close.
+                            bg_runs.push(TerminalBgRun {
+                                row: screen_row,
+                                col_start: start,
+                                col_end: col,
+                                color: prev,
+                            });
+                            row_bg = None;
+                        }
+                        (None, Some(c)) => {
+                            row_bg = Some((col, c));
+                        }
+                        (None, None) => {}
+                    }
 
                     let c = cell.c;
                     // Drop the trailing space of a wide-char's right
@@ -3408,11 +3490,22 @@ impl State {
                         current.push(c);
                     }
                 }
+                // End-of-row flush for the in-flight bg run.
+                if let Some((start, color)) = row_bg {
+                    bg_runs.push(TerminalBgRun {
+                        row: screen_row,
+                        col_start: start,
+                        col_end: grid.columns(),
+                        color,
+                    });
+                }
             }
             if !current.is_empty() {
                 runs.push((current, current_color));
             }
         }
+
+        self.terminal_bg_runs = bg_runs;
 
         // Emit spans. `Attrs::new()` defaults to `Family::SansSerif`,
         // and cosmic-text honours that per-span without merging with
@@ -5773,10 +5866,29 @@ impl State {
         // below the editor area. A slightly darker fill so it reads
         // as a separate chrome region.
         if self.terminal_pane_height() > 0.0 {
-            root.push_child(SceneNode::quad(
-                self.terminal_pane_rect(),
-                quad_color(&et.gutter_bg),
-            ));
+            let panel = self.terminal_pane_rect();
+            root.push_child(SceneNode::quad(panel, quad_color(&et.gutter_bg)));
+
+            // Per-cell background quads — `ls --color` legends,
+            // selection highlights from `less`, INVERSE prompts and
+            // so on. Drawn after the pane backdrop and before the
+            // cursor so a cell's bg shows under the caret block (the
+            // caret then overpaints it for the focused-cursor case).
+            let pad = 6.0 * self.scale;
+            let cell_w = self.terminal_measured_char_width();
+            let cell_h = self.terminal_measured_line_height();
+            if cell_w > 0.0 && cell_h > 0.0 {
+                for run in &self.terminal_bg_runs {
+                    let x = panel.min_x() + pad + (run.col_start as f32) * cell_w;
+                    let y = panel.min_y() + pad + (run.row as f32) * cell_h;
+                    let w = ((run.col_end - run.col_start) as f32) * cell_w;
+                    root.push_child(SceneNode::quad(
+                        Rect::new(x, y, w, cell_h),
+                        SceneColor::rgba(run.color.r, run.color.g, run.color.b, 0xff),
+                    ));
+                }
+            }
+
             // Cursor block — solid when the terminal has focus,
             // hollow-ish otherwise. Drawn under the text so the
             // glyph at that cell still reads on top.
