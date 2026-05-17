@@ -1463,10 +1463,10 @@ impl State {
                     self.window.request_redraw();
                     return;
                 }
-                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
-                    if self.accept_completion() {
-                        return;
-                    }
+                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab)
+                    if self.accept_completion() =>
+                {
+                    return;
                 }
                 Key::Named(NamedKey::Escape) => {
                     self.completion = None;
