@@ -4,6 +4,15 @@
 > Code-level changelog (per-PR feature/fix detail) lives in
 > [`editor/CHANGELOG.md`](../editor/CHANGELOG.md).
 
+## 2026-05-17 — Session 9 (M3 Developable — infrastructure)
+
+- **Milestone 3 partial-complete** — infrastructure (file tree, git gutter, find-in-files, embedded terminal) shipped; Phase-2 workflow features (npm script runner, test runners, Flutter hot reload) and ANSI colour rendering in the terminal still open ([tasks/milestone-3-developable.md](../tasks/milestone-3-developable.md)).
+- **File-tree sidebar** (`Cmd-B`) — flat-vec node list, root from `find_project_root`, lazy directory expansion, click-to-open + active-doc row highlight. Hardcoded ignore list (`.git`, `node_modules`, `target`, `.next`, `dist`, `build`).
+- **Render layering refactor** — separate overlay layer (`overlay_quads` + `overlay_scene` + `text_gpu.overlay_renderer`) so popup quads correctly occlude editor text. Theme `overlay_bg` colours forced to alpha=ff across default + 6 bundled themes.
+- **Git gutter** (`crates/app/src/git.rs`) — libgit2 diff between buffer and HEAD blob, per-line Added/Modified/Deleted markers in the gutter, keyed on editor revision (cheap, <5 ms on 4000-line files).
+- **Find in files** (`Cmd-Shift-F`) — overlay panel + `ignore::WalkBuilder` + case-insensitive regex per line, capped at 500 hits / files > 1 MB skipped / binaries dropped. Visible-window TextStack so 500-match lists still shape only 16 lines.
+- **Embedded terminal** (`Cmd-J`) — bottom-anchored pane backed by `alacritty_terminal` 0.26. PTY forks `$SHELL`, keyboard routes to PTY when focused (printable + Enter/Backspace/Tab/Esc/arrows/Home/End/Del/PgUp/PgDn → correct CSI bytes), mouse click focuses, wheel scrolls scrollback via `Scroll::Delta`, cursor block at the PTY's grid position, window resize syncs cell count. Editor's `editor_bottom_y()` shrinks above the pane so the gutter / sidebar / text bounds / max_scroll all clip correctly.
+
 ## 2026-05-16 → 2026-05-17 — Sessions 7–8 (M2 Smart)
 
 - **Milestone 2 partial-complete** — diagnostics + hover + goto-def slice through real LSPs ([tasks/milestone-2-smart.md](../tasks/milestone-2-smart.md)). Completion, references, rename, formatting, multi-root LSP deferred to a follow-up milestone.

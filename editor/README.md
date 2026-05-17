@@ -37,10 +37,10 @@ Status legend: ✅ shipped · 🟡 partial · ⚪ planned
 | ✅ | `crates/syntax` | tree-sitter + 15 grammars, incremental reparse, per-language classifiers | 4.2 |
 | ✅ | `crates/lsp-client` | JSON-RPC client, reader+writer threads, high-level LSP wrappers | 4.2 |
 | ✅ | `crates/config` | TOML settings + theme + hot-reload | 4.1.4 / 4.7 |
-| ✅ | `crates/app` | main binary; wires everything (+ inline LSP state, find, palette, document model) | 7 |
+| ✅ | `crates/app` | main binary; wires everything (+ inline LSP state, find, find-in-files, palette, document model, file-tree sidebar, git gutter, embedded terminal pane) | 7 |
 | ⚪ | `crates/dap-client` | DAP client | 4.3 |
-| ⚪ | `crates/git` | git2 wrapper + status/diff/blame | 4.6 |
-| ⚪ | `crates/terminal` | alacritty_terminal embedded | 4.1.4 |
+| 🟡 | `crates/git` | _inlined in `crates/app/src/git.rs` for now_ — libgit2 diff vs HEAD, per-line Added/Modified/Deleted markers. Promote to its own crate when blame / status panel land. | 4.6 |
+| 🟡 | `crates/terminal` | _inlined in `crates/app/src/terminal.rs` for now_ — `alacritty_terminal` PTY pane wired to `AppEvent::TerminalWakeup` (`Cmd-J`). Promote when ANSI colours + multi-pane land. | 4.1.4 |
 | ⚪ | `crates/workspace` | single/multi-root/workspace-file management | 4.1.5 |
 | ⚪ | `crates/theme` | (theme types live in `crates/config` for now) | 4.7 |
 | ⚪ | `crates/ai/providers` | `LlmProvider` trait + Anthropic/OpenAI/Google/OR/Ollama/OAI-compat | 5.A |
@@ -52,6 +52,26 @@ Status legend: ✅ shipped · 🟡 partial · ⚪ planned
 
 Per-PR detail is in [`CHANGELOG.md`](./CHANGELOG.md); project-level
 milestone status is in [`../tasks/`](../tasks/).
+
+### `crates/app` module layout
+
+The app crate has grown into the home for several features that
+*should* eventually become their own crates. Today's modules:
+
+| Module | Role |
+|--------|------|
+| `main.rs` | `App` / `State` / winit + wgpu glue + render loop + key routing |
+| `document.rs` | per-tab document model (path / dirty / undo plumbing) |
+| `palette.rs` | command palette (`Cmd-Shift-P`, fuzzy via `nucleo-matcher`) |
+| `find.rs` | in-buffer find/replace state |
+| `find_in_files.rs` | workspace-wide search (`Cmd-Shift-F`, `ignore` + `regex`) |
+| `file_tree.rs` | sidebar tree model (`Cmd-B`) |
+| `git.rs` | per-line diff vs HEAD via libgit2 |
+| `terminal.rs` | PTY pane via `alacritty_terminal` (`Cmd-J`) |
+| `lsp.rs` | per-document LSP state machine + popup overlays |
+
+Workspace deps added during M3 infrastructure:
+`git2` (default-features off), `ignore`, `regex`, `alacritty_terminal 0.26`.
 
 ## Languages directory
 

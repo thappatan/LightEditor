@@ -2,9 +2,9 @@
 milestone: 3
 title: Developable — Node.js & Flutter Workflow
 target_duration: 3-4 weeks
-started: TBD
-completed: TBD
-status: not_started
+started: 2026-05-17
+completed: in_progress
+status: partial_complete
 ---
 
 # Milestone 3 — Developable
@@ -15,6 +15,31 @@ status: not_started
 อ้างอิง spec doc: section 4.4 (Node.js workflow), section 4.5 (Flutter workflow)
 
 ## Tasks
+
+### Infrastructure (shipped this session)
+
+- [x] **File-tree sidebar** (`Cmd-B`) — flat-vec model, lazy expand, click to open, active-doc highlight, hidden-dirs filter
+- [x] **Two-pass render** — separate overlay layer so popup quads occlude editor text; theme `overlay_bg` forced opaque
+- [x] **Git gutter** — libgit2 diff vs HEAD, per-line Added/Modified/Deleted markers
+- [x] **Find in files** (`Cmd-Shift-F`) — ripgrep-style search via `ignore::WalkBuilder` + regex, overlay panel with scroll
+- [x] **Embedded terminal** (`Cmd-J`) — alacritty_terminal-backed PTY pane, focus / wheel / cursor / resize wired
+
+### Terminal polish — open
+
+- [ ] **ANSI colour rendering** — 256-entry palette + per-cell rich-text spans; biggest open piece of the terminal story
+- [ ] Title forwarded to pane header (alacritty `Event::Title`)
+- [ ] Bell ring (`Event::Bell`)
+- [ ] Bracketed-paste mode
+
+### File-tree polish — open
+
+- [ ] File watcher → auto-refresh on filesystem changes (notify)
+- [ ] Keyboard navigation (↑/↓, Enter to open)
+- [ ] Drag-resize handle on the sidebar width
+- [ ] Hidden-dirs list moved into settings.toml
+- [ ] Git-status decorations on tree rows (M / ? / U)
+
+### Original M3 scope
 
 - [ ] **Node.js / TypeScript (4.4)**
   - [ ] Auto-detect `package.json` → mark workspace
@@ -55,7 +80,28 @@ status: not_started
 - (none — depends on M2 LSP working)
 
 ## Notes
-_(log สำคัญที่เกิดระหว่าง milestone นี้)_
+
+M3 split into two phases:
+
+1. **Infrastructure** (this session) — the panes, panels, and gutter
+   chrome that the workflow features need a home in. File tree,
+   git gutter, find-in-files, embedded terminal. All shipped as
+   small mergeable PRs (#38 → #43).
+2. **Workflow features** (open) — the Node.js / TypeScript / Flutter
+   pieces from the original task list above. They build on top of
+   the terminal (npm script runner, test runners, hot reload) +
+   the file tree (multi-root UX, package.json detection).
+
+The render-layering refactor (PR #39) had to ship inside this
+milestone too — the existing single-layer pipeline let editor text
+bleed through popup backgrounds. Fixing it touched the whole render
+path and unlocked everything that followed.
+
+The biggest deferred item is **ANSI colour rendering** in the
+terminal. The pane shows a monochrome grid for now; programs that
+detect a TTY (ls, git, cargo) write colour escape codes that we
+don't honour yet. ~200 LOC behind a per-cell palette + rich-text
+span build.
 
 ## Decisions Made
 - _(none new — Hot reload UX details may need ADR)_

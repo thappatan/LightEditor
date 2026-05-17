@@ -8,6 +8,63 @@ adapted to a single-binary workspace pre-1.0.
 
 ## [Unreleased]
 
+### Added — M3 (Developable)
+
+- **File-tree sidebar** (`Cmd-B`). Root is derived from the active
+  doc's project (`find_project_root` walk shared with the LSP
+  layer); falls back to CWD when no doc has a path. Tree state is a
+  flat `Vec<TreeNode>` representing only the *visible* rows —
+  expanding a directory splices children in, collapsing drains them —
+  so rendering is a single linear pass. `.git`, `node_modules`,
+  `target`, `.next`, `dist`, `build` are filtered. Click a file to
+  open; the row matching the active document gets a faint
+  highlight underlay.
+- **Two-pass render**: editor + chrome quads/text render first,
+  then a separate overlay pass paints floating panels
+  (palette / hover / completion / find / find-in-files) and their
+  text. Fixes the bug where the editor's text bled through opaque
+  popup backgrounds because all text used to batch after all quads
+  in a single pass. New `TextGpu::overlay_renderer` +
+  `State::overlay_quads` + `State::overlay_scene` carry the second
+  layer; the wgpu render pass now does main quads → main text →
+  overlay quads → overlay text in z-order. Theme overlay_bg colours
+  also force alpha=ff across the default + 6 bundled themes so
+  occlusion lands cleanly.
+- **Git gutter**: `crates/app/src/git.rs` diffs the active doc's
+  buffer text against its HEAD blob via libgit2 and paints a thin
+  coloured bar on each line in the gutter (green added / blue
+  modified / red deletion wedge). Untracked-but-in-repo files mark
+  every line as Added. Result keyed on the editor's revision so
+  tab switches stay free. Cost <5 ms on a 4000-line file. Path
+  canonicalisation handles macOS's `/var` → `/private/var` symlink
+  for tests under `/tmp`. 6 unit tests.
+- **Find in files**: `Cmd-Shift-F` opens a centred overlay panel
+  (760×500 dip) with a query row + scrollable results. `crates/app/
+  src/find_in_files.rs::search` walks the workspace via
+  `ignore::WalkBuilder` (`.gitignore` respected automatically),
+  matches lines via a case-insensitive `RegexBuilder` (literal-
+  escaped query), caps at 500 hits / files > 1 MB skipped /
+  non-UTF8 blobs silently dropped. Panel uses the overlay layer
+  (opaque scrim), focus toggles between input row and results
+  (`Tab`), `Enter` runs search / opens selected, `Esc` dismisses.
+  Visible-window TextStack so a 500-match list still shapes 16
+  lines; wheel scrolls scrollback through the list. 6 unit tests
+  cover substring / case / .gitignore / binary skip / wrap nav.
+- **Embedded terminal** (`Cmd-J`): bottom-anchored pane at 260 dip,
+  backed by `alacritty_terminal` 0.26. PTY forks `$SHELL` (or
+  `/bin/sh`) rooted at the project root. `AppTermProxy` bridges
+  alacritty's `EventListener` to `AppEvent::TerminalWakeup` so
+  output triggers a redraw without polling. Cell count syncs from
+  pane pixel size on spawn / toggle / window resize. Keyboard
+  routes to PTY when focused (Enter→\r / Backspace→\x7f / arrows
+  → ANSI CSI / printable→event.text). Mouse click in pane focuses;
+  click outside unfocuses. Wheel scrolls scrollback via
+  `Term::scroll_display(Scroll::Delta)`. Cursor block drawn at
+  the PTY cursor's grid position (caret colour when focused, dim
+  active-line colour when not). Editor area shrinks when pane is
+  visible: `editor_bottom_y()` is the single helper that gutter +
+  sidebar + text bounds + `visible_height` / `max_scroll` all use.
+
 ### Added — LSP completion
 
 - `textDocument/completion` round trip wired through the existing LSP
