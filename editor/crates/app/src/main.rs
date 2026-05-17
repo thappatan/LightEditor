@@ -17,6 +17,7 @@ mod find_in_files;
 mod git;
 mod lsp;
 mod palette;
+mod scripts;
 mod terminal;
 mod terminal_palette;
 
@@ -41,7 +42,7 @@ use find::{FindBar, FindFocus};
 use find_in_files::FindInFiles;
 use lsp::{LspEvent, LspState};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use palette::{Command, CommandPalette};
+use palette::{CommandEntry, CommandId, CommandPalette, BUILTIN_COMMAND_IDS};
 use wgpu::{
     LoadOp, Operations, RenderPassColorAttachment, RenderPassDescriptor, StoreOp,
     TextureViewDescriptor,
@@ -993,6 +994,12 @@ struct State {
     /// tab switch, save, and every file-tree reload. Empty when the
     /// workspace isn't a git repo, which silently hides the markers.
     workspace_git_status: HashMap<PathBuf, git::FileGitStatus>,
+    /// `package.json` scripts detected in the workspace root, used to
+    /// populate the command palette with `Run script: <name>`
+    /// entries. Refreshed on every `FileTreeChanged` (which fires for
+    /// any edit to package.json too, since the watcher covers the
+    /// whole root). Empty when no manifest is present.
+    npm_scripts: Vec<scripts::NpmScript>,
     /// Find-in-files overlay (M3). `Some` while the panel is open;
     /// `None` once the user dismisses it. Re-opening builds a fresh
     /// state — there's no value in remembering an old query.
@@ -1229,6 +1236,7 @@ impl State {
         let file_tree_watcher =
             spawn_file_tree_watcher(&file_tree.root, hidden_dirs, flash_proxy.clone());
         let workspace_git_status = git::compute_workspace_status(&file_tree.root);
+        let npm_scripts = scripts::read_scripts(&file_tree.root);
 
         let mut state = Self {
             window,
@@ -1283,6 +1291,7 @@ impl State {
             sidebar_resize_drag: None,
             _file_tree_watcher: file_tree_watcher,
             workspace_git_status,
+            npm_scripts,
             find_in_files: None,
             find_in_files_text,
             terminal: None,
@@ -3035,6 +3044,14 @@ impl State {
         self.workspace_git_status = git::compute_workspace_status(&self.file_tree.root);
     }
 
+    /// Re-read `package.json`'s `"scripts"` map so the next time the
+    /// palette opens, its entries reflect the current state. Cheap —
+    /// one file read plus serde parse — so it runs on every
+    /// `FileTreeChanged` alongside the git-status refresh.
+    fn refresh_npm_scripts(&mut self) {
+        self.npm_scripts = scripts::read_scripts(&self.file_tree.root);
+    }
+
     /// Rebuild the file-tree text stack from the current node list.
     /// Indents nest visually via leading spaces; the marker `▾`/`▸`
     /// distinguishes expanded vs collapsed directories; files get a
@@ -4517,9 +4534,23 @@ impl State {
 
     // ── command palette ────────────────────────────────────────────────────
 
-    /// Open the command palette, populated with every registered command.
+    /// Open the command palette, populated with every registered
+    /// command plus any `package.json` scripts detected in the
+    /// workspace root. Built-in entries come first so the empty-query
+    /// order stays stable; scripts append after them.
     fn open_palette(&mut self) {
-        self.palette = Some(CommandPalette::new());
+        let mut entries: Vec<CommandEntry> = BUILTIN_COMMAND_IDS
+            .iter()
+            .cloned()
+            .map(CommandEntry::builtin)
+            .collect();
+        for script in &self.npm_scripts {
+            entries.push(CommandEntry {
+                id: CommandId::RunScript(script.name.clone()),
+                label: format!("Run script: {}", script.name),
+            });
+        }
+        self.palette = Some(CommandPalette::new(entries));
         self.refresh_palette_text();
         self.scene_dirty = true;
         self.window.request_redraw();
@@ -4542,9 +4573,9 @@ impl State {
         text.push_str("❯ ");
         text.push_str(palette.query());
         text.push_str("\n\n");
-        for cmd in palette.visible() {
+        for label in palette.visible_labels() {
             text.push_str("  ");
-            text.push_str(cmd.label());
+            text.push_str(label);
             text.push('\n');
         }
         self.palette_text.set_content(&mut self.font_system, &text);
@@ -4571,8 +4602,16 @@ impl State {
                 self.window.request_redraw();
             }
             Key::Named(NamedKey::Enter) => {
-                if let Some(cmd) = self.palette.as_ref().and_then(|p| p.selected()) {
-                    self.execute_command(cmd);
+                // Clone the id so we can call `execute_command` (which
+                // mutably borrows `self`) without holding the palette
+                // borrow over the call.
+                let cmd_id = self
+                    .palette
+                    .as_ref()
+                    .and_then(|p| p.selected())
+                    .map(|e| e.id.clone());
+                if let Some(id) = cmd_id {
+                    self.execute_command(id);
                 }
             }
             Key::Named(NamedKey::Backspace) => {
@@ -4603,33 +4642,58 @@ impl State {
 
     /// Run a palette-selected command. Closes the palette first so the
     /// underlying handler sees a consistent state.
-    fn execute_command(&mut self, cmd: Command) {
+    fn execute_command(&mut self, cmd: CommandId) {
         self.close_palette();
         match cmd {
-            Command::NewFile => self.new_file(),
-            Command::OpenFile => self.open_file_dialog(),
-            Command::SaveFile => self.save_to_file(),
-            Command::SaveFileAs => self.save_as(),
-            Command::SaveAll => self.save_all(),
-            Command::CloseOtherTabs => self.close_other_tabs(),
-            Command::CloseAllTabs => self.close_all_tabs(),
-            Command::ThemeDefault => self.apply_bundled_theme("Default Dark", ""),
-            Command::ThemeSolarizedDark => {
+            CommandId::NewFile => self.new_file(),
+            CommandId::OpenFile => self.open_file_dialog(),
+            CommandId::SaveFile => self.save_to_file(),
+            CommandId::SaveFileAs => self.save_as(),
+            CommandId::SaveAll => self.save_all(),
+            CommandId::CloseOtherTabs => self.close_other_tabs(),
+            CommandId::CloseAllTabs => self.close_all_tabs(),
+            CommandId::ThemeDefault => self.apply_bundled_theme("Default Dark", ""),
+            CommandId::ThemeSolarizedDark => {
                 self.apply_bundled_theme("Solarized Dark", BUNDLED_SOLARIZED_DARK)
             }
-            Command::ThemeSolarizedLight => {
+            CommandId::ThemeSolarizedLight => {
                 self.apply_bundled_theme("Solarized Light", BUNDLED_SOLARIZED_LIGHT)
             }
-            Command::ThemeMonokai => self.apply_bundled_theme("Monokai", BUNDLED_MONOKAI),
-            Command::ThemeGruvboxDark => {
+            CommandId::ThemeMonokai => self.apply_bundled_theme("Monokai", BUNDLED_MONOKAI),
+            CommandId::ThemeGruvboxDark => {
                 self.apply_bundled_theme("Gruvbox Dark", BUNDLED_GRUVBOX_DARK)
             }
-            Command::ThemeNord => self.apply_bundled_theme("Nord", BUNDLED_NORD),
-            Command::ThemeTokyoNight => {
+            CommandId::ThemeNord => self.apply_bundled_theme("Nord", BUNDLED_NORD),
+            CommandId::ThemeTokyoNight => {
                 self.apply_bundled_theme("Tokyo Night", BUNDLED_TOKYO_NIGHT)
             }
-            Command::BrowseThemes => self.browse_themes(),
+            CommandId::BrowseThemes => self.browse_themes(),
+            CommandId::RunScript(name) => self.run_npm_script(&name),
         }
+    }
+
+    /// Run `<package_manager> run <name>\n` in the embedded terminal,
+    /// auto-opening the pane if it's currently hidden. The package
+    /// manager is detected from the workspace's lockfile; the cwd is
+    /// the file-tree root that the script was discovered against.
+    fn run_npm_script(&mut self, name: &str) {
+        let root = self.file_tree.root.clone();
+        let pm = scripts::detect_package_manager(&root);
+        let cmd = format!("{} run {}\n", pm.binary(), name);
+
+        // Make sure the pane is visible and focused before we feed it
+        // the command — `Cmd-J` users expect to see the output.
+        let needs_show = self.terminal.as_ref().map(|t| !t.visible).unwrap_or(true);
+        if needs_show {
+            self.toggle_terminal();
+        }
+        if let Some(t) = self.terminal.as_mut() {
+            t.focused = true;
+            t.write(cmd.into_bytes());
+        }
+        self.set_status_flash(format!("running: {} run {}", pm.binary(), name));
+        self.scene_dirty = true;
+        self.window.request_redraw();
     }
 
     /// "Theme: Browse…" — open a file dialog rooted at
@@ -6747,6 +6811,12 @@ impl ApplicationHandler<AppEvent> for App {
                     // status query on the same debounce that drove the
                     // tree reload.
                     state.refresh_workspace_git_status();
+                    // package.json's "scripts" map is also workspace
+                    // state that moves with filesystem events. The
+                    // read is cheap (one file + serde parse), so we
+                    // pay it on every wakeup rather than thread a
+                    // package.json-specific watcher.
+                    state.refresh_npm_scripts();
                     // Only re-shape the row labels if the sidebar is
                     // visible — invisible reloads silently keep the
                     // tree warm so it pops up fresh on next Cmd-B.
@@ -6844,15 +6914,30 @@ fn main() {
     let (initial_text, file_path) = match std::env::args().nth(1) {
         Some(arg) => {
             let path = PathBuf::from(arg);
-            match std::fs::read_to_string(&path) {
-                // Canonicalize so the rest of the app (LSP, file-watcher,
-                // tab labels) deals with an absolute path. file:// URLs
-                // require absolute, and rust-analyzer hangs its workspace
-                // lookup on the URI.
-                Ok(content) => (content, Some(std::fs::canonicalize(&path).unwrap_or(path))),
-                Err(e) => {
-                    log::error!("could not read {}: {}", path.display(), e);
-                    (WELCOME_TEXT.to_string(), None)
+            // Directory argument → treat as "open this folder as the
+            // workspace". `chdir` so the existing CWD-based workspace
+            // root logic picks it up, then start with no file open.
+            // Matches `code <dir>` / `cursor <dir>` muscle memory.
+            if path.is_dir() {
+                let canon = std::fs::canonicalize(&path).unwrap_or(path.clone());
+                if let Err(e) = std::env::set_current_dir(&canon) {
+                    log::warn!("could not chdir into workspace {}: {}", canon.display(), e);
+                } else {
+                    log::info!("workspace root: {}", canon.display());
+                }
+                (WELCOME_TEXT.to_string(), None)
+            } else {
+                match std::fs::read_to_string(&path) {
+                    // Canonicalize so the rest of the app (LSP,
+                    // file-watcher, tab labels) deals with an absolute
+                    // path. file:// URLs require absolute, and
+                    // rust-analyzer hangs its workspace lookup on the
+                    // URI.
+                    Ok(content) => (content, Some(std::fs::canonicalize(&path).unwrap_or(path))),
+                    Err(e) => {
+                        log::error!("could not read {}: {}", path.display(), e);
+                        (WELCOME_TEXT.to_string(), None)
+                    }
                 }
             }
         }

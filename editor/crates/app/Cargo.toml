@@ -27,6 +27,7 @@ arboard = { workspace = true }
 editor-syntax = { workspace = true }
 editor-lsp-client = { workspace = true }
 lsp-types = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 git2 = { workspace = true }
 ignore = { workspace = true }

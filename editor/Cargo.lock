@@ -836,6 +836,7 @@ dependencies = [
  "nucleo-matcher",
  "regex",
  "rfd",
+ "serde",
  "serde_json",
  "toml",
  "wgpu",
