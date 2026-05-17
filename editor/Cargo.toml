@@ -97,6 +97,7 @@ url = "2"
 git2 = { version = "0.18", default-features = false }
 ignore = "0.4"
 regex = "1"
+alacritty_terminal = "0.26"
 # tokio = { version = "1", features = ["full"] }
 # git2 = "0.18"
 # nucleo = "0.5"
