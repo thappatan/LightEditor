@@ -14,8 +14,11 @@
 use std::path::{Path, PathBuf};
 
 /// Directories that are uninteresting to a code editor by default. Hard-
-/// coded for v1; surfacing as a setting is a follow-up.
-const HIDDEN_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "build"];
+/// coded for v1; surfacing as a setting is a follow-up. Public so the
+/// file-tree watcher in `main.rs` can ignore filesystem churn inside
+/// these dirs (build artifacts, dependency installs, git operations
+/// fire dozens of events a second otherwise).
+pub const HIDDEN_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "build"];
 
 /// One visible row in the sidebar.
 pub struct TreeNode {
@@ -131,14 +134,65 @@ impl FileTree {
     }
 
     /// Re-read the root directory's entries to pick up filesystem
-    /// changes. Currently nukes the tree state (re-collapses everything
-    /// under the root); a watcher-driven incremental refresh is a
-    /// follow-up.
+    /// changes. Re-collapses every directory under the root — useful
+    /// for an explicit "Refresh" command but heavy-handed for a
+    /// watcher-driven refresh; for that use
+    /// [`reload_preserving_expansion`](Self::reload_preserving_expansion).
     #[allow(dead_code)]
     pub fn reload(&mut self) {
         self.nodes = read_children(&self.root, 0);
-        // Clamp the selection so a removed bottom row doesn't leave
-        // selected pointing past the end of the list.
+        self.clamp_selection();
+    }
+
+    /// Re-read the tree while keeping every directory that was
+    /// expanded before still expanded after — so a `cargo build` /
+    /// `npm install` running in the watcher doesn't collapse the
+    /// user's open tree on every event. Directories that vanished
+    /// since the last read simply don't reappear; directories that
+    /// were collapsed stay collapsed.
+    pub fn reload_preserving_expansion(&mut self) {
+        // 1. Snapshot which directories were expanded.
+        let expanded: std::collections::HashSet<PathBuf> = self
+            .nodes
+            .iter()
+            .filter_map(|n| match n.kind {
+                NodeKind::Directory { expanded: true } => Some(n.path.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // 2. Rebuild from the root's top-level entries.
+        self.nodes = read_children(&self.root, 0);
+
+        // 3. Walk depth-first re-expanding the dirs we remembered. The
+        //    flat-vec layout guarantees parents come before children,
+        //    so a single linear pass is enough — every dir we hit
+        //    either gets expanded immediately or is left collapsed,
+        //    and any new children it splices in are then visited by
+        //    later iterations of this loop.
+        let mut i = 0;
+        while i < self.nodes.len() {
+            if let NodeKind::Directory { expanded: false } = self.nodes[i].kind {
+                if expanded.contains(&self.nodes[i].path) {
+                    self.nodes[i].kind = NodeKind::Directory { expanded: true };
+                    let parent_path = self.nodes[i].path.clone();
+                    let parent_depth = self.nodes[i].depth;
+                    let children = read_children(&parent_path, parent_depth + 1);
+                    self.nodes.splice(i + 1..i + 1, children);
+                }
+            }
+            i += 1;
+        }
+
+        // 4. The expanded list could have grown or shrunk; rein the
+        //    selection cursor back into bounds.
+        self.clamp_selection();
+    }
+
+    /// Clamp `selected` so it always points inside `nodes` (or is
+    /// `None` when the list is empty). Called after every reload so
+    /// the keyboard cursor doesn't dangle past the end of the list.
+    fn clamp_selection(&mut self) {
         if let Some(idx) = self.selected {
             if self.nodes.is_empty() {
                 self.selected = None;
@@ -415,6 +469,52 @@ mod tests {
         std::fs::remove_file(root.join("b.txt")).unwrap();
         tree.reload();
         assert_eq!(tree.selected, None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reload_preserving_expansion_keeps_open_dirs_open() {
+        let root = tempdir();
+        std::fs::create_dir(root.join("inner")).unwrap();
+        std::fs::write(root.join("inner/a.txt"), "").unwrap();
+        std::fs::write(root.join("other.txt"), "").unwrap();
+        let mut tree = FileTree::new(root.clone());
+        // [inner, other.txt]
+        let _ = tree.click(0); // expand inner/
+        assert_eq!(tree.nodes.len(), 3);
+        assert!(matches!(
+            tree.nodes[0].kind,
+            NodeKind::Directory { expanded: true }
+        ));
+
+        // Simulate the watcher firing after a new file lands in inner/.
+        std::fs::write(root.join("inner/b.txt"), "").unwrap();
+        tree.reload_preserving_expansion();
+        // inner/ stays expanded and picks up b.txt.
+        assert!(matches!(
+            tree.nodes[0].kind,
+            NodeKind::Directory { expanded: true }
+        ));
+        let names: Vec<&str> = tree.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["inner", "a.txt", "b.txt", "other.txt"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reload_preserving_expansion_drops_vanished_dirs() {
+        let root = tempdir();
+        std::fs::create_dir(root.join("doomed")).unwrap();
+        std::fs::write(root.join("doomed/x.txt"), "").unwrap();
+        std::fs::write(root.join("survivor.txt"), "").unwrap();
+        let mut tree = FileTree::new(root.clone());
+        let _ = tree.click(0); // expand doomed/
+        assert_eq!(tree.nodes.len(), 3);
+
+        // doomed/ gets nuked entirely between reloads.
+        std::fs::remove_dir_all(root.join("doomed")).unwrap();
+        tree.reload_preserving_expansion();
+        let names: Vec<&str> = tree.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["survivor.txt"]);
         std::fs::remove_dir_all(&root).ok();
     }
 

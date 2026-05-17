@@ -76,6 +76,11 @@ enum AppEvent {
     /// updated, child exited). Triggers a redraw — the actual grid
     /// read happens during `render()` while holding the term lock.
     TerminalWakeup,
+    /// Something under the workspace root touched the filesystem since
+    /// the last reload. The watcher debounces a burst into a single
+    /// event; the handler does a `reload_preserving_expansion()` and
+    /// refreshes the shaped sidebar text.
+    FileTreeChanged,
 }
 
 /// How long a "settings reloaded" flash stays on the status bar.
@@ -84,6 +89,10 @@ const FLASH_DURATION: Duration = Duration::from_millis(2000);
 /// Half-cycle of the caret blink — solid for this long, then hidden for the
 /// same. 530ms matches VSCode's smooth-blink cadence.
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+/// Quiet period the file-tree watcher waits for before firing a reload.
+/// `notify` emits dozens of events for a single git checkout or `npm
+/// install`; the debounce coalesces them into one reload at the end.
+const FILE_TREE_DEBOUNCE: Duration = Duration::from_millis(200);
 /// One in-flight hover popup. `anchor_char` lets the popup follow the
 /// caret through scrolls without reshaping. The shaped body lives on the
 /// `hover_text` TextStack — this struct holds only the anchor.
@@ -897,6 +906,12 @@ struct State {
     file_tree: FileTree,
     /// Dedicated TextStack for the sidebar's row labels.
     file_tree_text: TextStack,
+    /// Recursive filesystem watcher rooted at the sidebar's root.
+    /// Fires `AppEvent::FileTreeChanged` after a 200 ms quiet period;
+    /// the handler reloads with expansion preserved. `None` when
+    /// `notify` setup failed — the tree still works, just without
+    /// auto-refresh on external changes.
+    _file_tree_watcher: Option<RecommendedWatcher>,
     /// Find-in-files overlay (M3). `Some` while the panel is open;
     /// `None` once the user dismisses it. Re-opening builds a fresh
     /// state — there's no value in remembering an old query.
@@ -1113,6 +1128,7 @@ impl State {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         let file_tree = FileTree::new(tree_root);
+        let file_tree_watcher = spawn_file_tree_watcher(&file_tree.root, flash_proxy.clone());
 
         let mut state = Self {
             window,
@@ -1163,6 +1179,7 @@ impl State {
             completion_text,
             file_tree,
             file_tree_text,
+            _file_tree_watcher: file_tree_watcher,
             find_in_files: None,
             find_in_files_text,
             terminal: None,
@@ -6362,6 +6379,19 @@ impl ApplicationHandler<AppEvent> for App {
                     state.window.request_redraw();
                 }
             }
+            AppEvent::FileTreeChanged => {
+                if let Some(state) = self.state.as_mut() {
+                    state.file_tree.reload_preserving_expansion();
+                    // Only re-shape the row labels if the sidebar is
+                    // visible — invisible reloads silently keep the
+                    // tree warm so it pops up fresh on next Cmd-B.
+                    if state.file_tree.visible {
+                        state.refresh_file_tree_text();
+                        state.scene_dirty = true;
+                        state.window.request_redraw();
+                    }
+                }
+            }
         }
     }
 
@@ -6522,6 +6552,77 @@ fn main() {
         theme_watcher,
     );
     event_loop.run_app(&mut app).expect("event loop failed");
+}
+
+/// Spawn a recursive watcher over the file-tree's workspace root.
+/// Filesystem events get filtered: anything inside a hidden dir
+/// (`.git`, `node_modules`, `target`, …) is dropped at the watcher
+/// callback so a `git checkout` or `npm install` doesn't drown the
+/// app in events. Surviving events feed a debounce thread that
+/// coalesces bursts into one `AppEvent::FileTreeChanged` per ~200 ms
+/// quiet period — saving a file triggers exactly one reload.
+fn spawn_file_tree_watcher(
+    root: &Path,
+    proxy: EventLoopProxy<AppEvent>,
+) -> Option<RecommendedWatcher> {
+    if !root.exists() {
+        return None;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let Ok(event) = event else { return };
+        // Forward only if at least one affected path is *outside* the
+        // ignored set. Routine git / build / dependency operations
+        // touch dozens of paths a second under those dirs and never
+        // change anything the sidebar shows.
+        let interesting = event.paths.iter().any(|p| !path_under_hidden_dir(p));
+        if interesting {
+            // The receiver thread closes on the event-loop dropping;
+            // a `send` failure is the cue to stop forwarding.
+            let _ = tx.send(());
+        }
+    })
+    .map_err(|e| log::warn!("file-tree watcher init failed: {e}"))
+    .ok()?;
+
+    watcher
+        .watch(root, RecursiveMode::Recursive)
+        .map_err(|e| log::warn!("file-tree watcher attach failed: {e}"))
+        .ok()?;
+
+    // Debounce thread: block on the channel, then sleep through a
+    // quiet window before firing. `try_recv` drains anything that
+    // arrived during the sleep so a burst becomes one reload.
+    let proxy_for_debounce = proxy;
+    std::thread::spawn(move || loop {
+        if rx.recv().is_err() {
+            return;
+        }
+        std::thread::sleep(FILE_TREE_DEBOUNCE);
+        while rx.try_recv().is_ok() {}
+        if proxy_for_debounce
+            .send_event(AppEvent::FileTreeChanged)
+            .is_err()
+        {
+            return;
+        }
+    });
+
+    log::info!("watching {} for file-tree changes", root.display());
+    Some(watcher)
+}
+
+/// `true` if any path component is a hidden directory the file tree
+/// already filters out (`.git`, `node_modules`, `target`, …). Used to
+/// drop watcher events that can't affect the sidebar.
+fn path_under_hidden_dir(path: &Path) -> bool {
+    path.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .any(|name| file_tree::HIDDEN_DIRS.contains(&name))
 }
 
 /// Same shape as `spawn_settings_watcher`, but emits `ThemeChanged`.
