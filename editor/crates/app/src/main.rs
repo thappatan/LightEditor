@@ -626,6 +626,18 @@ fn severity_rank(s: lsp_types::DiagnosticSeverity) -> u8 {
     }
 }
 
+/// Adjust the find-in-files panel's scroll so `selected` is inside
+/// the `visible`-row window. Handles both directions: selection past
+/// the bottom edge pulls scroll forward; selection above the top
+/// edge pulls it back.
+fn scroll_into_view(f: &mut FindInFiles, visible: usize) {
+    if f.selected < f.scroll {
+        f.scroll = f.selected;
+    } else if f.selected >= f.scroll + visible {
+        f.scroll = f.selected + 1 - visible;
+    }
+}
+
 /// Pick a quad colour for one git-gutter line status. Conventions match
 /// VS Code: green added / blue modified / red deletion wedge. Themable
 /// later via a dedicated section in the theme TOML; hardcoded for v1.
@@ -1584,9 +1596,11 @@ impl State {
                     return;
                 }
                 Key::Named(NamedKey::ArrowDown) => {
+                    let visible = self.find_in_files_visible_rows();
                     if let Some(f) = self.find_in_files.as_mut() {
                         f.input_focused = false;
                         f.select_next();
+                        scroll_into_view(f, visible);
                     }
                     self.refresh_find_in_files_text();
                     self.scene_dirty = true;
@@ -1594,9 +1608,11 @@ impl State {
                     return;
                 }
                 Key::Named(NamedKey::ArrowUp) => {
+                    let visible = self.find_in_files_visible_rows();
                     if let Some(f) = self.find_in_files.as_mut() {
                         f.input_focused = false;
                         f.select_prev();
+                        scroll_into_view(f, visible);
                     }
                     self.refresh_find_in_files_text();
                     self.scene_dirty = true;
@@ -2717,16 +2733,21 @@ impl State {
     }
 
     /// Reshape the find-in-files panel's text from the current state.
+    /// Only the visible window of result rows is fed to cosmic-text —
+    /// scrolling through a 500-match list stays cheap because the
+    /// shape budget is bounded by `find_in_files_visible_rows()`.
     /// Layout: row 0 = "Search: <query>", row 1 = status, row 2 blank,
-    /// row 3..N = results.
+    /// row 3..N = results inside the visible window.
     fn refresh_find_in_files_text(&mut self) {
+        let visible = self.find_in_files_visible_rows();
+        let workspace = self.file_tree.root.clone();
         let text = {
             let Some(f) = self.find_in_files.as_ref() else {
                 return;
             };
-            let mut s = String::with_capacity(64 + f.results.len() * 80);
+            let mut s = String::with_capacity(64 + visible * 80);
             // Caret marker on the input line shows focus state at a
-            // glance: solid ▎when typing, dim when results have focus.
+            // glance: solid ▎ when typing, dim when results have focus.
             let caret = if f.input_focused { '▎' } else { ' ' };
             s.push_str(&format!("Search: {}{caret}\n", f.query));
             if f.results.is_empty() {
@@ -2736,14 +2757,17 @@ impl State {
                     "no matches (press Enter to search)\n"
                 });
             } else {
+                let end = (f.scroll + visible).min(f.results.len());
                 s.push_str(&format!(
-                    "{} match(es) — ↑↓ to navigate, Enter to open, Esc to close\n",
-                    f.results.len()
+                    "{} match(es), showing {}-{} — ↑↓ navigates, wheel pages, Enter opens, Esc closes\n",
+                    f.results.len(),
+                    f.scroll + 1,
+                    end,
                 ));
             }
             s.push('\n');
-            let workspace = self.file_tree.root.clone();
-            for m in &f.results {
+            let end = (f.scroll + visible).min(f.results.len());
+            for m in &f.results[f.scroll..end] {
                 let rel = m.path.strip_prefix(&workspace).unwrap_or(&m.path).display();
                 let trimmed = m.line_text.trim();
                 s.push_str(&format!("{rel}:{} {trimmed}\n", m.line + 1));
@@ -4531,8 +4555,21 @@ impl State {
         self.window.request_redraw();
     }
 
-    /// Mouse wheel: scroll the active document vertically.
+    /// Mouse wheel: scroll the find-in-files panel if the pointer is
+    /// inside it; otherwise scroll the active document vertically.
     fn handle_scroll(&mut self, delta_y: f32) {
+        // Find-in-files panel claims wheel events while open and the
+        // pointer is over it — otherwise scroll wheel just falls
+        // through to the editor.
+        if self.find_in_files.is_some() {
+            if let Some((mx, my)) = self.mouse_pos {
+                let panel = self.find_in_files_panel_rect();
+                if panel.contains(Point::new(mx, my)) {
+                    self.scroll_find_in_files(delta_y);
+                    return;
+                }
+            }
+        }
         let max = self.max_scroll();
         let current = self.doc().scroll_y;
         let new = (current - delta_y).clamp(0.0, max);
@@ -4541,6 +4578,47 @@ impl State {
             self.scene_dirty = true;
             self.window.request_redraw();
         }
+    }
+
+    /// Scroll the find-in-files results list by the wheel-equivalent
+    /// number of rows.
+    fn scroll_find_in_files(&mut self, delta_y: f32) {
+        let line_h = self.line_height();
+        // Convert pixel delta to row delta (round up so even a small
+        // wheel tick advances one row).
+        let row_delta = (delta_y / line_h).round() as i32;
+        if row_delta == 0 {
+            return;
+        }
+        let visible = self.find_in_files_visible_rows();
+        let max_scroll = {
+            let Some(f) = self.find_in_files.as_ref() else {
+                return;
+            };
+            f.results.len().saturating_sub(visible)
+        };
+        if let Some(f) = self.find_in_files.as_mut() {
+            let new = (f.scroll as i32 - row_delta).clamp(0, max_scroll as i32) as usize;
+            if new == f.scroll {
+                return;
+            }
+            f.scroll = new;
+        }
+        self.refresh_find_in_files_text();
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// How many result rows fit inside the panel given its height and
+    /// the current line metric. At least 1 so the math doesn't divide
+    /// by zero on a too-small window.
+    fn find_in_files_visible_rows(&self) -> usize {
+        let panel = self.find_in_files_panel_rect();
+        let pad = FIND_FILES_PAD_DIP * self.scale;
+        let inner_h = (panel.size.height - 2.0 * pad).max(0.0);
+        let line_h = self.line_height();
+        let total_rows = (inner_h / line_h) as usize;
+        total_rows.saturating_sub(FIND_FILES_HEADER_ROWS).max(1)
     }
 
     /// Total shaped text height in physical pixels — visual, not logical:
