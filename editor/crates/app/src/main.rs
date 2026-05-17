@@ -79,6 +79,104 @@ struct HoverPopup {
     anchor_char: usize,
 }
 
+/// Completion popup state. Stays open while the user is typing inside
+/// the word that triggered it; each keystroke refines `prefix` and
+/// re-filters `items`. The shaped item list lives on the
+/// `completion_text` TextStack.
+struct CompletionPopup {
+    /// The full item set the server returned. Server-side filtering is
+    /// not always exhaustive (rust-analyzer in particular returns broad
+    /// lists), so we filter locally as the user types.
+    items: Vec<editor_lsp_client::lsp_types::CompletionItem>,
+    /// Indices into [`items`] that match `prefix`, in display order
+    /// (best match first per a simple case-insensitive prefix score).
+    filtered: Vec<usize>,
+    /// Caret char index when the popup opened — the start of the prefix.
+    anchor_char: usize,
+    /// What the user has typed since the anchor. The popup dismisses
+    /// when this stops matching anything.
+    prefix: String,
+    /// Currently selected row, indexing into [`filtered`].
+    selected: usize,
+    /// First visible row when [`filtered.len()`] exceeds the visible
+    /// row count — supports keyboard scrolling through long lists.
+    scroll: usize,
+}
+
+impl CompletionPopup {
+    /// Rebuild [`filtered`] from [`prefix`]. Empty prefix shows every
+    /// item; otherwise items are kept when their `filter_text` (or
+    /// `label`, the spec fallback) starts with the prefix
+    /// case-insensitively. Resets selection + scroll.
+    fn refilter(&mut self) {
+        self.filtered.clear();
+        if self.prefix.is_empty() {
+            self.filtered.extend(0..self.items.len());
+        } else {
+            let needle = self.prefix.to_ascii_lowercase();
+            for (i, item) in self.items.iter().enumerate() {
+                let hay = item
+                    .filter_text
+                    .as_deref()
+                    .unwrap_or(item.label.as_str())
+                    .to_ascii_lowercase();
+                if hay.starts_with(&needle) {
+                    self.filtered.push(i);
+                }
+            }
+            // Stable sort so prefix-matched items keep server ordering,
+            // which usually reflects relevance.
+        }
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Keep `selected` inside the visible window of `COMPLETION_MAX_ROWS`
+    /// rows. Called after every up/down navigation.
+    fn adjust_scroll(&mut self) {
+        let visible = COMPLETION_MAX_ROWS;
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + visible {
+            self.scroll = self.selected + 1 - visible;
+        }
+    }
+
+    /// Make a shallow snapshot for re-shaping the popup text. Borrow
+    /// rules forbid passing `&self` to `shape_completion_popup` while
+    /// `&mut self.completion` is held; cloning just the slim fields
+    /// the shaper needs (item refs + filtered indices) sidesteps it.
+    fn clone_for_shape(&self) -> CompletionPopup {
+        CompletionPopup {
+            items: self.items.clone(),
+            filtered: self.filtered.clone(),
+            anchor_char: self.anchor_char,
+            prefix: self.prefix.clone(),
+            selected: self.selected,
+            scroll: self.scroll,
+        }
+    }
+}
+
+/// Whether `c` belongs to an identifier — used to anchor the completion
+/// popup and decide when the user has typed out of it.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Walk backward from `caret` (a `char` index) over identifier chars and
+/// return the first index where the word starts. `text` is the buffer's
+/// full content. Returns `caret` when the caret is not adjacent to a
+/// word character — the popup then anchors with an empty prefix.
+fn word_start_before(text: &str, caret: usize) -> usize {
+    let chars: Vec<char> = text.chars().take(caret).collect();
+    let mut i = chars.len();
+    while i > 0 && is_word_char(chars[i - 1]) {
+        i -= 1;
+    }
+    i
+}
+
 /// Per-phase render timing, captured as elapsed-since-frame-start at each
 /// checkpoint. Logged only when a frame overruns the hard latency limit so
 /// the steady-state log stays quiet.
@@ -207,6 +305,14 @@ const HOVER_PAD_DIP: f32 = 8.0;
 /// Maximum rendered height. Long hovers from rust-analyzer are clipped
 /// rather than scrolled — scrolling is a follow-up.
 const HOVER_MAX_HEIGHT_DIP: f32 = 240.0;
+
+/// Completion-popup overlay (LSP) — list of suggestions hanging under
+/// the caret. Width is fixed at this many dips; the list scrolls when
+/// the filtered set exceeds the visible row count.
+const COMPLETION_WIDTH_DIP: f32 = 360.0;
+const COMPLETION_PAD_DIP: f32 = 6.0;
+/// Maximum visible rows in the popup before it scrolls.
+const COMPLETION_MAX_ROWS: usize = 10;
 
 /// Width of the diagnostic indicator drawn in the gutter, in logical px.
 const DIAG_DOT_DIP: f32 = 6.0;
@@ -723,6 +829,11 @@ struct State {
     hover_popup: Option<HoverPopup>,
     /// Dedicated TextStack for the hover overlay's body.
     hover_text: TextStack,
+    /// Completion popup state — shown when the user invokes Ctrl-Space
+    /// and the active LSP server returns matching items.
+    completion: Option<CompletionPopup>,
+    /// Dedicated TextStack for the completion popup's item list.
+    completion_text: TextStack,
 
     /// When the last unhandled key press happened, for keystroke-latency timing.
     pending_keystroke: Option<Instant>,
@@ -873,6 +984,15 @@ impl State {
             "",
         );
 
+        let completion_text = TextStack::new(
+            &mut font_system,
+            (COMPLETION_WIDTH_DIP - 2.0 * COMPLETION_PAD_DIP) * scale,
+            font_size_pt,
+            line_height_pt,
+            scale,
+            "",
+        );
+
         let mut state = Self {
             window,
             gpu,
@@ -916,6 +1036,8 @@ impl State {
             lsp: LspState::new(),
             hover_popup: None,
             hover_text,
+            completion: None,
+            completion_text,
             tab_spaces,
             theme,
             pending_keystroke: None,
@@ -1330,6 +1452,38 @@ impl State {
         let alt = self.modifiers.alt_key();
         let cmd = is_cmd_or_ctrl(self.modifiers);
 
+        // Completion popup intercepts navigation + accept + dismiss keys.
+        // Runs before the main matcher so Enter accepts the suggestion
+        // instead of inserting a newline, etc.
+        if self.completion.is_some() {
+            match &event.logical_key {
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.completion_next();
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.completion_prev();
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
+                    if self.accept_completion() {
+                        return;
+                    }
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.completion = None;
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         let mut text_changed = true;
         let handled = match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
@@ -1378,8 +1532,17 @@ impl State {
                 true
             }
             Key::Named(NamedKey::Space) => {
-                self.doc_mut().editor.insert(" ");
-                true
+                // Ctrl-Space triggers LSP completion — standard
+                // cross-editor shortcut. (Cmd-Space is Spotlight on
+                // macOS, so we deliberately don't bind Cmd-Space.)
+                if self.modifiers.control_key() {
+                    self.request_completion();
+                    text_changed = false;
+                    true
+                } else {
+                    self.doc_mut().editor.insert(" ");
+                    true
+                }
             }
             Key::Named(NamedKey::Tab) => {
                 let primary = self.doc().editor.selections().primary();
@@ -1471,6 +1634,10 @@ impl State {
             // A text edit invalidates the hover popup's anchor; dismiss.
             if text_changed {
                 self.hover_popup = None;
+                // The completion popup, by contrast, follows the user
+                // typing more characters — refresh its prefix instead
+                // of dismissing.
+                self.refresh_completion_after_edit();
             }
             // If the find bar is open, the match list now reflects the old text.
             if text_changed && self.doc().find.is_some() {
@@ -2571,6 +2738,14 @@ impl State {
                     self.handle_lsp_definition(doc_path, locations);
                     want_redraw = true;
                 }
+                LspEvent::Completion {
+                    doc_path,
+                    anchor_char,
+                    items,
+                } => {
+                    self.handle_lsp_completion(doc_path, anchor_char, items);
+                    want_redraw = true;
+                }
                 LspEvent::ServerExited { kind } => {
                     log::warn!("LSP server {kind:?} exited");
                     self.set_status_flash(format!("LSP {kind:?} disconnected"));
@@ -2688,6 +2863,194 @@ impl State {
             character: pos.column as u32,
         };
         self.lsp.request_definition(&path, lang, lsp_pos);
+    }
+
+    /// Trigger `textDocument/completion` at the caret. Anchor is the
+    /// start of the word the caret is inside (so the popup stays
+    /// stable as the user keeps typing letters of the same word).
+    /// Already-open popups are replaced — the user just hit Ctrl-Space
+    /// again to refresh.
+    fn request_completion(&mut self) {
+        let Some(path) = self.doc().file_path.clone() else {
+            return;
+        };
+        let Some(lang) = Language::for_path(&path) else {
+            return;
+        };
+        let head = self.doc().editor.selections().primary().head;
+        let anchor = word_start_before(&self.doc().editor.text(), head);
+        let pos = self.doc().editor.buffer().char_to_position(head);
+        let lsp_pos = lsp_types::Position {
+            line: pos.line as u32,
+            character: pos.column as u32,
+        };
+        self.lsp.request_completion(
+            &path,
+            lang,
+            lsp_pos,
+            anchor,
+            editor_lsp_client::lsp_types::CompletionTriggerKind::INVOKED,
+            None,
+        );
+    }
+
+    fn handle_lsp_completion(
+        &mut self,
+        doc_path: PathBuf,
+        anchor_char: usize,
+        items: Vec<editor_lsp_client::lsp_types::CompletionItem>,
+    ) {
+        if self.doc().file_path.as_deref() != Some(&doc_path) {
+            return;
+        }
+        if items.is_empty() {
+            self.set_status_flash("no completions".to_string());
+            return;
+        }
+        // The caret may have moved (the user kept typing while the request
+        // was in flight) — compute the current prefix from the live caret.
+        let head = self.doc().editor.selections().primary().head;
+        if head < anchor_char {
+            return; // caret moved before the anchor; the popup is stale
+        }
+        let text = self.doc().editor.text();
+        let prefix: String = text
+            .chars()
+            .skip(anchor_char)
+            .take(head - anchor_char)
+            .collect();
+        let mut popup = CompletionPopup {
+            items,
+            filtered: Vec::new(),
+            anchor_char,
+            prefix,
+            selected: 0,
+            scroll: 0,
+        };
+        popup.refilter();
+        if popup.filtered.is_empty() {
+            return;
+        }
+        self.shape_completion_popup(&popup);
+        self.completion = Some(popup);
+    }
+
+    fn shape_completion_popup(&mut self, popup: &CompletionPopup) {
+        let mut s = String::with_capacity(popup.filtered.len() * 32);
+        for (row, &i) in popup.filtered.iter().enumerate() {
+            if row > 0 {
+                s.push('\n');
+            }
+            s.push_str(&popup.items[i].label);
+        }
+        self.completion_text.set_content(&mut self.font_system, &s);
+    }
+
+    /// Try to accept the currently-selected completion. Returns `true`
+    /// when an item was inserted (so the caller can swallow the key).
+    fn accept_completion(&mut self) -> bool {
+        let Some(popup) = self.completion.as_ref() else {
+            return false;
+        };
+        let Some(&item_idx) = popup.filtered.get(popup.selected) else {
+            self.completion = None;
+            return false;
+        };
+        let item = &popup.items[item_idx];
+        // Prefer insert_text when the server explicitly supplied one;
+        // fall back to the label. `text_edit`'s explicit range is
+        // ignored for v1 — most servers' ranges are equivalent to the
+        // anchor → caret span we already computed.
+        let insert = item
+            .insert_text
+            .clone()
+            .unwrap_or_else(|| item.label.clone());
+        let anchor = popup.anchor_char;
+        let head = self.doc().editor.selections().primary().head;
+        self.completion = None;
+        // Replace [anchor, head) with the chosen text.
+        let editor = &mut self.docs[self.active].editor;
+        editor.set_selection(Selection::new(anchor, head));
+        editor.insert(&insert);
+        self.text_dirty = true;
+        self.scene_dirty = true;
+        self.follow_caret = true;
+        self.mark_dirty_if_clean();
+        self.window.request_redraw();
+        true
+    }
+
+    /// Move the selection one row down within the filtered list, wrapping
+    /// from bottom to top. Scrolls the visible window if the new selection
+    /// is past the bottom edge.
+    fn completion_next(&mut self) {
+        let Some(popup) = self.completion.as_mut() else {
+            return;
+        };
+        if popup.filtered.is_empty() {
+            return;
+        }
+        popup.selected = (popup.selected + 1) % popup.filtered.len();
+        popup.adjust_scroll();
+    }
+
+    fn completion_prev(&mut self) {
+        let Some(popup) = self.completion.as_mut() else {
+            return;
+        };
+        if popup.filtered.is_empty() {
+            return;
+        }
+        popup.selected = if popup.selected == 0 {
+            popup.filtered.len() - 1
+        } else {
+            popup.selected - 1
+        };
+        popup.adjust_scroll();
+    }
+
+    /// Re-evaluate the popup against the buffer state after an edit. The
+    /// caret may have moved (typing extends the prefix; backspace
+    /// shrinks it); if it falls outside the anchored word the popup
+    /// dismisses.
+    fn refresh_completion_after_edit(&mut self) {
+        // Read everything we need before borrowing `self.completion`
+        // mutably, otherwise the popup borrow conflicts with the doc
+        // accessors below.
+        let Some(anchor) = self.completion.as_ref().map(|p| p.anchor_char) else {
+            return;
+        };
+        let head = self.doc().editor.selections().primary().head;
+        if head < anchor {
+            self.completion = None;
+            return;
+        }
+        let text = self.doc().editor.text();
+        let total = text.chars().count();
+        if anchor > total {
+            self.completion = None;
+            return;
+        }
+        let prefix: String = text.chars().skip(anchor).take(head - anchor).collect();
+        // The user typed a non-word character (space, punctuation) —
+        // close the popup rather than show stale matches.
+        if prefix.chars().any(|c| !is_word_char(c)) {
+            self.completion = None;
+            return;
+        }
+        let snapshot = {
+            let Some(popup) = self.completion.as_mut() else {
+                return;
+            };
+            popup.prefix = prefix;
+            popup.refilter();
+            if popup.filtered.is_empty() {
+                self.completion = None;
+                return;
+            }
+            popup.clone_for_shape()
+        };
+        self.shape_completion_popup(&snapshot);
     }
 
     fn handle_lsp_hover(&mut self, doc_path: PathBuf, result: Option<lsp_types::Hover>) {
@@ -3481,6 +3844,44 @@ impl State {
         Some((panel.min_x() + pad, panel.min_y() + pad))
     }
 
+    /// Completion-popup geometry. Anchors to the caret like the hover
+    /// popup, but height is row-based (line height × visible row count).
+    fn completion_panel_rect(&self) -> Option<Rect> {
+        let popup = self.completion.as_ref()?;
+        let (cx, cy) = self.caret_pixel(popup.anchor_char)?;
+        let scroll = self.doc().scroll_y;
+        let line_h = self.line_height();
+        let pad = COMPLETION_PAD_DIP * self.scale;
+        let width = COMPLETION_WIDTH_DIP * self.scale;
+        let visible_rows = popup.filtered.len().clamp(1, COMPLETION_MAX_ROWS);
+        let height = visible_rows as f32 * line_h + 2.0 * pad;
+        let top = self.text_inset_y + cy - scroll + line_h + 2.0 * self.scale;
+        let surface_w = self.gpu.surface_config.width as f32;
+        let left = (self.text_inset_x + cx).min(surface_w - width - pad);
+        Some(Rect::new(left.max(0.0), top, width, height))
+    }
+
+    fn completion_text_origin(&self) -> Option<(f32, f32)> {
+        let panel = self.completion_panel_rect()?;
+        let pad = COMPLETION_PAD_DIP * self.scale;
+        Some((panel.min_x() + pad, panel.min_y() + pad))
+    }
+
+    /// Highlight rect for the currently-selected row in the completion
+    /// popup, in surface coordinates.
+    fn completion_selection_rect(&self) -> Option<Rect> {
+        let popup = self.completion.as_ref()?;
+        let panel = self.completion_panel_rect()?;
+        let pad = COMPLETION_PAD_DIP * self.scale;
+        let line_h = self.line_height();
+        let visible_idx = popup.selected.checked_sub(popup.scroll)?;
+        if visible_idx >= COMPLETION_MAX_ROWS {
+            return None;
+        }
+        let y = panel.min_y() + pad + (visible_idx as f32) * line_h;
+        Some(Rect::new(panel.min_x(), y, panel.size.width, line_h))
+    }
+
     fn match_highlight_rects(&self) -> Vec<Rect> {
         let Some(find) = self.doc().find.as_ref() else {
             return Vec::new();
@@ -3883,6 +4284,17 @@ impl State {
         if self.hover_popup.is_some() {
             if let Some(rect) = self.hover_panel_rect() {
                 root.push_child(SceneNode::quad(rect, quad_color(&et.overlay_bg)));
+            }
+        }
+
+        // Completion popup — same anchor logic as the hover popup,
+        // plus a selection-row highlight quad.
+        if self.completion.is_some() {
+            if let Some(rect) = self.completion_panel_rect() {
+                root.push_child(SceneNode::quad(rect, quad_color(&et.overlay_bg)));
+            }
+            if let Some(rect) = self.completion_selection_rect() {
+                root.push_child(SceneNode::quad(rect, quad_color(&et.palette_selection_bg)));
             }
         }
 
@@ -4338,6 +4750,36 @@ impl State {
                 top: hy,
                 scale: 1.0,
                 bounds: hover_bounds,
+                default_color: editor_color,
+                custom_glyphs: &[],
+            });
+        }
+        if let Some((cx, cy)) = self.completion_text_origin() {
+            // Scroll the visible window into view: shift the buffer's
+            // origin upward by `scroll * line_h` so row 0 of the visible
+            // window lands at the popup's top, and clip with the panel
+            // bounds so non-visible rows are masked.
+            let popup = self
+                .completion
+                .as_ref()
+                .expect("completion_text_origin implies completion is Some");
+            let panel = self
+                .completion_panel_rect()
+                .expect("completion_text_origin implies completion_panel_rect");
+            let line_h = self.line_height();
+            let top_offset = cy - (popup.scroll as f32) * line_h;
+            let bounds = TextBounds {
+                left: panel.min_x() as i32,
+                top: panel.min_y() as i32,
+                right: panel.max_x() as i32,
+                bottom: panel.max_y() as i32,
+            };
+            text_areas.push(TextArea {
+                buffer: &self.completion_text.buffer,
+                left: cx,
+                top: top_offset,
+                scale: 1.0,
+                bounds,
                 default_color: editor_color,
                 custom_glyphs: &[],
             });

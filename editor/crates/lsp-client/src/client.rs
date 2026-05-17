@@ -24,8 +24,9 @@ use lsp_types::{
         DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
         Exit, Initialized, Notification,
     },
-    request::{GotoDefinition, HoverRequest, Initialize, Request, Shutdown},
-    ClientCapabilities, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    request::{Completion, GotoDefinition, HoverRequest, Initialize, Request, Shutdown},
+    ClientCapabilities, CompletionClientCapabilities, CompletionContext, CompletionParams,
+    CompletionTriggerKind, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams,
     HoverClientCapabilities, HoverParams, InitializeParams, InitializedParams, MarkupKind,
     Position, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
@@ -211,6 +212,16 @@ impl LspClient {
                         dynamic_registration: Some(false),
                         content_format: Some(vec![MarkupKind::PlainText, MarkupKind::Markdown]),
                     }),
+                    completion: Some(CompletionClientCapabilities {
+                        dynamic_registration: Some(false),
+                        // We don't implement snippets in v1; ask servers to
+                        // give us plain text so they don't return `${...}`
+                        // placeholders we'd insert verbatim.
+                        completion_item: None,
+                        completion_item_kind: None,
+                        context_support: Some(true),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -298,6 +309,33 @@ impl LspClient {
             partial_result_params: Default::default(),
         };
         self.send_request(GotoDefinition::METHOD, params)
+    }
+
+    /// Ask for completion items at `position`. `trigger` carries the
+    /// reason for the request — explicit (`Invoked`) when the user hit
+    /// the completion shortcut, or `TriggerCharacter` when a server-
+    /// declared trigger char like `.` or `::` was just typed. Returns
+    /// the request id.
+    pub fn request_completion(
+        &mut self,
+        uri: Url,
+        position: Position,
+        trigger: CompletionTriggerKind,
+        trigger_character: Option<String>,
+    ) -> io::Result<i64> {
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: Default::default(),
+            context: Some(CompletionContext {
+                trigger_kind: trigger,
+                trigger_character,
+            }),
+        };
+        self.send_request(Completion::METHOD, params)
     }
 
     /// Send the `shutdown` request. Returns the request id; the caller
