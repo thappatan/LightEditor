@@ -79,6 +79,48 @@ struct HoverPopup {
     anchor_char: usize,
 }
 
+/// Per-phase render timing, captured as elapsed-since-frame-start at each
+/// checkpoint. Logged only when a frame overruns the hard latency limit so
+/// the steady-state log stays quiet.
+///
+/// Each field is `Duration::ZERO` until that checkpoint is reached, which
+/// happens when the phase actually runs (e.g. `text_materialize` stays
+/// zero when `text_dirty == false`).
+#[derive(Default)]
+struct FrameTimings {
+    text_materialize: Duration,
+    syntax_parse: Duration,
+    build_spans: Duration,
+    reshape: Duration,
+    lsp_send: Duration,
+    scene: Duration,
+    quads_prepare: Duration,
+    text_prepare: Duration,
+}
+
+impl FrameTimings {
+    fn log(&self, total: Duration) {
+        // Report as cumulative milliseconds at each checkpoint. The
+        // reader can take deltas between adjacent entries to spot the
+        // expensive phase. Zero entries are phases that didn't run.
+        let ms = |d: Duration| d.as_secs_f32() * 1000.0;
+        log::info!(
+            "slow frame breakdown (cumulative ms): \
+             text_materialize={:.1} syntax={:.1} spans={:.1} reshape={:.1} \
+             lsp_send={:.1} scene={:.1} quads={:.1} text_prepare={:.1} total={:.1}",
+            ms(self.text_materialize),
+            ms(self.syntax_parse),
+            ms(self.build_spans),
+            ms(self.reshape),
+            ms(self.lsp_send),
+            ms(self.scene),
+            ms(self.quads_prepare),
+            ms(self.text_prepare),
+            ms(total),
+        );
+    }
+}
+
 /// How often the LSP polling thread fires. 100 ms is fast enough that
 /// diagnostics appear immediately to the eye, and slow enough that idle
 /// CPU stays near zero.
@@ -3976,9 +4018,14 @@ impl State {
 
     fn render(&mut self) {
         let frame_start = Instant::now();
+        // Phase-by-phase timing checkpoints. Only logged when the frame
+        // overruns the hard latency limit, so the steady-state log stays
+        // quiet.
+        let mut t = FrameTimings::default();
 
         if self.text_dirty {
             let new_text = self.docs[self.active].editor.text();
+            t.text_materialize = frame_start.elapsed();
             if self.visible_whitespace {
                 // Visible-whitespace substitution changes some chars' byte
                 // widths, so the syntax char ranges won't line up — fall
@@ -4007,6 +4054,7 @@ impl State {
                     self.docs[self.active].cached_highlights = highlights;
                     self.docs[self.active].cached_revision = Some(revision);
                 }
+                t.syntax_parse = frame_start.elapsed();
                 let default_color = text_color(&self.theme.editor.text_fg);
                 let spans = build_highlight_spans(
                     &new_text,
@@ -4014,15 +4062,18 @@ impl State {
                     default_color,
                     &self.theme.syntax,
                 );
+                t.build_spans = frame_start.elapsed();
                 self.text.set_content_rich(&mut self.font_system, spans);
             } else {
                 self.text.set_content(&mut self.font_system, &new_text);
             }
+            t.reshape = frame_start.elapsed();
             self.text_dirty = false;
             // Ship the freshly-materialised text to the LSP server for
             // the active doc. The helper short-circuits when no server is
             // wired for this language, so the non-LSP path is free.
             self.lsp_did_change_active(&new_text);
+            t.lsp_send = frame_start.elapsed();
         }
         if self.scene_dirty {
             if self.follow_caret {
@@ -4034,6 +4085,7 @@ impl State {
             self.rebuild_scene();
             self.scene_dirty = false;
         }
+        t.scene = frame_start.elapsed();
 
         self.quads.prepare(
             &self.gpu.device,
@@ -4042,6 +4094,7 @@ impl State {
             self.gpu.surface_config.width as f32,
             self.gpu.surface_config.height as f32,
         );
+        t.quads_prepare = frame_start.elapsed();
 
         let surface_w = self.gpu.surface_config.width;
         let surface_h = self.gpu.surface_config.height;
@@ -4303,6 +4356,7 @@ impl State {
                 &mut self.swash_cache,
             )
             .expect("text prepare failed");
+        t.text_prepare = frame_start.elapsed();
 
         let Some(frame) = self.gpu.acquire() else {
             return;
@@ -4349,10 +4403,15 @@ impl State {
         }
 
         if let Some(key_at) = self.pending_keystroke.take() {
-            log::info!(
-                "keystroke latency {:.2}ms (target 16ms / hard 33ms)",
-                key_at.elapsed().as_secs_f32() * 1000.0
-            );
+            let latency_ms = key_at.elapsed().as_secs_f32() * 1000.0;
+            log::info!("keystroke latency {latency_ms:.2}ms (target 16ms / hard 33ms)");
+            // For frames that overrun the hard limit, dump the phase
+            // breakdown so it's clear whether the time was spent in our
+            // code (text materialize / reshape / scene) or waiting on
+            // the OS / GPU (atlas prepare / present).
+            if latency_ms > 33.0 {
+                t.log(frame_start.elapsed());
+            }
         }
 
         if self.last_report.elapsed().as_secs() >= 1 {
