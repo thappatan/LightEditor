@@ -18,6 +18,7 @@ mod git;
 mod lsp;
 mod palette;
 mod terminal;
+mod terminal_palette;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -32,7 +33,7 @@ use editor_syntax::{Highlight, HighlightCategory, Language};
 use editor_ui_render::{GpuContext, QuadRenderer};
 use editor_ui_scene::{Color as SceneColor, Point, Rect, Scene, SceneNode};
 use editor_ui_text::glyphon::{
-    Attrs, Color, FontSystem, Resolution, SwashCache, TextArea, TextBounds,
+    Attrs, Color, Family, FontSystem, Resolution, SwashCache, TextArea, TextBounds,
 };
 use editor_ui_text::{TextGpu, TextStack};
 use file_tree::{ClickResult, FileTree, NodeKind};
@@ -1229,9 +1230,16 @@ impl State {
         let Some(pane_rect) = self.terminal.as_ref().map(|_| self.terminal_pane_rect()) else {
             return;
         };
-        // Terminal text uses the editor's monospace metrics.
-        let cell_w = self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale;
-        let cell_h = self.line_height();
+        // Terminal text uses the editor's monospace metrics. We need the
+        // *actual* glyph advance from cosmic-text here, not the 0.6 ×
+        // font_size approximation — they drift enough that the PTY's
+        // column count and the rendered text disagree on where each
+        // column lands. And we have to measure from `terminal_text`
+        // specifically, not the chrome's buffer, because the two can
+        // pick different monospace faces even when both request
+        // `Family::Monospace`.
+        let cell_w = self.terminal_measured_char_width();
+        let cell_h = self.terminal_measured_line_height();
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return;
         }
@@ -2322,6 +2330,41 @@ impl State {
             .unwrap_or_else(|| self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale)
     }
 
+    /// Glyph advance specifically for the terminal pane. Reading from
+    /// `terminal_text` (rather than the editor's `text` / gutter) keeps
+    /// the cursor's pixel position lock-stepped with whatever cosmic-
+    /// text actually shaped into the pane — the chrome and the pane
+    /// can land on different monospace faces even when both ask for
+    /// `Family::Monospace`, and the editor's set_content_rich shaping
+    /// can pick a different face than the pane's rich-span shaping.
+    /// Falls back to [`measured_char_width`](Self::measured_char_width)
+    /// before the pane has shaped anything (spawn time, hidden pane).
+    fn terminal_measured_char_width(&self) -> f32 {
+        self.terminal_text
+            .buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .find(|g| g.w > 0.0)
+            .map(|g| g.w)
+            .unwrap_or_else(|| self.measured_char_width())
+    }
+
+    /// Vertical advance between terminal rows, in physical pixels.
+    /// Mirrors `terminal_measured_char_width` for the Y axis — the
+    /// cell height the cursor block and the cell-count math need has
+    /// to match the line_height cosmic-text actually used when it
+    /// shaped the pane's rich spans, not what the chrome's TextStack
+    /// thinks its own line height is.
+    fn terminal_measured_line_height(&self) -> f32 {
+        self.terminal_text
+            .buffer
+            .layout_runs()
+            .next()
+            .map(|run| run.line_height)
+            .filter(|h| *h > 0.0)
+            .unwrap_or_else(|| self.line_height())
+    }
+
     /// Find the matching bracket for whichever bracket the primary caret
     /// sits next to. Looks at the char right of the caret first, then the
     /// char left of it. Returns `(this_pos, match_pos)` or `None` when
@@ -2895,8 +2938,13 @@ impl State {
         // First open: spawn the shell rooted at the project root.
         let cwd = Some(self.file_tree.root.clone());
         let pane_height = TERMINAL_HEIGHT_DIP * self.scale;
-        let cell_w = self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale;
-        let cell_h = self.line_height();
+        // Real cosmic-text monospace advance — see comment in
+        // `resync_terminal_cells`. At spawn time `terminal_text` is
+        // empty, so this falls back to the chrome's measurement;
+        // `resync_terminal_cells` re-runs once the first frame has
+        // shaped the pane and the value gets refined.
+        let cell_w = self.terminal_measured_char_width();
+        let cell_h = self.terminal_measured_line_height();
         match terminal::TerminalPane::spawn(
             self.flash_proxy.clone(),
             cwd,
@@ -2952,8 +3000,15 @@ impl State {
         }
         let panel = self.terminal_pane_rect();
         let pad = 6.0 * self.scale;
-        let cell_w = self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale;
-        let cell_h = self.line_height();
+        // Use the pane's own glyph advance so the cursor lands on the
+        // same pixel column the shaped text does. Reading from the
+        // chrome's `text` buffer (or the 0.6 × font_size
+        // approximation) drifts because cosmic-text can resolve
+        // `Family::Monospace` to a different face for the pane than
+        // for the editor, especially when the pane has the rich
+        // colour spans the editor doesn't.
+        let cell_w = self.terminal_measured_char_width();
+        let cell_h = self.terminal_measured_line_height();
         let term = pane.term.lock();
         let grid = term.grid();
         // alacritty stores the cursor as a Line (signed, history-relative)
@@ -2975,42 +3030,112 @@ impl State {
     /// Snapshot the terminal grid into the terminal_text TextStack
     /// for the next frame. Called from the render path when the
     /// terminal is visible and there's a wakeup pending.
+    ///
+    /// Per-cell foreground colours are read from the grid and folded
+    /// into `(slice, Attrs)` spans so cosmic-text shapes coloured
+    /// runs in one pass. Background colours and bold-weight / italic /
+    /// underline attributes are *not* honoured in v1 — the renderer
+    /// has no per-cell quad layer yet and the pane uses a single
+    /// monospace face, so all four would need a follow-up.
     fn refresh_terminal_text(&mut self) {
         let Some(pane) = self.terminal.as_ref() else {
             return;
         };
-        let text = {
+        use alacritty_terminal::term::cell::Flags;
+        use terminal_palette::{brighten_named, resolve, PaletteColor};
+
+        // Theme-driven defaults for the three sentinel named colours.
+        // Programs that emit `Named(Foreground)` get the editor's text
+        // colour back, which is what the chrome uses for status / tab
+        // strip too — keeps the pane looking like part of the editor.
+        let unpack = |hex: &str, fallback: [u8; 4]| -> PaletteColor {
+            let [r, g, b, _] = parse_hex_color(hex).unwrap_or(fallback);
+            PaletteColor::new(r, g, b)
+        };
+        let default_fg = unpack(&self.theme.editor.text_fg, [0xEE, 0xEE, 0xEE, 0xFF]);
+        let default_bg = unpack(&self.theme.editor.background, [0x12, 0x12, 0x16, 0xFF]);
+        let default_cursor = unpack(&self.theme.editor.caret, [0xEE, 0xEE, 0xEE, 0xFF]);
+
+        // Build (run_text, run_color) entries in one pass. A new run
+        // starts when the resolved colour differs from the previous
+        // cell, or when we cross a row boundary (the '\n' rides on
+        // its own run so we don't accidentally extend the previous
+        // colour past the line terminator).
+        let mut runs: Vec<(String, PaletteColor)> = Vec::with_capacity(pane.rows * 2);
+        let mut current = String::new();
+        let mut current_color = default_fg;
+
+        {
             let term = pane.term.lock();
             let grid = term.grid();
-            let mut s = String::with_capacity(pane.cols * pane.rows + pane.rows);
-            // Iterate visible rows in display order. The grid's
-            // display offset (set by scrolling) shifts which rows
-            // are visible — for v1 we render the *current* visible
-            // window from the top of the screen down.
             use alacritty_terminal::grid::Dimensions as _;
             let display_offset = grid.display_offset();
             let total_rows = grid.screen_lines();
             for screen_row in 0..total_rows {
+                if screen_row > 0 {
+                    if !current.is_empty() {
+                        runs.push((std::mem::take(&mut current), current_color));
+                    }
+                    runs.push(("\n".to_string(), current_color));
+                }
                 let line =
                     alacritty_terminal::index::Line(screen_row as i32 - display_offset as i32);
-                if screen_row > 0 {
-                    s.push('\n');
-                }
                 for col in 0..grid.columns() {
                     let cell = &grid[line][alacritty_terminal::index::Column(col)];
+                    let flags = cell.flags;
+                    let mut fg = cell.fg;
+                    // Classic xterm behaviour: BOLD brightens the
+                    // named fg colour (8 → 16-colour palette upgrade).
+                    // Indexed and Spec colours pass through.
+                    if flags.contains(Flags::BOLD) {
+                        fg = brighten_named(fg);
+                    }
+                    // INVERSE *should* swap fg/bg. Without a per-cell
+                    // quad layer the swap would paint text in the
+                    // pane's bg colour — i.e. invisible — so we
+                    // ignore the flag for now. Tracked as M3 polish.
+                    let color = resolve(fg, default_fg, default_bg, default_cursor);
+
+                    if color != current_color && !current.is_empty() {
+                        runs.push((std::mem::take(&mut current), current_color));
+                    }
+                    current_color = color;
+
                     let c = cell.c;
                     // Drop the trailing space of a wide-char's right
                     // half (alacritty stores a 0 there).
                     if c == '\0' {
-                        s.push(' ');
+                        current.push(' ');
                     } else {
-                        s.push(c);
+                        current.push(c);
                     }
                 }
             }
-            s
-        };
-        self.terminal_text.set_content(&mut self.font_system, &text);
+            if !current.is_empty() {
+                runs.push((current, current_color));
+            }
+        }
+
+        // Emit spans. `Attrs::new()` defaults to `Family::SansSerif`,
+        // and cosmic-text honours that per-span without merging with
+        // the AttrsList's default — so every span must explicitly
+        // re-state monospace or the prompt drifts into a proportional
+        // font and the rendered text no longer lines up with the
+        // PTY's column count. Skip `.color()` when the resolved
+        // colour matches the chrome default so cosmic-text picks up
+        // `TextArea.default_color` straight from the renderer.
+        let spans: Vec<(&str, Attrs)> = runs
+            .iter()
+            .map(|(s, c)| {
+                let mut attrs = Attrs::new().family(Family::Monospace);
+                if *c != default_fg {
+                    attrs = attrs.color(Color::rgb(c.r, c.g, c.b));
+                }
+                (s.as_str(), attrs)
+            })
+            .collect();
+        self.terminal_text
+            .set_content_rich(&mut self.font_system, spans);
     }
 
     /// Translate a winit key event into the byte sequence a PTY
