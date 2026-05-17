@@ -1369,6 +1369,15 @@ impl State {
                         self.request_hover();
                         return;
                     }
+                    "." => {
+                        // Cmd-. is the macOS-friendly trigger for LSP
+                        // completion. Ctrl-Space is the cross-platform
+                        // default, but macOS users with multiple input
+                        // sources have it bound to Input Source Switcher
+                        // before our app ever sees it.
+                        self.request_completion();
+                        return;
+                    }
                     "c" => {
                         self.copy_selection();
                         return;
@@ -2868,13 +2877,18 @@ impl State {
     /// Trigger `textDocument/completion` at the caret. Anchor is the
     /// start of the word the caret is inside (so the popup stays
     /// stable as the user keeps typing letters of the same word).
-    /// Already-open popups are replaced — the user just hit Ctrl-Space
-    /// again to refresh.
+    /// Already-open popups are replaced — the user just hit the
+    /// completion shortcut again to refresh.
     fn request_completion(&mut self) {
         let Some(path) = self.doc().file_path.clone() else {
+            log::info!("completion: skipped — no file path on active doc");
             return;
         };
         let Some(lang) = Language::for_path(&path) else {
+            log::info!(
+                "completion: skipped — no language recognised for {}",
+                path.display()
+            );
             return;
         };
         let head = self.doc().editor.selections().primary().head;
@@ -2884,14 +2898,24 @@ impl State {
             line: pos.line as u32,
             character: pos.column as u32,
         };
-        self.lsp.request_completion(
+        match self.lsp.request_completion(
             &path,
             lang,
             lsp_pos,
             anchor,
             editor_lsp_client::lsp_types::CompletionTriggerKind::INVOKED,
             None,
-        );
+        ) {
+            Some(id) => log::info!(
+                "completion: request sent (id={id}, anchor_char={anchor}, line={}, col={})",
+                pos.line,
+                pos.column
+            ),
+            None => log::info!(
+                "completion: server not ready for {lang:?} on {}",
+                path.display()
+            ),
+        }
     }
 
     fn handle_lsp_completion(
@@ -2900,6 +2924,11 @@ impl State {
         anchor_char: usize,
         items: Vec<editor_lsp_client::lsp_types::CompletionItem>,
     ) {
+        log::info!(
+            "completion: response for {} — {} item(s)",
+            doc_path.display(),
+            items.len()
+        );
         if self.doc().file_path.as_deref() != Some(&doc_path) {
             return;
         }
