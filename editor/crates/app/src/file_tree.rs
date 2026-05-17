@@ -42,10 +42,21 @@ pub enum NodeKind {
 /// loaded node list is retained so a re-show is instant.
 pub struct FileTree {
     pub visible: bool,
+    /// `true` when the sidebar owns the keyboard. Independent of
+    /// `visible`: the panel can be shown without keyboard focus (after
+    /// the user clicks back into the editor), and it can be focused
+    /// only while visible (focus is force-cleared on hide). The host
+    /// uses this to decide whether ↑ / ↓ / Enter / Esc go to the tree
+    /// or fall through to the editor.
+    pub focused: bool,
+    /// Index of the row the user has selected via keyboard, or `None`
+    /// when no row is highlighted. Mouse clicks open / toggle without
+    /// touching this, so the selection cursor stays where the keyboard
+    /// last left it.
+    pub selected: Option<usize>,
     /// Root the tree is anchored at. Kept on the struct so a future
     /// "Open Folder" command can rebuild without recreating the whole
     /// state. Reads from this happen via [`reload`](FileTree::reload).
-    #[allow(dead_code)]
     pub root: PathBuf,
     pub nodes: Vec<TreeNode>,
     /// Vertical scroll position in physical pixels, kept per-tree so the
@@ -61,6 +72,8 @@ impl FileTree {
         let nodes = read_children(&root, 0);
         Self {
             visible: false,
+            focused: false,
+            selected: None,
             root,
             nodes,
             scroll_y: 0.0,
@@ -71,6 +84,74 @@ impl FileTree {
     /// handler (returned as `OpenFile(path)`); directories toggle their
     /// expanded state in place.
     pub fn click(&mut self, idx: usize) -> ClickResult {
+        let result = self.activate_at(idx);
+        // Mouse interaction moves the selection cursor too so the
+        // keyboard picks up where the mouse left off.
+        if !self.nodes.is_empty() {
+            self.selected = Some(idx.min(self.nodes.len() - 1));
+        }
+        result
+    }
+
+    /// Activate the currently-selected row — equivalent to clicking it.
+    /// No-op when nothing is selected. Used by the Enter-key handler.
+    pub fn activate_selected(&mut self) -> ClickResult {
+        match self.selected {
+            Some(idx) => self.activate_at(idx),
+            None => ClickResult::Nothing,
+        }
+    }
+
+    /// Move the selection one row down, wrapping to the top at the end.
+    /// Seeds the selection at row 0 if nothing was selected yet.
+    pub fn select_next(&mut self) {
+        if self.nodes.is_empty() {
+            self.selected = None;
+            return;
+        }
+        self.selected = Some(match self.selected {
+            None => 0,
+            Some(idx) => (idx + 1) % self.nodes.len(),
+        });
+    }
+
+    /// Move the selection one row up, wrapping to the bottom at the top.
+    /// Seeds the selection at the last row if nothing was selected yet.
+    pub fn select_prev(&mut self) {
+        if self.nodes.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let last = self.nodes.len() - 1;
+        self.selected = Some(match self.selected {
+            None => last,
+            Some(0) => last,
+            Some(idx) => idx - 1,
+        });
+    }
+
+    /// Re-read the root directory's entries to pick up filesystem
+    /// changes. Currently nukes the tree state (re-collapses everything
+    /// under the root); a watcher-driven incremental refresh is a
+    /// follow-up.
+    #[allow(dead_code)]
+    pub fn reload(&mut self) {
+        self.nodes = read_children(&self.root, 0);
+        // Clamp the selection so a removed bottom row doesn't leave
+        // selected pointing past the end of the list.
+        if let Some(idx) = self.selected {
+            if self.nodes.is_empty() {
+                self.selected = None;
+            } else if idx >= self.nodes.len() {
+                self.selected = Some(self.nodes.len() - 1);
+            }
+        }
+    }
+
+    /// Shared body of [`click`](Self::click) /
+    /// [`activate_selected`](Self::activate_selected). Files become an
+    /// `OpenFile`; directories toggle expansion in place.
+    fn activate_at(&mut self, idx: usize) -> ClickResult {
         let Some(node) = self.nodes.get_mut(idx) else {
             return ClickResult::Nothing;
         };
@@ -88,15 +169,6 @@ impl FileTree {
                 ClickResult::Nothing
             }
         }
-    }
-
-    /// Re-read the root directory's entries to pick up filesystem
-    /// changes. Currently nukes the tree state (re-collapses everything
-    /// under the root); a watcher-driven incremental refresh is a
-    /// follow-up.
-    #[allow(dead_code)]
-    pub fn reload(&mut self) {
-        self.nodes = read_children(&self.root, 0);
     }
 
     fn expand_at(&mut self, idx: usize) {
@@ -258,6 +330,102 @@ mod tests {
             ClickResult::OpenFile(p) => assert_eq!(p, root.join("hello.rs")),
             other => panic!("expected OpenFile, got {other:?}"),
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn select_next_seeds_and_advances_with_wrap() {
+        let root = tempdir();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        std::fs::write(root.join("b.txt"), "").unwrap();
+        std::fs::write(root.join("c.txt"), "").unwrap();
+        let mut tree = FileTree::new(root.clone());
+        assert_eq!(tree.selected, None);
+
+        tree.select_next();
+        assert_eq!(tree.selected, Some(0));
+        tree.select_next();
+        assert_eq!(tree.selected, Some(1));
+        tree.select_next();
+        assert_eq!(tree.selected, Some(2));
+        // Past the end → wrap to top.
+        tree.select_next();
+        assert_eq!(tree.selected, Some(0));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn select_prev_seeds_at_bottom_and_wraps() {
+        let root = tempdir();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        std::fs::write(root.join("b.txt"), "").unwrap();
+        let mut tree = FileTree::new(root.clone());
+
+        tree.select_prev();
+        // Nothing was selected → seed at the *last* row, not the first.
+        assert_eq!(tree.selected, Some(1));
+        tree.select_prev();
+        assert_eq!(tree.selected, Some(0));
+        tree.select_prev();
+        // Wrap past the top → bottom.
+        assert_eq!(tree.selected, Some(1));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn activate_selected_opens_file_or_toggles_dir() {
+        let root = tempdir();
+        std::fs::create_dir(root.join("inner")).unwrap();
+        std::fs::write(root.join("inner/x.txt"), "").unwrap();
+        std::fs::write(root.join("y.txt"), "").unwrap();
+        let mut tree = FileTree::new(root.clone());
+        // [inner, y.txt]
+        tree.selected = Some(0);
+        let r = tree.activate_selected();
+        // Directory expands in place.
+        assert!(matches!(r, ClickResult::Nothing));
+        assert_eq!(tree.nodes.len(), 3); // inner + x.txt + y.txt
+
+        // Move down to the expanded child and open it.
+        tree.select_next();
+        assert_eq!(tree.selected, Some(1));
+        match tree.activate_selected() {
+            ClickResult::OpenFile(p) => assert_eq!(p, root.join("inner/x.txt")),
+            other => panic!("expected OpenFile, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reload_clamps_selection_to_new_node_count() {
+        let root = tempdir();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        std::fs::write(root.join("b.txt"), "").unwrap();
+        std::fs::write(root.join("c.txt"), "").unwrap();
+        let mut tree = FileTree::new(root.clone());
+        tree.selected = Some(2);
+
+        // Drop the bottom file and reload — selection was off the end.
+        std::fs::remove_file(root.join("c.txt")).unwrap();
+        tree.reload();
+        assert_eq!(tree.selected, Some(1));
+
+        // Drain everything and the selection clears.
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        std::fs::remove_file(root.join("b.txt")).unwrap();
+        tree.reload();
+        assert_eq!(tree.selected, None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn click_updates_selection_to_clicked_row() {
+        let root = tempdir();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        std::fs::write(root.join("b.txt"), "").unwrap();
+        let mut tree = FileTree::new(root.clone());
+        let _ = tree.click(1);
+        assert_eq!(tree.selected, Some(1));
         std::fs::remove_dir_all(&root).ok();
     }
 }
