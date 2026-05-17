@@ -2965,8 +2965,15 @@ impl State {
     }
 
     fn shape_completion_popup(&mut self, popup: &CompletionPopup) {
-        let mut s = String::with_capacity(popup.filtered.len() * 32);
-        for (row, &i) in popup.filtered.iter().enumerate() {
+        // Only shape the visible window — typical responses are hundreds
+        // of items long and shaping every BufferLine costs proportionally,
+        // so capping to `COMPLETION_MAX_ROWS` keeps the popup-open
+        // keystroke path cheap. Re-shape happens on navigation that
+        // moves the visible window.
+        let start = popup.scroll;
+        let end = (popup.scroll + COMPLETION_MAX_ROWS).min(popup.filtered.len());
+        let mut s = String::with_capacity((end - start) * 32);
+        for (row, &i) in popup.filtered[start..end].iter().enumerate() {
             if row > 0 {
                 s.push('\n');
             }
@@ -3011,31 +3018,48 @@ impl State {
 
     /// Move the selection one row down within the filtered list, wrapping
     /// from bottom to top. Scrolls the visible window if the new selection
-    /// is past the bottom edge.
+    /// is past the bottom edge, and re-shapes the popup text when the
+    /// window changes (since the text stack only holds visible rows).
     fn completion_next(&mut self) {
-        let Some(popup) = self.completion.as_mut() else {
-            return;
+        let snapshot = {
+            let Some(popup) = self.completion.as_mut() else {
+                return;
+            };
+            if popup.filtered.is_empty() {
+                return;
+            }
+            let before = popup.scroll;
+            popup.selected = (popup.selected + 1) % popup.filtered.len();
+            popup.adjust_scroll();
+            if popup.scroll == before {
+                return; // selection moved within the visible window — no reshape
+            }
+            popup.clone_for_shape()
         };
-        if popup.filtered.is_empty() {
-            return;
-        }
-        popup.selected = (popup.selected + 1) % popup.filtered.len();
-        popup.adjust_scroll();
+        self.shape_completion_popup(&snapshot);
     }
 
     fn completion_prev(&mut self) {
-        let Some(popup) = self.completion.as_mut() else {
-            return;
+        let snapshot = {
+            let Some(popup) = self.completion.as_mut() else {
+                return;
+            };
+            if popup.filtered.is_empty() {
+                return;
+            }
+            let before = popup.scroll;
+            popup.selected = if popup.selected == 0 {
+                popup.filtered.len() - 1
+            } else {
+                popup.selected - 1
+            };
+            popup.adjust_scroll();
+            if popup.scroll == before {
+                return;
+            }
+            popup.clone_for_shape()
         };
-        if popup.filtered.is_empty() {
-            return;
-        }
-        popup.selected = if popup.selected == 0 {
-            popup.filtered.len() - 1
-        } else {
-            popup.selected - 1
-        };
-        popup.adjust_scroll();
+        self.shape_completion_popup(&snapshot);
     }
 
     /// Re-evaluate the popup against the buffer state after an edit. The
@@ -4784,19 +4808,13 @@ impl State {
             });
         }
         if let Some((cx, cy)) = self.completion_text_origin() {
-            // Scroll the visible window into view: shift the buffer's
-            // origin upward by `scroll * line_h` so row 0 of the visible
-            // window lands at the popup's top, and clip with the panel
-            // bounds so non-visible rows are masked.
-            let popup = self
-                .completion
-                .as_ref()
-                .expect("completion_text_origin implies completion is Some");
+            // The completion_text stack only holds the *visible* rows
+            // (popup.scroll..popup.scroll+max_rows), so no scroll offset
+            // is needed — the buffer's row 0 lines up with the popup's
+            // top row already.
             let panel = self
                 .completion_panel_rect()
                 .expect("completion_text_origin implies completion_panel_rect");
-            let line_h = self.line_height();
-            let top_offset = cy - (popup.scroll as f32) * line_h;
             let bounds = TextBounds {
                 left: panel.min_x() as i32,
                 top: panel.min_y() as i32,
@@ -4806,7 +4824,7 @@ impl State {
             text_areas.push(TextArea {
                 buffer: &self.completion_text.buffer,
                 left: cx,
-                top: top_offset,
+                top: cy,
                 scale: 1.0,
                 bounds,
                 default_color: editor_color,
