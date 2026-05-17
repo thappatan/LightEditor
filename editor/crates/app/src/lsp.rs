@@ -372,11 +372,7 @@ impl LspState {
             .get(&uri)
             .is_some_and(|t| t.elapsed() < DIDCHANGE_DEBOUNCE);
         if too_soon {
-            slot.pending_change = Some(PendingChange {
-                uri,
-                version,
-                text,
-            });
+            slot.pending_change = Some(PendingChange { uri, version, text });
             return;
         }
         if let Err(e) = slot.client.did_change_full(uri.clone(), version, text) {
