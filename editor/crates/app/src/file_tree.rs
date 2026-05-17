@@ -183,13 +183,15 @@ mod tests {
     use super::*;
 
     fn tempdir() -> PathBuf {
-        // A simple `target/test-tmp-<rand>` so we don't depend on a tempdir
-        // crate. Each invocation makes a unique path; the test cleans up.
-        let n: u32 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("editor-app-filetree-{n}"));
+        // Unique per-test path without depending on the `tempfile` crate.
+        // (PID, atomic counter) avoids the nanosecond-resolution collision
+        // we hit when CI runs tests in parallel — `subsec_nanos()` alone
+        // can land on the same value across threads.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let pid = std::process::id();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("editor-app-filetree-{pid}-{n}"));
         std::fs::create_dir_all(&path).unwrap();
         path
     }
