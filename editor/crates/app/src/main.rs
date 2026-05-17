@@ -141,21 +141,6 @@ impl CompletionPopup {
             self.scroll = self.selected + 1 - visible;
         }
     }
-
-    /// Make a shallow snapshot for re-shaping the popup text. Borrow
-    /// rules forbid passing `&self` to `shape_completion_popup` while
-    /// `&mut self.completion` is held; cloning just the slim fields
-    /// the shaper needs (item refs + filtered indices) sidesteps it.
-    fn clone_for_shape(&self) -> CompletionPopup {
-        CompletionPopup {
-            items: self.items.clone(),
-            filtered: self.filtered.clone(),
-            anchor_char: self.anchor_char,
-            prefix: self.prefix.clone(),
-            selected: self.selected,
-            scroll: self.scroll,
-        }
-    }
 }
 
 /// Whether `c` belongs to an identifier — used to anchor the completion
@@ -2937,17 +2922,13 @@ impl State {
             return;
         }
         // The caret may have moved (the user kept typing while the request
-        // was in flight) — compute the current prefix from the live caret.
+        // was in flight) — compute the current prefix from the live caret
+        // via the rope slice rather than materialising the whole buffer.
         let head = self.doc().editor.selections().primary().head;
         if head < anchor_char {
             return; // caret moved before the anchor; the popup is stale
         }
-        let text = self.doc().editor.text();
-        let prefix: String = text
-            .chars()
-            .skip(anchor_char)
-            .take(head - anchor_char)
-            .collect();
+        let prefix = self.doc().editor.buffer().slice(anchor_char..head);
         let mut popup = CompletionPopup {
             items,
             filtered: Vec::new(),
@@ -2960,26 +2941,33 @@ impl State {
         if popup.filtered.is_empty() {
             return;
         }
-        self.shape_completion_popup(&popup);
         self.completion = Some(popup);
+        self.shape_completion_popup_inplace();
     }
 
-    fn shape_completion_popup(&mut self, popup: &CompletionPopup) {
-        // Only shape the visible window — typical responses are hundreds
-        // of items long and shaping every BufferLine costs proportionally,
-        // so capping to `COMPLETION_MAX_ROWS` keeps the popup-open
-        // keystroke path cheap. Re-shape happens on navigation that
-        // moves the visible window.
-        let start = popup.scroll;
-        let end = (popup.scroll + COMPLETION_MAX_ROWS).min(popup.filtered.len());
-        let mut s = String::with_capacity((end - start) * 32);
-        for (row, &i) in popup.filtered[start..end].iter().enumerate() {
-            if row > 0 {
-                s.push('\n');
+    /// Re-shape the popup's text stack from `self.completion`. Reads only
+    /// the visible window so a 200-item response stays a 10-line shape
+    /// job. Reads + writes `self` via split borrows — no allocation of
+    /// the full item set (a `CompletionPopup` clone would touch every
+    /// `String` field of every `CompletionItem`).
+    fn shape_completion_popup_inplace(&mut self) {
+        let text = {
+            let Some(popup) = self.completion.as_ref() else {
+                return;
+            };
+            let start = popup.scroll;
+            let end = (popup.scroll + COMPLETION_MAX_ROWS).min(popup.filtered.len());
+            let mut s = String::with_capacity((end - start) * 32);
+            for (row, &i) in popup.filtered[start..end].iter().enumerate() {
+                if row > 0 {
+                    s.push('\n');
+                }
+                s.push_str(&popup.items[i].label);
             }
-            s.push_str(&popup.items[i].label);
-        }
-        self.completion_text.set_content(&mut self.font_system, &s);
+            s
+        };
+        self.completion_text
+            .set_content(&mut self.font_system, &text);
     }
 
     /// Try to accept the currently-selected completion. Returns `true`
@@ -3021,7 +3009,7 @@ impl State {
     /// is past the bottom edge, and re-shapes the popup text when the
     /// window changes (since the text stack only holds visible rows).
     fn completion_next(&mut self) {
-        let snapshot = {
+        let needs_reshape = {
             let Some(popup) = self.completion.as_mut() else {
                 return;
             };
@@ -3031,16 +3019,15 @@ impl State {
             let before = popup.scroll;
             popup.selected = (popup.selected + 1) % popup.filtered.len();
             popup.adjust_scroll();
-            if popup.scroll == before {
-                return; // selection moved within the visible window — no reshape
-            }
-            popup.clone_for_shape()
+            popup.scroll != before
         };
-        self.shape_completion_popup(&snapshot);
+        if needs_reshape {
+            self.shape_completion_popup_inplace();
+        }
     }
 
     fn completion_prev(&mut self) {
-        let snapshot = {
+        let needs_reshape = {
             let Some(popup) = self.completion.as_mut() else {
                 return;
             };
@@ -3054,12 +3041,11 @@ impl State {
                 popup.selected - 1
             };
             popup.adjust_scroll();
-            if popup.scroll == before {
-                return;
-            }
-            popup.clone_for_shape()
+            popup.scroll != before
         };
-        self.shape_completion_popup(&snapshot);
+        if needs_reshape {
+            self.shape_completion_popup_inplace();
+        }
     }
 
     /// Re-evaluate the popup against the buffer state after an edit. The
@@ -3067,43 +3053,37 @@ impl State {
     /// shrinks it); if it falls outside the anchored word the popup
     /// dismisses.
     fn refresh_completion_after_edit(&mut self) {
-        // Read everything we need before borrowing `self.completion`
-        // mutably, otherwise the popup borrow conflicts with the doc
-        // accessors below.
         let Some(anchor) = self.completion.as_ref().map(|p| p.anchor_char) else {
             return;
         };
         let head = self.doc().editor.selections().primary().head;
-        if head < anchor {
+        let len_chars = self.doc().editor.buffer().len_chars();
+        if head < anchor || anchor > len_chars {
             self.completion = None;
             return;
         }
-        let text = self.doc().editor.text();
-        let total = text.chars().count();
-        if anchor > total {
-            self.completion = None;
-            return;
-        }
-        let prefix: String = text.chars().skip(anchor).take(head - anchor).collect();
-        // The user typed a non-word character (space, punctuation) —
-        // close the popup rather than show stale matches.
+        // Slice the rope for just the prefix — way cheaper than
+        // materialising the whole buffer (which on a 4000-line file
+        // was costing ~10 ms of `Rope::to_string` per keystroke).
+        let prefix = self.doc().editor.buffer().slice(anchor..head);
         if prefix.chars().any(|c| !is_word_char(c)) {
             self.completion = None;
             return;
         }
-        let snapshot = {
-            let Some(popup) = self.completion.as_mut() else {
-                return;
-            };
+        let empty = {
+            let popup = self
+                .completion
+                .as_mut()
+                .expect("completion present per earlier check");
             popup.prefix = prefix;
             popup.refilter();
-            if popup.filtered.is_empty() {
-                self.completion = None;
-                return;
-            }
-            popup.clone_for_shape()
+            popup.filtered.is_empty()
         };
-        self.shape_completion_popup(&snapshot);
+        if empty {
+            self.completion = None;
+            return;
+        }
+        self.shape_completion_popup_inplace();
     }
 
     fn handle_lsp_hover(&mut self, doc_path: PathBuf, result: Option<lsp_types::Hover>) {
