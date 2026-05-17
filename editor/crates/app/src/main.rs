@@ -1210,11 +1210,39 @@ impl State {
             .set_width(&mut self.font_system, status_width);
         self.status_right
             .set_width(&mut self.font_system, status_width);
+        self.terminal_text
+            .set_width(&mut self.font_system, size.width as f32);
+        // Propagate the new pane size to the PTY so programs that look
+        // at `$COLUMNS` / `tput cols` see the right answer.
+        self.resync_terminal_cells();
         // Palette / find widths are fixed; nothing to update on a window resize.
         self.text_dirty = true;
         self.scene_dirty = true;
         // ControlFlow::Wait won't redraw on its own — a resize must ask.
         self.window.request_redraw();
+    }
+
+    /// Recompute the terminal's cell-grid dimensions from the pane's
+    /// current pixel size and push them through to the PTY. Called on
+    /// every window resize and once at spawn.
+    fn resync_terminal_cells(&mut self) {
+        let Some(pane_rect) = self.terminal.as_ref().map(|_| self.terminal_pane_rect()) else {
+            return;
+        };
+        // Terminal text uses the editor's monospace metrics.
+        let cell_w = self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale;
+        let cell_h = self.line_height();
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return;
+        }
+        let pad = 6.0 * self.scale;
+        let usable_w = (pane_rect.size.width - 2.0 * pad).max(cell_w);
+        let usable_h = (pane_rect.size.height - 2.0 * pad).max(cell_h);
+        let cols = ((usable_w / cell_w).floor() as u16).max(1);
+        let rows = ((usable_h / cell_h).floor() as u16).max(1);
+        if let Some(term) = self.terminal.as_mut() {
+            term.resize(cols, rows, cell_w, cell_h);
+        }
     }
 
     /// Re-size everything for a new window scale factor (the window moved to a
@@ -1910,6 +1938,22 @@ impl State {
             return;
         };
         self.note_activity();
+        // Clicks inside the terminal pane focus it; clicks anywhere
+        // else unfocus it so the editor regains the keyboard.
+        if self.terminal_pane_height() > 0.0 {
+            let pane = self.terminal_pane_rect();
+            let in_pane = pane.contains(Point::new(mx, my));
+            if let Some(term) = self.terminal.as_mut() {
+                if term.focused != in_pane {
+                    term.focused = in_pane;
+                    self.scene_dirty = true;
+                    self.window.request_redraw();
+                }
+            }
+            if in_pane {
+                return; // swallow the click — don't fall through to editor
+            }
+        }
         // Find-in-files panel claims clicks first while open — clicking
         // a result row opens that file; clicking the input row focuses
         // it; clicking outside the panel dismisses it.
@@ -2838,7 +2882,12 @@ impl State {
         if let Some(term) = self.terminal.as_mut() {
             term.visible = !term.visible;
             term.focused = term.visible;
-            self.recompute_text_inset(); // editor width is unaffected, but other layout may shift
+            self.recompute_text_inset();
+            // Window may have resized while the pane was hidden, so
+            // re-sync cell count whenever we bring it back into view.
+            if self.terminal.as_ref().is_some_and(|t| t.visible) {
+                self.resync_terminal_cells();
+            }
             self.scene_dirty = true;
             self.window.request_redraw();
             return;
@@ -2859,6 +2908,9 @@ impl State {
         ) {
             Ok(pane) => {
                 self.terminal = Some(pane);
+                // Match cell count to real pane size on first show; the
+                // initial 100×12 was just a placeholder for the spawn.
+                self.resync_terminal_cells();
                 self.refresh_terminal_text();
                 self.scene_dirty = true;
                 self.window.request_redraw();
@@ -2887,6 +2939,37 @@ impl State {
         let status_h = STATUS_BAR_HEIGHT_DIP * self.scale;
         let top = (surface_h - status_h - h).max(0.0);
         Rect::new(0.0, top, surface_w, h)
+    }
+
+    /// Cursor block rect for the terminal, in physical pixels. Returns
+    /// `None` when the pane is hidden or when the cursor's grid
+    /// coordinates fall outside the rendered window (very large
+    /// scrollback offset).
+    fn terminal_cursor_rect(&self) -> Option<Rect> {
+        let pane = self.terminal.as_ref()?;
+        if !pane.visible {
+            return None;
+        }
+        let panel = self.terminal_pane_rect();
+        let pad = 6.0 * self.scale;
+        let cell_w = self.text.font_size_pt() * MONOSPACE_CHAR_FACTOR * self.scale;
+        let cell_h = self.line_height();
+        let term = pane.term.lock();
+        let grid = term.grid();
+        // alacritty stores the cursor as a Line (signed, history-relative)
+        // and Column. Translate into the visible window: a positive
+        // display offset means the user scrolled up, so the live
+        // cursor row sits N rows below the screen.
+        use alacritty_terminal::grid::Dimensions as _;
+        let display_offset = grid.display_offset() as i32;
+        let cursor = grid.cursor.point;
+        let row_on_screen = cursor.line.0 + display_offset;
+        if row_on_screen < 0 || row_on_screen as usize >= grid.screen_lines() {
+            return None;
+        }
+        let x = panel.min_x() + pad + (cursor.column.0 as f32) * cell_w;
+        let y = panel.min_y() + pad + (row_on_screen as f32) * cell_h;
+        Some(Rect::new(x, y, cell_w.max(1.0), cell_h))
     }
 
     /// Snapshot the terminal grid into the terminal_text TextStack
@@ -4761,9 +4844,32 @@ impl State {
         self.window.request_redraw();
     }
 
-    /// Mouse wheel: scroll the find-in-files panel if the pointer is
-    /// inside it; otherwise scroll the active document vertically.
+    /// Mouse wheel: route to whichever pane is under the pointer —
+    /// the find-in-files panel and the terminal pane each claim
+    /// wheel events when the cursor is over them; otherwise the
+    /// editor scrolls.
     fn handle_scroll(&mut self, delta_y: f32) {
+        // Terminal pane: scroll its scrollback. alacritty's
+        // `Grid::scroll_display(Scroll::Delta(N))` shifts the
+        // display offset by N lines (positive = scroll up into
+        // history, negative = back toward the live tail).
+        if self.terminal_pane_height() > 0.0 {
+            if let Some((mx, my)) = self.mouse_pos {
+                let pane = self.terminal_pane_rect();
+                if pane.contains(Point::new(mx, my)) {
+                    let lines = (delta_y / self.line_height()).round() as i32;
+                    if lines != 0 {
+                        if let Some(t) = self.terminal.as_ref() {
+                            let mut term = t.term.lock();
+                            term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+                        }
+                        self.scene_dirty = true;
+                        self.window.request_redraw();
+                    }
+                    return;
+                }
+            }
+        }
         // Find-in-files panel claims wheel events while open and the
         // pointer is over it — otherwise scroll wheel just falls
         // through to the editor.
@@ -5172,6 +5278,17 @@ impl State {
                 self.terminal_pane_rect(),
                 quad_color(&et.gutter_bg),
             ));
+            // Cursor block — solid when the terminal has focus,
+            // hollow-ish otherwise. Drawn under the text so the
+            // glyph at that cell still reads on top.
+            if let Some(rect) = self.terminal_cursor_rect() {
+                let color = if self.terminal.as_ref().is_some_and(|t| t.focused) {
+                    quad_color(&et.caret)
+                } else {
+                    quad_color(&et.active_line_bg)
+                };
+                root.push_child(SceneNode::quad(rect, color));
+            }
         }
 
         // Status bar backdrop — opaque so it covers any text that scrolled
