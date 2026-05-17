@@ -51,6 +51,36 @@ impl ServerKind {
     }
 }
 
+/// Walk up from `start` looking for a file that marks a project root.
+/// Returns the directory containing the first marker, or `None` when we
+/// hit the filesystem root without finding one — in which case the host
+/// passes a null `rootUri` and the server falls back to single-file mode.
+///
+/// Matters most for rust-analyzer: without a Cargo.toml in scope it does
+/// no type-checking, so a file opened from `crates/app/src/main.rs` gets
+/// no diagnostics unless we point the server at the workspace root.
+fn find_project_root(start: &Path) -> Option<PathBuf> {
+    const MARKERS: &[&str] = &[
+        "Cargo.toml",
+        "package.json",
+        "tsconfig.json",
+        "jsconfig.json",
+        "pyproject.toml",
+        "go.mod",
+        "pubspec.yaml",
+        ".git",
+    ];
+    let mut p: &Path = start.parent()?;
+    loop {
+        for marker in MARKERS {
+            if p.join(marker).exists() {
+                return Some(p.to_path_buf());
+            }
+        }
+        p = p.parent()?;
+    }
+}
+
 /// Which LSP `languageId` to use for a given editor language. Servers care
 /// about this — e.g. `typescript-language-server` distinguishes `typescript`
 /// from `typescriptreact`.
@@ -143,18 +173,14 @@ pub struct LspState {
     slots: HashMap<ServerKind, Slot>,
     pending: HashMap<i64, PendingRequest>,
     diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
-    /// Initial workspace root URI, sent with every initialize. `None` when
-    /// the app launched without a file (or with an unsaved path).
-    workspace_root: Option<Url>,
 }
 
 impl LspState {
-    pub fn new(workspace_root: Option<Url>) -> Self {
+    pub fn new() -> Self {
         Self {
             slots: HashMap::new(),
             pending: HashMap::new(),
             diagnostics: HashMap::new(),
-            workspace_root,
         }
     }
 
@@ -181,29 +207,41 @@ impl LspState {
         c
     }
 
-    /// Spawn the server for `lang` if it isn't running yet. Returns `Ok`
-    /// even when spawning fails (e.g. binary not on PATH) — in that case
-    /// the server is silently absent and downstream operations no-op.
-    pub fn ensure_server(&mut self, lang: Language) -> Option<ServerKind> {
+    /// Spawn the server for `lang` if it isn't running yet, rooted at the
+    /// project containing `hint_path` (walks up looking for Cargo.toml /
+    /// package.json / tsconfig.json / etc.). Returns the server kind on
+    /// success, `None` when no server is wired or when spawning the binary
+    /// failed (e.g. not on PATH — feature silently disables).
+    pub fn ensure_server(&mut self, lang: Language, hint_path: &Path) -> Option<ServerKind> {
         let kind = ServerKind::for_language(lang)?;
         if self.slots.contains_key(&kind) {
             return Some(kind);
         }
+        let root = find_project_root(hint_path);
+        let root_uri = root.as_deref().and_then(|p| Url::from_file_path(p).ok());
+        log::info!(
+            "LSP: starting {kind:?} for {} with root {}",
+            hint_path.display(),
+            root.as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none>".into()),
+        );
         let (cmd, args) = kind.command();
         let mut client = match LspClient::spawn(cmd, &args) {
             Ok(c) => c,
             Err(e) => {
-                log::info!("LSP: could not spawn {cmd}: {e} — feature disabled for {kind:?}");
+                log::warn!("LSP: could not spawn {cmd}: {e} — feature disabled for {kind:?}");
                 return None;
             }
         };
-        let init_id = match client.initialize(self.workspace_root.clone()) {
+        let init_id = match client.initialize(root_uri) {
             Ok(id) => id,
             Err(e) => {
                 log::warn!("LSP: initialize write failed for {kind:?}: {e}");
                 return None;
             }
         };
+        log::info!("LSP: {kind:?} initialize sent (id={init_id})");
         self.slots.insert(
             kind,
             Slot {
@@ -224,7 +262,7 @@ impl LspState {
         let Some(uri) = path_to_uri(path) else {
             return;
         };
-        let Some(kind) = self.ensure_server(lang) else {
+        let Some(kind) = self.ensure_server(lang, path) else {
             return;
         };
         let Some(slot) = self.slots.get_mut(&kind) else {
@@ -232,6 +270,10 @@ impl LspState {
         };
         let lang_id = language_id(lang);
         if !slot.initialized {
+            // Queue the open — actual didOpen flush happens once we receive
+            // the initialize response. Replace any earlier queued entry for
+            // the same URI so we don't ship stale text.
+            slot.pending_opens.retain(|o| o.uri != uri);
             slot.pending_opens.push(PendingOpen {
                 uri,
                 lang_id,
@@ -241,6 +283,7 @@ impl LspState {
             return;
         }
         if slot.open_uris.insert(uri.clone()) {
+            log::info!("LSP: didOpen {kind:?} {} (v{version})", path.display());
             if let Err(e) = slot.client.did_open(uri, lang_id, version, text) {
                 log::warn!("LSP: didOpen failed for {kind:?}: {e}");
             }
@@ -255,17 +298,20 @@ impl LspState {
         let Some(slot) = self.slots.get_mut(&kind) else {
             return;
         };
-        if !slot.open_uris.contains(&uri) {
-            // didOpen first: catches the case where init was still
-            // pending when the doc opened.
-            slot.open_uris.insert(uri.clone());
-            if let Err(e) =
-                slot.client
-                    .did_open(uri.clone(), language_id(lang), version, text.clone())
-            {
-                log::warn!("LSP: didOpen (deferred) failed for {kind:?}: {e}");
-                return;
+        if !slot.initialized {
+            // Server is still handshaking. Refresh the queued didOpen with
+            // the latest text so the post-init flush ships fresh content
+            // instead of whatever the doc looked like at first didOpen.
+            if let Some(po) = slot.pending_opens.iter_mut().find(|o| o.uri == uri) {
+                po.version = version;
+                po.text = text;
             }
+            return;
+        }
+        if !slot.open_uris.contains(&uri) {
+            // didOpen never reached this server for this URI — likely a
+            // language we don't sync. Skip silently.
+            return;
         }
         if let Err(e) = slot.client.did_change_full(uri, version, text) {
             log::warn!("LSP: didChange failed for {kind:?}: {e}");
@@ -412,6 +458,11 @@ impl LspState {
                     if let Some(params) = n.params {
                         if let Ok(p) = serde_json::from_value::<PublishDiagnosticsParams>(params) {
                             if let Ok(path) = p.uri.to_file_path() {
+                                log::info!(
+                                    "LSP {kind:?} publishDiagnostics {} ({} item(s))",
+                                    path.display(),
+                                    p.diagnostics.len(),
+                                );
                                 diagnostics.insert(path.clone(), p.diagnostics);
                                 events.push(LspEvent::DiagnosticsUpdated { path });
                             }
@@ -425,14 +476,24 @@ impl LspState {
             Message::Response(r) => {
                 let Some(id) = r.id.as_i64() else { return };
                 if id == slot.init_id {
+                    log::info!("LSP {kind:?} initialize response received");
                     slot.initialized = true;
                     let _ = slot.client.initialized();
-                    // Flush any queued didOpens.
-                    for op in std::mem::take(&mut slot.pending_opens) {
+                    let queued = std::mem::take(&mut slot.pending_opens);
+                    log::info!("LSP {kind:?} flushing {} queued didOpen(s)", queued.len());
+                    for op in queued {
                         if slot.open_uris.insert(op.uri.clone()) {
-                            let _ = slot
+                            let path_str = op.uri.path().to_string();
+                            log::info!(
+                                "LSP {kind:?} didOpen (post-init) {path_str} v{}",
+                                op.version
+                            );
+                            if let Err(e) = slot
                                 .client
-                                .did_open(op.uri, op.lang_id, op.version, op.text);
+                                .did_open(op.uri, op.lang_id, op.version, op.text)
+                            {
+                                log::warn!("LSP {kind:?} didOpen flush failed: {e}");
+                            }
                         }
                     }
                     return;
@@ -534,7 +595,7 @@ mod tests {
 
     #[test]
     fn diagnostic_counts_sum_by_severity() {
-        let mut state = LspState::new(None);
+        let mut state = LspState::new();
         let path = PathBuf::from("/tmp/x.rs");
         state.diagnostics.insert(
             path,
@@ -560,10 +621,19 @@ mod tests {
     }
 
     #[test]
+    fn find_project_root_walks_up_to_a_marker() {
+        // Use this crate's own layout: src/lsp.rs sits under crates/app/,
+        // which contains Cargo.toml. Walking up should find it.
+        let here = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lsp.rs");
+        let root = find_project_root(&here).expect("Cargo.toml exists upward");
+        assert!(root.join("Cargo.toml").is_file());
+    }
+
+    #[test]
     fn missing_server_silently_skips() {
         // A pristine state with no spawned servers shouldn't panic when we
         // try to send didChange — it just no-ops.
-        let mut state = LspState::new(None);
+        let mut state = LspState::new();
         state.did_change(
             Path::new("/tmp/x.rs"),
             Language::Rust,

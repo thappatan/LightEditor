@@ -831,14 +831,6 @@ impl State {
             "",
         );
 
-        // LSP rooted at the initial file's parent directory when possible —
-        // multi-root + per-workspace promotion is a follow-up (spec §4.1.5).
-        let workspace_root = doc
-            .file_path
-            .as_deref()
-            .and_then(|p| p.parent())
-            .and_then(editor_lsp_client::path_to_uri);
-
         let mut state = Self {
             window,
             gpu,
@@ -879,7 +871,7 @@ impl State {
             last_interaction: Instant::now(),
             flash_proxy,
             lsp_doc_version: HashMap::new(),
-            lsp: LspState::new(workspace_root),
+            lsp: LspState::new(),
             hover_popup: None,
             hover_text,
             tab_spaces,

@@ -1,18 +1,22 @@
 //! Subprocess wrapper around one language-server stdio pair.
 //!
-//! The client spawns the server, hands its stdout to a background thread
-//! that frames JSON-RPC messages onto a channel, and keeps stdin behind a
-//! mutex for outgoing writes. Callers send notifications and requests via
-//! [`send_notification`](LspClient::send_notification) /
-//! [`send_request`](LspClient::send_request), and drain incoming messages
-//! at their leisure via [`try_recv`](LspClient::try_recv).
+//! The client spawns the server with three background threads:
+//! - a **reader** thread that frames incoming JSON-RPC messages from
+//!   stdout onto an `mpsc::Receiver` the host drains at its leisure;
+//! - a **writer** thread that consumes outgoing messages from an
+//!   `mpsc::Sender` and writes them framed to stdin.
+//!
+//! Decoupling writes from the host's render thread is what keeps keystroke
+//! latency low: a full-document `didChange` on a large buffer can exceed
+//! the OS pipe buffer (~64KB on macOS) and block the writer until the
+//! server drains it. Without the writer thread, that block runs on the
+//! UI thread.
 
 use std::ffi::OsString;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 
 use lsp_types::{
@@ -36,18 +40,22 @@ use crate::jsonrpc::{self, Message};
 
 /// One running language-server process plus its stdio plumbing.
 ///
-/// The server's stdout is consumed on a dedicated thread; stdin writes
-/// happen on the caller's thread, serialized through a `Mutex`. Dropping
-/// the client kills the child — graceful shutdown should go through
-/// [`shutdown`](LspClient::shutdown) and [`exit_notification`](LspClient::exit_notification)
-/// first.
+/// Reads and writes run on dedicated background threads; the host thread
+/// only pushes outgoing messages onto a channel (cheap and non-blocking)
+/// and drains incoming messages via [`try_recv`](LspClient::try_recv).
+/// Dropping the client kills the child — graceful shutdown should go
+/// through [`shutdown`](LspClient::shutdown) and
+/// [`exit_notification`](LspClient::exit_notification) first.
 pub struct LspClient {
     child: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
+    /// Outgoing-message channel. The writer thread on the other end frames
+    /// each value and writes it to the server's stdin.
+    outgoing: Sender<Value>,
     incoming: Receiver<Message>,
-    /// JoinHandle is kept so the reader thread is dropped (and joined-best-
-    /// effort via the channel's hang-up) on `LspClient::drop`.
+    /// JoinHandles are kept so the threads are dropped (and joined-best-
+    /// effort via the channels' hang-up) on `LspClient::drop`.
     _reader: JoinHandle<()>,
+    _writer: JoinHandle<()>,
     /// Monotonic request-id counter. JSON-RPC ids can be strings or numbers;
     /// we use numbers for simplicity.
     next_id: i64,
@@ -58,16 +66,27 @@ impl LspClient {
     /// stdout. `stderr` is inherited (so server diagnostics show up in the
     /// host process's stderr / logs).
     pub fn spawn<S: Into<OsString>>(command: S, args: &[&str]) -> io::Result<Self> {
-        let mut child = Command::new(command.into())
+        let cmd_name = {
+            let s: OsString = command.into();
+            s
+        };
+        log::info!(
+            "LSP: spawning {:?} with args {:?}",
+            cmd_name.to_string_lossy(),
+            args
+        );
+        let mut child = Command::new(&cmd_name)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
-        let stdin = child.stdin.take().expect("stdin was piped");
+        let mut stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
 
-        let (tx, rx) = mpsc::channel::<Message>();
+        let (in_tx, in_rx) = mpsc::channel::<Message>();
+        let (out_tx, out_rx) = mpsc::channel::<Value>();
+
         let reader = std::thread::Builder::new()
             .name("lsp-client-reader".into())
             .spawn(move || {
@@ -75,7 +94,7 @@ impl LspClient {
                 loop {
                     match jsonrpc::read_message(&mut r) {
                         Ok(Some(msg)) => {
-                            if tx.send(msg).is_err() {
+                            if in_tx.send(msg).is_err() {
                                 break; // main side dropped the receiver
                             }
                         }
@@ -87,11 +106,26 @@ impl LspClient {
                     }
                 }
             })?;
+
+        let writer = std::thread::Builder::new()
+            .name("lsp-client-writer".into())
+            .spawn(move || {
+                while let Ok(body) = out_rx.recv() {
+                    if let Err(e) = jsonrpc::write_message(&mut stdin, &body) {
+                        log::warn!("LSP write error: {e}");
+                        break;
+                    }
+                }
+                // Best-effort: flush any pending bytes before the FD is dropped.
+                let _ = stdin.flush();
+            })?;
+
         Ok(Self {
             child,
-            stdin: Arc::new(Mutex::new(stdin)),
-            incoming: rx,
+            outgoing: out_tx,
+            incoming: in_rx,
             _reader: reader,
+            _writer: writer,
             next_id: 0,
         })
     }
@@ -118,7 +152,7 @@ impl LspClient {
             "method": method,
             "params": params,
         });
-        self.write(&body)?;
+        self.write(body)?;
         Ok(id)
     }
 
@@ -129,7 +163,7 @@ impl LspClient {
             "method": method,
             "params": params,
         });
-        self.write(&body)
+        self.write(body)
     }
 
     /// Send a response to a server-initiated request. The server may ask
@@ -140,12 +174,19 @@ impl LspClient {
             "id": id,
             "result": result,
         });
-        self.write(&body)
+        self.write(body)
     }
 
-    fn write(&self, body: &Value) -> io::Result<()> {
-        let mut stdin = self.stdin.lock().expect("stdin mutex");
-        jsonrpc::write_message(&mut *stdin, body)
+    fn write(&self, body: Value) -> io::Result<()> {
+        // Push to the writer thread's channel — returns immediately even
+        // for a multi-megabyte payload, since the channel is unbounded.
+        // Error means the writer thread has exited (server crash).
+        self.outgoing.send(body).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "LSP writer thread is gone (server probably crashed)",
+            )
+        })
     }
 
     // ── high-level LSP convenience wrappers ───────────────────────────────
