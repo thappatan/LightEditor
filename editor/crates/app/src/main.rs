@@ -14,6 +14,7 @@ mod document;
 mod file_tree;
 mod find;
 mod find_in_files;
+mod flutter;
 mod git;
 mod lsp;
 mod palette;
@@ -56,7 +57,7 @@ use winit::window::{Window, WindowId};
 
 /// Cross-thread events posted into the winit event loop from background
 /// helpers — file watcher, flash-clear timer, caret-blink timer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum AppEvent {
     /// `settings.toml` (user or workspace) changed on disk; reload and reapply.
     SettingsChanged,
@@ -82,6 +83,10 @@ enum AppEvent {
     /// event; the handler does a `reload_preserving_expansion()` and
     /// refreshes the shaped sidebar text.
     FileTreeChanged,
+    /// `flutter devices --machine` finished in the background; the
+    /// payload is the parsed device list (empty on any failure so
+    /// the host's "no devices" branch fires).
+    FlutterDevicesRefreshed(Vec<flutter::FlutterDevice>),
 }
 
 /// How long a "settings reloaded" flash stays on the status bar.
@@ -300,6 +305,11 @@ const PALETTE_WIDTH_DIP: f32 = 600.0;
 const PALETTE_TOP_DIP: f32 = 80.0;
 /// Padding inside the palette panel, in logical pixels.
 const PALETTE_PAD_DIP: f32 = 12.0;
+/// Maximum number of command rows rendered at once. Beyond this, the
+/// palette scrolls under arrow-key navigation. Picked so the popup
+/// stays comfortably above the editor's mid-screen on a typical
+/// 1080p / 1440p window.
+const PALETTE_VISIBLE_ROWS: usize = 12;
 
 /// Find-bar overlay dimensions (single-row), in logical pixels.
 const FIND_WIDTH_DIP: f32 = 480.0;
@@ -1047,6 +1057,26 @@ struct State {
     /// any edit to package.json too, since the watcher covers the
     /// whole root). Empty when no manifest is present.
     npm_scripts: Vec<scripts::NpmScript>,
+    /// Flutter project (pubspec.yaml with `flutter:` SDK dependency)
+    /// detected in the workspace root. `Some` ⇒ the palette gets
+    /// `Flutter: Run / Hot Reload / Hot Restart / Stop` entries and
+    /// the dispatch handlers know which CLI to drive.
+    flutter_project: Option<flutter::FlutterProject>,
+    /// `true` between `Flutter: Run` and `Flutter: Stop` — i.e. when
+    /// the editor thinks a `flutter run` session is alive in the
+    /// terminal pane. Drives save-triggered hot reload and the
+    /// status-bar "Flutter: running" indicator. We don't introspect
+    /// the terminal output to confirm; the flag tracks the user's
+    /// last *explicit* action, which is right ~95% of the time and
+    /// recoverable by another palette command.
+    flutter_session_active: bool,
+    /// Cached list of `flutter devices --machine` output, populated
+    /// by a background thread on startup and refreshed after each
+    /// Flutter palette command. Drives the per-device picker in the
+    /// command palette. Empty when flutter isn't installed, no
+    /// devices are connected, or the refresh is still in flight on
+    /// first launch.
+    flutter_devices: Vec<flutter::FlutterDevice>,
     /// Find-in-files overlay (M3). `Some` while the panel is open;
     /// `None` once the user dismisses it. Re-opening builds a fresh
     /// state — there's no value in remembering an old query.
@@ -1126,10 +1156,15 @@ impl State {
             None => Document::new_scratch(initial_text),
         };
 
-        let palette_width = (PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale;
+        // Palette rows must not soft-wrap — a long entry (e.g.
+        // `Flutter: Run on iPhone · ios (<long-uuid>)`) breaking
+        // onto a second visible line would split one logical row
+        // into two, and the selection highlight + index → row math
+        // would disagree by one. The panel's `TextBounds` clips the
+        // overflow horizontally; the user sees a truncated label.
         let palette_text = TextStack::new(
             &mut font_system,
-            palette_width,
+            NO_WRAP_WIDTH_PX,
             font_size_pt,
             line_height_pt,
             scale,
@@ -1284,6 +1319,7 @@ impl State {
             spawn_file_tree_watcher(&file_tree.root, hidden_dirs, flash_proxy.clone());
         let workspace_git_status = git::compute_workspace_status(&file_tree.root);
         let npm_scripts = scripts::read_scripts(&file_tree.root);
+        let flutter_project = flutter::detect_flutter(&file_tree.root);
 
         let mut state = Self {
             window,
@@ -1339,6 +1375,9 @@ impl State {
             _file_tree_watcher: file_tree_watcher,
             workspace_git_status,
             npm_scripts,
+            flutter_project,
+            flutter_session_active: false,
+            flutter_devices: Vec::new(),
             find_in_files: None,
             find_in_files_text,
             terminal: None,
@@ -1357,6 +1396,13 @@ impl State {
         // Introduce the initial document to its LSP server (no-op when
         // there is no file path or no server for its language).
         state.lsp_did_open_doc(0);
+        // If this is a Flutter workspace, kick off a background
+        // `flutter devices --machine` so the per-device entries are
+        // ready by the time the user opens the palette. The fetch
+        // takes ~1–3 s; doing it in a thread keeps startup snappy.
+        if state.flutter_project.is_some() {
+            state.refresh_flutter_devices_async();
+        }
         state
     }
 
@@ -1448,8 +1494,8 @@ impl State {
         self.text.set_scale(fs, scale);
         self.text.set_width(fs, surface_w - self.text_padding);
         self.palette_text.set_scale(fs, scale);
-        self.palette_text
-            .set_width(fs, (PALETTE_WIDTH_DIP - 2.0 * PALETTE_PAD_DIP) * scale);
+        // No wrap — see palette_text construction comment.
+        self.palette_text.set_width(fs, NO_WRAP_WIDTH_PX);
         self.find_text.set_scale(fs, scale);
         self.find_text
             .set_width(fs, (FIND_WIDTH_DIP - 2.0 * FIND_PAD_DIP) * scale);
@@ -3099,6 +3145,34 @@ impl State {
         self.npm_scripts = scripts::read_scripts(&self.file_tree.root);
     }
 
+    /// Re-detect whether the workspace is a Flutter project. Pubspec
+    /// edits (a Flutter SDK dep getting added or removed) flow through
+    /// `FileTreeChanged` just like package.json does.
+    fn refresh_flutter_project(&mut self) {
+        self.flutter_project = flutter::detect_flutter(&self.file_tree.root);
+        // A pubspec edit can also flip a workspace into a Flutter
+        // project (`flutter create .`) — kick off a device refresh
+        // when that happens so the palette is ready next open.
+        if self.flutter_project.is_some() {
+            self.refresh_flutter_devices_async();
+        } else {
+            self.flutter_devices.clear();
+        }
+    }
+
+    /// Spawn a background thread that runs `flutter devices --machine`
+    /// and posts the result back through the event loop. The fetch
+    /// takes 1–3 seconds typically; doing it asynchronously keeps the
+    /// palette snappy. Safe to fire multiple times in flight — the
+    /// last refresh to arrive wins.
+    fn refresh_flutter_devices_async(&self) {
+        let proxy = self.flash_proxy.clone();
+        std::thread::spawn(move || {
+            let devices = flutter::list_devices();
+            let _ = proxy.send_event(AppEvent::FlutterDevicesRefreshed(devices));
+        });
+    }
+
     /// Rebuild the file-tree text stack from the current node list.
     /// Indents nest visually via leading spaces; the marker `▾`/`▸`
     /// distinguishes expanded vs collapsed directories; files get a
@@ -3759,6 +3833,7 @@ impl State {
             Ok(()) => {
                 log::info!("saved {}", path.display());
                 let label = filename_for_flash(&path);
+                let auto_reload = self.should_auto_hot_reload(&path);
                 {
                     let d = self.doc_mut();
                     d.file_path = Some(path);
@@ -3766,7 +3841,19 @@ impl State {
                 }
                 self.update_title();
                 self.refresh_tabs_text();
-                self.set_status_flash(format!("saved · {label}"));
+                if auto_reload {
+                    // VSCode-style: a save of a .dart file with a
+                    // live `flutter run` session triggers hot reload
+                    // automatically. The terminal pane stays where
+                    // it is (no focus change); the user sees the
+                    // status bar flash, the app updates in seconds.
+                    if let Some(t) = self.terminal.as_ref() {
+                        t.write(b"r" as &[u8]);
+                    }
+                    self.set_status_flash(format!("saved · {label} · hot reload"));
+                } else {
+                    self.set_status_flash(format!("saved · {label}"));
+                }
                 // First save of an untitled doc: introduce it to the LSP
                 // server now that it has a path. Subsequent saves are a
                 // plain didSave.
@@ -4093,8 +4180,18 @@ impl State {
         let left = flash.unwrap_or_else(|| {
             format!("{label}  ·  {language}  ·  Spaces: {indent}  ·  {le}{diag_suffix}")
         });
+        // Flutter session indicator on the right half so it's visible
+        // alongside the caret position. Mirrors VSCode's debug bar
+        // hint — "running" while a `flutter run` is active, gone
+        // afterwards. Keeps the user oriented on whether Cmd-S will
+        // trigger an automatic hot reload.
+        let flutter_prefix = if self.flutter_session_active {
+            "Flutter: running  ·  "
+        } else {
+            ""
+        };
         let right = format!(
-            "{find_prefix}Ln {}, Col {}  ·  {} lines",
+            "{flutter_prefix}{find_prefix}Ln {}, Col {}  ·  {} lines",
             pos.line + 1,
             pos.column + 1,
             lines
@@ -4593,6 +4690,42 @@ impl State {
                 label: format!("Run script: {}", script.name),
             });
         }
+        if self.flutter_project.is_some() {
+            // With a cached device list, surface one Run entry per
+            // device so the user can target a specific phone /
+            // emulator / browser without typing the id. Without a
+            // cached list (initial launch, flutter binary missing,
+            // refresh still in flight) fall back to the bare
+            // `Flutter: Run` which lets Flutter pick the default.
+            if self.flutter_devices.is_empty() {
+                entries.push(CommandEntry::builtin(CommandId::FlutterRun));
+            } else {
+                for dev in &self.flutter_devices {
+                    // Keep the label short — the device id (often a
+                    // 32-char UUID) is internal; the user picks by
+                    // name + platform. Emulators get a trailing
+                    // " (emulator)" hint because that's the only
+                    // distinction that matters at pick time when a
+                    // real phone of the same name is also attached.
+                    let suffix = if dev.emulator { " (emulator)" } else { "" };
+                    let label = if dev.target_platform.is_empty() {
+                        format!("Flutter: Run on {}{}", dev.name, suffix)
+                    } else {
+                        format!(
+                            "Flutter: Run on {} · {}{}",
+                            dev.name, dev.target_platform, suffix
+                        )
+                    };
+                    entries.push(CommandEntry {
+                        id: CommandId::FlutterRunOnDevice(dev.id.clone()),
+                        label,
+                    });
+                }
+            }
+            entries.push(CommandEntry::builtin(CommandId::FlutterHotReload));
+            entries.push(CommandEntry::builtin(CommandId::FlutterHotRestart));
+            entries.push(CommandEntry::builtin(CommandId::FlutterStop));
+        }
         self.palette = Some(CommandPalette::new(entries));
         self.refresh_palette_text();
         self.scene_dirty = true;
@@ -4616,7 +4749,11 @@ impl State {
         text.push_str("❯ ");
         text.push_str(palette.query());
         text.push_str("\n\n");
-        for label in palette.visible_labels() {
+        // Render only the rows currently scrolled into view. Caps the
+        // popup at PALETTE_VISIBLE_ROWS so a long list (Flutter
+        // devices + Themes + Run scripts) stays inside the window
+        // instead of falling off the bottom.
+        for label in palette.windowed_labels(PALETTE_VISIBLE_ROWS) {
             text.push_str("  ");
             text.push_str(label);
             text.push('\n');
@@ -4631,6 +4768,7 @@ impl State {
             Key::Named(NamedKey::ArrowUp) => {
                 if let Some(p) = self.palette.as_mut() {
                     p.prev();
+                    p.scroll_into_view(PALETTE_VISIBLE_ROWS);
                 }
                 self.refresh_palette_text();
                 self.scene_dirty = true;
@@ -4639,6 +4777,7 @@ impl State {
             Key::Named(NamedKey::ArrowDown) => {
                 if let Some(p) = self.palette.as_mut() {
                     p.next();
+                    p.scroll_into_view(PALETTE_VISIBLE_ROWS);
                 }
                 self.refresh_palette_text();
                 self.scene_dirty = true;
@@ -4712,7 +4851,76 @@ impl State {
             }
             CommandId::BrowseThemes => self.browse_themes(),
             CommandId::RunScript(name) => self.run_npm_script(&name),
+            CommandId::FlutterRun => {
+                self.flutter_session_active = true;
+                self.flutter_send(b"flutter run\n", "flutter run");
+                self.refresh_flutter_devices_async();
+            }
+            CommandId::FlutterRunOnDevice(id) => {
+                self.flutter_session_active = true;
+                self.flutter_run_on_device(&id);
+                self.refresh_flutter_devices_async();
+            }
+            CommandId::FlutterHotReload => self.flutter_send(b"r", "flutter: hot reload"),
+            CommandId::FlutterHotRestart => self.flutter_send(b"R", "flutter: hot restart"),
+            CommandId::FlutterStop => {
+                self.flutter_session_active = false;
+                self.flutter_send(b"q", "flutter: stop");
+                self.refresh_flutter_devices_async();
+            }
         }
+    }
+
+    /// Write `bytes` to the embedded terminal, opening + focusing the
+    /// pane first if it's hidden. Used by every `Flutter:` command —
+    /// `flutter run\n` to start a session, the bare `r`/`R`/`q` keys
+    /// to drive an already-running session through the standard
+    /// Flutter CLI shortcuts. `label` is flashed to the status bar
+    /// so the user sees their action without flipping to the pane.
+    fn flutter_send(&mut self, bytes: &'static [u8], label: &str) {
+        let needs_show = self.terminal.as_ref().map(|t| !t.visible).unwrap_or(true);
+        if needs_show {
+            self.toggle_terminal();
+        }
+        if let Some(t) = self.terminal.as_mut() {
+            t.focused = true;
+            t.write(bytes);
+        }
+        self.set_status_flash(label.to_string());
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Variant of [`flutter_send`](Self::flutter_send) that runs
+    /// `flutter run -d <id>` for the picker-selected device. Builds
+    /// the bytes per-call because the id is owned data — the static
+    /// `&[u8]` signature on `flutter_send` doesn't fit.
+    fn flutter_run_on_device(&mut self, device_id: &str) {
+        let needs_show = !self.terminal.as_ref().is_some_and(|t| t.visible);
+        if needs_show {
+            self.toggle_terminal();
+        }
+        let cmd = format!("flutter run -d {device_id}\n");
+        if let Some(t) = self.terminal.as_mut() {
+            t.focused = true;
+            t.write(cmd.into_bytes());
+        }
+        self.set_status_flash(format!("flutter run -d {device_id}"));
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// `true` when a Flutter session is active AND the just-saved
+    /// document is a `.dart` file. Used by `save_to_file` to mirror
+    /// VSCode's save-triggers-hot-reload UX. The pane stays out of
+    /// the user's way otherwise — saves to non-Dart files don't
+    /// disturb a running session.
+    fn should_auto_hot_reload(&self, saved: &Path) -> bool {
+        self.flutter_session_active
+            && saved
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("dart"))
     }
 
     /// Run `<package_manager> run <name>\n` in the embedded terminal,
@@ -5016,7 +5224,7 @@ impl State {
         let rows = self
             .palette
             .as_ref()
-            .map(|p| p.visible_count())
+            .map(|p| p.visible_count().min(PALETTE_VISIBLE_ROWS))
             .unwrap_or(0);
         let inner_height = (2 + rows) as f32 * lh;
         let height = inner_height + 2.0 * pad;
@@ -5033,12 +5241,10 @@ impl State {
 
     fn palette_selection_rect(&self) -> Option<Rect> {
         let palette = self.palette.as_ref()?;
-        if palette.visible_count() == 0 {
-            return None;
-        }
+        let row = palette.selected_row_windowed(PALETTE_VISIBLE_ROWS)?;
         let lh = self.line_height();
         let (_ox, oy) = self.palette_text_origin();
-        let row_y = oy + (2 + palette.selected_row()) as f32 * lh;
+        let row_y = oy + (2 + row) as f32 * lh;
         let panel = self.palette_panel_rect();
         let pad = PALETTE_PAD_DIP * self.scale;
         Some(Rect::new(
@@ -6865,6 +7071,19 @@ impl ApplicationHandler<AppEvent> for App {
                     state.window.request_redraw();
                 }
             }
+            AppEvent::FlutterDevicesRefreshed(devices) => {
+                if let Some(state) = self.state.as_mut() {
+                    state.flutter_devices = devices;
+                    // Only re-shape if the palette is actively showing
+                    // — opening it always rebuilds from current state,
+                    // so a closed palette just picks up the new list
+                    // on the next open.
+                    if state.palette.is_some() {
+                        state.scene_dirty = true;
+                        state.window.request_redraw();
+                    }
+                }
+            }
             AppEvent::FileTreeChanged => {
                 if let Some(state) = self.state.as_mut() {
                     state.file_tree.reload_preserving_expansion();
@@ -6880,6 +7099,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // pay it on every wakeup rather than thread a
                     // package.json-specific watcher.
                     state.refresh_npm_scripts();
+                    state.refresh_flutter_project();
                     // Only re-shape the row labels if the sidebar is
                     // visible — invisible reloads silently keep the
                     // tree warm so it pops up fresh on next Cmd-B.
