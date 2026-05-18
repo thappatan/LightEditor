@@ -231,6 +231,71 @@ pub fn compute_workspace_status(root: &Path) -> HashMap<PathBuf, FileGitStatus> 
     out
 }
 
+/// Bubble file-level statuses up to their ancestor directories so the
+/// file-tree sidebar can decorate parent rows with the most severe
+/// status anywhere underneath them. Each returned directory holds the
+/// highest-priority status of any file that descends from it; priority
+/// is `Conflicted > Modified > Added > Deleted > Untracked` (matches
+/// the urgency the user wants to see first).
+///
+/// `stop_at` is the workspace root — climbing past it would bubble
+/// statuses into the user's home directory, which isn't useful.
+pub fn aggregate_dirs(
+    files: &HashMap<PathBuf, FileGitStatus>,
+    stop_at: &Path,
+) -> HashMap<PathBuf, FileGitStatus> {
+    let stop = stop_at
+        .canonicalize()
+        .unwrap_or_else(|_| stop_at.to_path_buf());
+    let mut dirs: HashMap<PathBuf, FileGitStatus> = HashMap::new();
+    for (path, &file_status) in files {
+        let mut current = path.parent();
+        while let Some(dir) = current {
+            // Don't bubble past the workspace root.
+            if dir == stop {
+                if let Some(existing) = dirs.get(dir).copied() {
+                    dirs.insert(dir.to_path_buf(), max_priority(existing, file_status));
+                } else {
+                    dirs.insert(dir.to_path_buf(), file_status);
+                }
+                break;
+            }
+            // Path went out of the workspace tree entirely (rare with
+            // canonicalised inputs but possible across symlinks).
+            if !dir.starts_with(&stop) {
+                break;
+            }
+            let merged = match dirs.get(dir).copied() {
+                Some(existing) => max_priority(existing, file_status),
+                None => file_status,
+            };
+            dirs.insert(dir.to_path_buf(), merged);
+            current = dir.parent();
+        }
+    }
+    dirs
+}
+
+/// Pick the higher-priority status. See [`aggregate_dirs`] for the
+/// ranking rationale.
+fn max_priority(a: FileGitStatus, b: FileGitStatus) -> FileGitStatus {
+    if priority_rank(a) >= priority_rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
+fn priority_rank(s: FileGitStatus) -> u8 {
+    match s {
+        FileGitStatus::Conflicted => 5,
+        FileGitStatus::Modified => 4,
+        FileGitStatus::Added => 3,
+        FileGitStatus::Deleted => 2,
+        FileGitStatus::Untracked => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +465,74 @@ mod tests {
         let map = compute_workspace_status(&tmp);
         assert!(map.is_empty());
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    fn root_with_paths(
+        layout: &[(&str, FileGitStatus)],
+    ) -> (PathBuf, HashMap<PathBuf, FileGitStatus>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let pid = std::process::id();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("editor-app-git-agg-{pid}-{n}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let mut map = HashMap::new();
+        for (rel, status) in layout {
+            let full = root.join(rel);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&full, "").unwrap();
+            map.insert(full, *status);
+        }
+        (root, map)
+    }
+
+    #[test]
+    fn aggregate_bubbles_status_to_parents() {
+        let (root, files) = root_with_paths(&[
+            ("src/lib.rs", FileGitStatus::Modified),
+            ("src/inner/deep.rs", FileGitStatus::Untracked),
+        ]);
+        let dirs = aggregate_dirs(&files, &root);
+        // Both `src/` and `src/inner/` carry a marker. The root's
+        // parent ("src/") wins on priority — Modified > Untracked.
+        assert_eq!(dirs.get(&root.join("src")), Some(&FileGitStatus::Modified));
+        assert_eq!(
+            dirs.get(&root.join("src/inner")),
+            Some(&FileGitStatus::Untracked),
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn aggregate_picks_highest_priority_across_siblings() {
+        // Conflict > Modified > Added > Deleted > Untracked.
+        let (root, files) = root_with_paths(&[
+            ("crate/a.rs", FileGitStatus::Untracked),
+            ("crate/b.rs", FileGitStatus::Modified),
+            ("crate/c.rs", FileGitStatus::Conflicted),
+            ("crate/d.rs", FileGitStatus::Added),
+        ]);
+        let dirs = aggregate_dirs(&files, &root);
+        assert_eq!(
+            dirs.get(&root.join("crate")),
+            Some(&FileGitStatus::Conflicted),
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn aggregate_does_not_bubble_past_root() {
+        let (root, files) = root_with_paths(&[("a.rs", FileGitStatus::Modified)]);
+        let dirs = aggregate_dirs(&files, &root);
+        // Only the root itself (where a.rs lives) appears; no entry
+        // for the root's *parent* (the temp dir).
+        assert!(dirs.contains_key(&root));
+        if let Some(parent) = root.parent() {
+            assert!(!dirs.contains_key(parent));
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 }
