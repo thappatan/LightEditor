@@ -36,6 +36,23 @@ pub enum CommandId {
     /// The string is the bare script name (the host already knows the
     /// package manager and the workspace root).
     RunScript(String),
+    /// Start `flutter run` in the embedded terminal (auto-opens the
+    /// pane). Surfaces only when the workspace has a Flutter pubspec
+    /// *and* the editor doesn't have a cached device list yet —
+    /// with devices known, the palette surfaces one
+    /// [`FlutterRunOnDevice`](Self::FlutterRunOnDevice) entry per
+    /// device instead.
+    FlutterRun,
+    /// Start `flutter run -d <id>` for the device named by the
+    /// payload. Built dynamically from `flutter devices --machine`.
+    FlutterRunOnDevice(String),
+    /// Send `r` to the focused terminal — Flutter's hot-reload key.
+    /// Assumes a `flutter run` session is currently at the prompt.
+    FlutterHotReload,
+    /// Send `R` for a full Flutter hot-restart.
+    FlutterHotRestart,
+    /// Send `q` to ask `flutter run` to quit cleanly.
+    FlutterStop,
 }
 
 /// One entry shown in the palette. `id` drives dispatch; `label` is what
@@ -67,6 +84,11 @@ impl CommandEntry {
             CommandId::ThemeTokyoNight => "Theme: Tokyo Night",
             CommandId::BrowseThemes => "Theme: Browse…",
             CommandId::RunScript(_) => "Run script",
+            CommandId::FlutterRun => "Flutter: Run",
+            CommandId::FlutterRunOnDevice(_) => "Flutter: Run on …",
+            CommandId::FlutterHotReload => "Flutter: Hot Reload",
+            CommandId::FlutterHotRestart => "Flutter: Hot Restart",
+            CommandId::FlutterStop => "Flutter: Stop",
         };
         Self {
             id,
@@ -107,6 +129,12 @@ pub struct CommandPalette {
     /// Index into `visible`, identifying the currently-highlighted row.
     /// Reset to 0 whenever the filter changes.
     selected: usize,
+    /// First row of `visible` shown in the rendered list. Lets the
+    /// host clamp the popup to a fixed height while still surfacing
+    /// every entry — keystrokes update `selected`, and
+    /// [`scroll_into_view`](Self::scroll_into_view) slides this
+    /// value so the highlighted row stays inside the visible band.
+    scroll: usize,
     /// Reused across re-filters — building one is more expensive than a query
     /// edit, and the matcher carries scratch buffers.
     matcher: Matcher,
@@ -123,6 +151,7 @@ impl CommandPalette {
             entries,
             visible,
             selected: 0,
+            scroll: 0,
             matcher: Matcher::new(Config::DEFAULT),
         }
     }
@@ -132,19 +161,74 @@ impl CommandPalette {
     }
 
     /// Iterator over the labels of the currently-matching entries, in
-    /// display order. Used by the renderer.
+    /// display order. Tests use this for full-list inspection;
+    /// renderers should prefer [`windowed_labels`](Self::windowed_labels)
+    /// so the popup stays a fixed height.
+    #[allow(dead_code)]
     pub fn visible_labels(&self) -> impl Iterator<Item = &str> + '_ {
         self.visible.iter().map(|&i| self.entries[i].label.as_str())
+    }
+
+    /// Iterator over the *windowed* labels — i.e. the slice currently
+    /// scrolled into view by [`scroll_into_view`]. Use this when the
+    /// renderer caps the popup at a fixed row count.
+    pub fn windowed_labels(&self, window: usize) -> impl Iterator<Item = &str> + '_ {
+        let end = (self.scroll + window).min(self.visible.len());
+        self.visible[self.scroll..end]
+            .iter()
+            .map(|&i| self.entries[i].label.as_str())
     }
 
     pub fn visible_count(&self) -> usize {
         self.visible.len()
     }
 
-    /// Zero-based row of the currently-selected command, or 0 when the
-    /// visible list is empty.
+    /// Zero-based row of the currently-selected command relative to
+    /// the *full* visible list (ignoring the scroll window). The
+    /// renderer wants
+    /// [`selected_row_windowed`](Self::selected_row_windowed) instead.
+    #[allow(dead_code)]
     pub fn selected_row(&self) -> usize {
         self.selected
+    }
+
+    /// Selected row relative to the *windowed* view, given a row cap.
+    /// Returns `None` when the selection has scrolled out of the
+    /// window (callers shouldn't paint a highlight in that case).
+    pub fn selected_row_windowed(&self, window: usize) -> Option<usize> {
+        if window == 0 || self.visible.is_empty() {
+            return None;
+        }
+        if self.selected < self.scroll || self.selected >= self.scroll + window {
+            return None;
+        }
+        Some(self.selected - self.scroll)
+    }
+
+    /// Current scroll offset (zero-based row at the top of the
+    /// windowed view). Surfaced for tests / future inspection;
+    /// renderer doesn't need it directly because windowed_labels
+    /// and selected_row_windowed already factor it in.
+    #[allow(dead_code)]
+    pub fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    /// Slide the scroll offset so the selected row sits inside the
+    /// first `window` rows. Call after every key that mutates
+    /// `selected`.
+    pub fn scroll_into_view(&mut self, window: usize) {
+        if window == 0 || self.visible.is_empty() {
+            self.scroll = 0;
+            return;
+        }
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + window {
+            self.scroll = self.selected + 1 - window;
+        }
+        let max_scroll = self.visible.len().saturating_sub(window);
+        self.scroll = self.scroll.min(max_scroll);
     }
 
     /// The currently-selected entry, or `None` if the filter matched nothing.
@@ -203,6 +287,7 @@ impl CommandPalette {
                 .collect();
         }
         self.selected = 0;
+        self.scroll = 0;
     }
 }
 
@@ -280,5 +365,39 @@ mod tests {
         // Last entry on empty-query is the script.
         let last_label = palette.visible_labels().last().expect("last entry exists");
         assert_eq!(last_label, "Run script: dev");
+    }
+
+    #[test]
+    fn scroll_keeps_selection_in_window() {
+        let mut p = builtin_palette();
+        // 15 built-in entries, window of 5 → arrow-down past the
+        // bottom should shift the scroll, not push the selection
+        // off-screen.
+        for _ in 0..7 {
+            p.next();
+            p.scroll_into_view(5);
+        }
+        assert_eq!(p.selected_row(), 7);
+        // selected (7) must sit inside [scroll, scroll+5).
+        let scroll = p.scroll();
+        assert!(scroll <= 7 && 7 < scroll + 5, "scroll={scroll}");
+        assert!(p.selected_row_windowed(5).is_some());
+    }
+
+    #[test]
+    fn windowed_labels_returns_only_visible_slice() {
+        let p = builtin_palette();
+        let labels: Vec<&str> = p.windowed_labels(5).collect();
+        assert_eq!(labels.len(), 5);
+        assert_eq!(labels[0], "New File");
+    }
+
+    #[test]
+    fn selected_row_windowed_is_none_when_scrolled_out() {
+        let mut p = builtin_palette();
+        // Force scroll past where selected is.
+        p.scroll = 5;
+        // Selected is still 0 (default) → outside [5, 5+window).
+        assert_eq!(p.selected_row_windowed(3), None);
     }
 }
