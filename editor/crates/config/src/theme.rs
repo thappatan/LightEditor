@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 pub struct Theme {
     pub editor: EditorTheme,
     pub syntax: SyntaxTheme,
+    pub terminal: TerminalTheme,
 }
 
 /// Colors for editor chrome and non-syntax surfaces.
@@ -140,6 +141,56 @@ impl Default for SyntaxTheme {
             type_: "#f0d983ff".into(),
             function: "#8ab4f8ff".into(),
             punctuation: "#a0a0b0ff".into(),
+        }
+    }
+}
+
+/// Colours for the embedded terminal pane. The 16-entry `palette` maps
+/// to the standard ANSI colour names in their numeric order:
+/// `[Black, Red, Green, Yellow, Blue, Magenta, Cyan, White,
+///   BrightBlack, BrightRed, …, BrightWhite]`. `foreground` / `background`
+/// / `cursor` are returned for the corresponding `NamedColor` sentinels
+/// programs emit when they want the pane defaults.
+///
+/// Missing fields fall back to the Tango-ish defaults that shipped
+/// hardcoded before this section landed — an existing `theme.toml`
+/// without a `[terminal]` block keeps its old look.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalTheme {
+    pub foreground: String,
+    pub background: String,
+    pub cursor: String,
+    pub palette: Vec<String>,
+}
+
+impl Default for TerminalTheme {
+    fn default() -> Self {
+        Self {
+            // Empty strings → callers fall back to the editor's own
+            // text_fg / background / caret. Keeps the pane visually
+            // continuous with the chrome when no override is supplied.
+            foreground: String::new(),
+            background: String::new(),
+            cursor: String::new(),
+            palette: vec![
+                "#000000ff".into(), // 0  Black
+                "#cc0000ff".into(), // 1  Red
+                "#4e9a06ff".into(), // 2  Green
+                "#c4a000ff".into(), // 3  Yellow
+                "#3465a4ff".into(), // 4  Blue
+                "#75507bff".into(), // 5  Magenta
+                "#06989aff".into(), // 6  Cyan
+                "#d3d7cfff".into(), // 7  White
+                "#555753ff".into(), // 8  BrightBlack
+                "#ef2929ff".into(), // 9  BrightRed
+                "#8ae234ff".into(), // 10 BrightGreen
+                "#fce94fff".into(), // 11 BrightYellow
+                "#729fcfff".into(), // 12 BrightBlue
+                "#ad7fa8ff".into(), // 13 BrightMagenta
+                "#34e2e2ff".into(), // 14 BrightCyan
+                "#eeeeecff".into(), // 15 BrightWhite
+            ],
         }
     }
 }

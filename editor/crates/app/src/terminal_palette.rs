@@ -8,11 +8,12 @@
 //! - `Indexed(u8)` — an entry in the xterm 256-colour palette;
 //! - `Spec(Rgb)` — a true-colour triple emitted by the program itself.
 //!
-//! We need to turn each into an `(r, g, b)` triple the renderer can hand
-//! to cosmic-text. The palette itself is hardcoded to a Tango-ish set
-//! (close to the macOS Terminal defaults) so this PR doesn't have to
-//! touch the theme schema — the theme integration is a separate
-//! follow-up.
+//! We need to turn each into an `(r, g, b)` triple the renderer can
+//! hand to cosmic-text. The 16-colour palette and the three pane
+//! sentinels (Foreground / Background / Cursor) come from the active
+//! [`Theme`](editor_config::Theme)'s `[terminal]` section via
+//! [`PaletteContext`]; [`DEFAULT_ANSI_16`] is kept as the Tango-ish
+//! fallback for any slot the theme leaves blank.
 
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb};
 
@@ -43,8 +44,9 @@ impl PaletteColor {
 /// The 16 named ANSI colours, in `NamedColor`'s numeric order so a
 /// `u8` cast indexes directly. Tango-ish palette — same family as the
 /// macOS Terminal "Basic" profile, tuned for legibility on a dark
-/// background.
-const ANSI_16: [PaletteColor; 16] = [
+/// background. Used as the fallback when a theme doesn't override the
+/// `[terminal]` palette entries.
+pub const DEFAULT_ANSI_16: [PaletteColor; 16] = [
     PaletteColor::new(0x00, 0x00, 0x00), // 0  Black
     PaletteColor::new(0xCC, 0x00, 0x00), // 1  Red
     PaletteColor::new(0x4E, 0x9A, 0x06), // 2  Green
@@ -63,15 +65,52 @@ const ANSI_16: [PaletteColor; 16] = [
     PaletteColor::new(0xEE, 0xEE, 0xEC), // 15 BrightWhite
 ];
 
-/// Build an xterm 256-palette entry from its index.
+/// Snapshot of every colour the cell-level [`resolve`] needs to turn
+/// an alacritty [`AnsiColor`] into RGB. Built once per
+/// `refresh_terminal_text` from the active theme so per-cell lookups
+/// stay arithmetic; bundle includes the 16 ANSI slots plus the three
+/// `Foreground` / `Background` / `Cursor` sentinels that the chrome
+/// owns.
+#[derive(Debug, Clone, Copy)]
+pub struct PaletteContext {
+    /// 16-colour palette, indexed in `NamedColor`'s numeric order.
+    pub ansi_16: [PaletteColor; 16],
+    /// Theme-owned editor text colour. Returned for `Named(Foreground)`.
+    pub default_fg: PaletteColor,
+    /// Theme-owned editor background. Returned for `Named(Background)`.
+    pub default_bg: PaletteColor,
+    /// Theme-owned caret colour. Returned for `Named(Cursor)`.
+    pub default_cursor: PaletteColor,
+}
+
+impl PaletteContext {
+    /// Convenience constructor for tests / quick callers — uses the
+    /// built-in palette and the supplied chrome sentinels.
+    #[cfg(test)]
+    pub fn with_defaults(
+        default_fg: PaletteColor,
+        default_bg: PaletteColor,
+        default_cursor: PaletteColor,
+    ) -> Self {
+        Self {
+            ansi_16: DEFAULT_ANSI_16,
+            default_fg,
+            default_bg,
+            default_cursor,
+        }
+    }
+}
+
+/// Build an xterm 256-palette entry from its index, using `palette`
+/// for the 16 named colours and a computed value for the higher slots.
 ///
-/// - `0..=15`  → the 16 named ANSI colours.
+/// - `0..=15`  → entry of `palette` at that index.
 /// - `16..=231` → 6×6×6 RGB cube. Each channel is one of six levels
 ///   `[0, 95, 135, 175, 215, 255]`.
 /// - `232..=255` → 24-step greyscale ramp from 8 to 238 in steps of 10.
-pub fn xterm_256(idx: u8) -> PaletteColor {
+pub fn xterm_256(idx: u8, palette: &[PaletteColor; 16]) -> PaletteColor {
     match idx {
-        0..=15 => ANSI_16[idx as usize],
+        0..=15 => palette[idx as usize],
         16..=231 => {
             const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
             let n = idx - 16;
@@ -89,67 +128,55 @@ pub fn xterm_256(idx: u8) -> PaletteColor {
 }
 
 /// Resolve a `NamedColor` to RGB. `Foreground` / `Background` / `Cursor`
-/// fall back to the chrome's defaults supplied by the caller — the
-/// theme owns those colours, not us.
-pub fn named_color(
-    name: NamedColor,
-    default_fg: PaletteColor,
-    default_bg: PaletteColor,
-    default_cursor: PaletteColor,
-) -> PaletteColor {
+/// fall back to the chrome defaults on `ctx`; the 16 ANSI names index
+/// into the theme's palette.
+pub fn named_color(name: NamedColor, ctx: &PaletteContext) -> PaletteColor {
+    let p = &ctx.ansi_16;
     match name {
-        // The 16 standard colours map straight through.
-        NamedColor::Black => ANSI_16[0],
-        NamedColor::Red => ANSI_16[1],
-        NamedColor::Green => ANSI_16[2],
-        NamedColor::Yellow => ANSI_16[3],
-        NamedColor::Blue => ANSI_16[4],
-        NamedColor::Magenta => ANSI_16[5],
-        NamedColor::Cyan => ANSI_16[6],
-        NamedColor::White => ANSI_16[7],
-        NamedColor::BrightBlack => ANSI_16[8],
-        NamedColor::BrightRed => ANSI_16[9],
-        NamedColor::BrightGreen => ANSI_16[10],
-        NamedColor::BrightYellow => ANSI_16[11],
-        NamedColor::BrightBlue => ANSI_16[12],
-        NamedColor::BrightMagenta => ANSI_16[13],
-        NamedColor::BrightCyan => ANSI_16[14],
-        NamedColor::BrightWhite => ANSI_16[15],
+        NamedColor::Black => p[0],
+        NamedColor::Red => p[1],
+        NamedColor::Green => p[2],
+        NamedColor::Yellow => p[3],
+        NamedColor::Blue => p[4],
+        NamedColor::Magenta => p[5],
+        NamedColor::Cyan => p[6],
+        NamedColor::White => p[7],
+        NamedColor::BrightBlack => p[8],
+        NamedColor::BrightRed => p[9],
+        NamedColor::BrightGreen => p[10],
+        NamedColor::BrightYellow => p[11],
+        NamedColor::BrightBlue => p[12],
+        NamedColor::BrightMagenta => p[13],
+        NamedColor::BrightCyan => p[14],
+        NamedColor::BrightWhite => p[15],
 
-        // Dim* variants are the matching dim colour. We don't have a
-        // dimmed palette, so reuse the bright→named lookup that vte
-        // ships and then resolve recursively. The two-step keeps the
-        // mapping in one place if we ever want to tune dim colours
-        // separately.
-        NamedColor::DimBlack => ANSI_16[0],
-        NamedColor::DimRed => ANSI_16[1],
-        NamedColor::DimGreen => ANSI_16[2],
-        NamedColor::DimYellow => ANSI_16[3],
-        NamedColor::DimBlue => ANSI_16[4],
-        NamedColor::DimMagenta => ANSI_16[5],
-        NamedColor::DimCyan => ANSI_16[6],
-        NamedColor::DimWhite => ANSI_16[7],
+        // Dim* variants reuse the matching named entry. A dedicated
+        // dim palette is a follow-up — for now `bold off; dim on`
+        // just renders the standard colour.
+        NamedColor::DimBlack => p[0],
+        NamedColor::DimRed => p[1],
+        NamedColor::DimGreen => p[2],
+        NamedColor::DimYellow => p[3],
+        NamedColor::DimBlue => p[4],
+        NamedColor::DimMagenta => p[5],
+        NamedColor::DimCyan => p[6],
+        NamedColor::DimWhite => p[7],
 
         NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::DimForeground => {
-            default_fg
+            ctx.default_fg
         }
-        NamedColor::Background => default_bg,
-        NamedColor::Cursor => default_cursor,
+        NamedColor::Background => ctx.default_bg,
+        NamedColor::Cursor => ctx.default_cursor,
     }
 }
 
-/// Resolve any [`AnsiColor`] (the cell-level enum) to an RGB triple,
-/// given the chrome defaults to use for `Named(Foreground / Background /
-/// Cursor)`. This is the only entry-point the renderer calls per cell.
-pub fn resolve(
-    color: AnsiColor,
-    default_fg: PaletteColor,
-    default_bg: PaletteColor,
-    default_cursor: PaletteColor,
-) -> PaletteColor {
+/// Resolve any [`AnsiColor`] (the cell-level enum) to an RGB triple
+/// using the theme-supplied [`PaletteContext`]. This is the only
+/// entry-point the renderer calls per cell.
+pub fn resolve(color: AnsiColor, ctx: &PaletteContext) -> PaletteColor {
     match color {
-        AnsiColor::Named(name) => named_color(name, default_fg, default_bg, default_cursor),
-        AnsiColor::Indexed(i) => xterm_256(i),
+        AnsiColor::Named(name) => named_color(name, ctx),
+        AnsiColor::Indexed(i) => xterm_256(i, &ctx.ansi_16),
         AnsiColor::Spec(rgb) => PaletteColor::from_rgb(rgb),
     }
 }
@@ -178,49 +205,89 @@ mod tests {
     fn cur() -> PaletteColor {
         PaletteColor::new(0xFF, 0x00, 0xFF)
     }
+    fn ctx() -> PaletteContext {
+        PaletteContext::with_defaults(fg(), bg(), cur())
+    }
 
     #[test]
     fn xterm_256_first_block_matches_ansi_16() {
         for i in 0..16u8 {
-            assert_eq!(xterm_256(i), ANSI_16[i as usize], "idx {i}");
+            assert_eq!(
+                xterm_256(i, &DEFAULT_ANSI_16),
+                DEFAULT_ANSI_16[i as usize],
+                "idx {i}"
+            );
         }
     }
 
     #[test]
     fn xterm_256_cube_corners() {
         // 16 = (0,0,0) — pure black corner of the cube.
-        assert_eq!(xterm_256(16), PaletteColor::new(0, 0, 0));
+        assert_eq!(xterm_256(16, &DEFAULT_ANSI_16), PaletteColor::new(0, 0, 0));
         // 231 = (255,255,255) — pure white corner.
-        assert_eq!(xterm_256(231), PaletteColor::new(255, 255, 255));
+        assert_eq!(
+            xterm_256(231, &DEFAULT_ANSI_16),
+            PaletteColor::new(255, 255, 255)
+        );
         // 21 = (0,0,255) — a single channel maxed.
-        assert_eq!(xterm_256(21), PaletteColor::new(0, 0, 255));
+        assert_eq!(
+            xterm_256(21, &DEFAULT_ANSI_16),
+            PaletteColor::new(0, 0, 255)
+        );
         // 196 = (255,0,0).
-        assert_eq!(xterm_256(196), PaletteColor::new(255, 0, 0));
+        assert_eq!(
+            xterm_256(196, &DEFAULT_ANSI_16),
+            PaletteColor::new(255, 0, 0)
+        );
         // 46 = (0,255,0).
-        assert_eq!(xterm_256(46), PaletteColor::new(0, 255, 0));
+        assert_eq!(
+            xterm_256(46, &DEFAULT_ANSI_16),
+            PaletteColor::new(0, 255, 0)
+        );
     }
 
     #[test]
     fn xterm_256_greyscale_ramp_endpoints() {
         // First grey: 232 → 8.
-        assert_eq!(xterm_256(232), PaletteColor::new(8, 8, 8));
+        assert_eq!(xterm_256(232, &DEFAULT_ANSI_16), PaletteColor::new(8, 8, 8));
         // Last grey: 255 → 238.
-        assert_eq!(xterm_256(255), PaletteColor::new(238, 238, 238));
+        assert_eq!(
+            xterm_256(255, &DEFAULT_ANSI_16),
+            PaletteColor::new(238, 238, 238)
+        );
     }
 
     #[test]
     fn named_foreground_uses_defaults() {
-        assert_eq!(named_color(NamedColor::Foreground, fg(), bg(), cur()), fg());
-        assert_eq!(named_color(NamedColor::Background, fg(), bg(), cur()), bg());
-        assert_eq!(named_color(NamedColor::Cursor, fg(), bg(), cur()), cur());
+        let c = ctx();
+        assert_eq!(named_color(NamedColor::Foreground, &c), fg());
+        assert_eq!(named_color(NamedColor::Background, &c), bg());
+        assert_eq!(named_color(NamedColor::Cursor, &c), cur());
     }
 
     #[test]
     fn named_red_is_palette_red() {
-        assert_eq!(named_color(NamedColor::Red, fg(), bg(), cur()), ANSI_16[1]);
+        let c = ctx();
+        assert_eq!(named_color(NamedColor::Red, &c), DEFAULT_ANSI_16[1]);
+        assert_eq!(named_color(NamedColor::BrightRed, &c), DEFAULT_ANSI_16[9]);
+    }
+
+    #[test]
+    fn theme_override_changes_ansi_red() {
+        // Build a context with a custom palette so we can verify the
+        // resolver actually reads from `ctx.ansi_16` rather than the
+        // module-level default.
+        let mut custom = DEFAULT_ANSI_16;
+        custom[1] = PaletteColor::new(0x99, 0x00, 0x00); // override Red
+        let c = PaletteContext {
+            ansi_16: custom,
+            default_fg: fg(),
+            default_bg: bg(),
+            default_cursor: cur(),
+        };
         assert_eq!(
-            named_color(NamedColor::BrightRed, fg(), bg(), cur()),
-            ANSI_16[9]
+            named_color(NamedColor::Red, &c),
+            PaletteColor::new(0x99, 0x00, 0x00),
         );
     }
 
@@ -228,7 +295,7 @@ mod tests {
     fn resolve_handles_spec() {
         let rgb = Rgb { r: 1, g: 2, b: 3 };
         assert_eq!(
-            resolve(AnsiColor::Spec(rgb), fg(), bg(), cur()),
+            resolve(AnsiColor::Spec(rgb), &ctx()),
             PaletteColor::new(1, 2, 3)
         );
     }

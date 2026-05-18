@@ -686,6 +686,46 @@ fn scroll_into_view(f: &mut FindInFiles, visible: usize) {
     }
 }
 
+/// Build the per-frame terminal palette context from the current
+/// theme. The 16 ANSI slots come from `theme.terminal.palette`,
+/// padded with [`DEFAULT_ANSI_16`] for any missing entries; the
+/// `Foreground` / `Background` / `Cursor` sentinels default to the
+/// editor's own text / background / caret colours when the theme
+/// leaves them empty, so the pane stays visually continuous with
+/// the chrome by default.
+fn build_terminal_palette(theme: &Theme) -> terminal_palette::PaletteContext {
+    use terminal_palette::{PaletteColor, DEFAULT_ANSI_16};
+    let unpack = |hex: &str, fallback: PaletteColor| -> PaletteColor {
+        if hex.is_empty() {
+            return fallback;
+        }
+        match parse_hex_color(hex) {
+            Some([r, g, b, _]) => PaletteColor::new(r, g, b),
+            None => fallback,
+        }
+    };
+    let editor_fg = unpack(&theme.editor.text_fg, PaletteColor::new(0xEE, 0xEE, 0xEE));
+    let editor_bg = unpack(
+        &theme.editor.background,
+        PaletteColor::new(0x12, 0x12, 0x16),
+    );
+    let editor_caret = unpack(&theme.editor.caret, PaletteColor::new(0xEE, 0xEE, 0xEE));
+
+    let mut ansi_16 = DEFAULT_ANSI_16;
+    for (i, slot) in ansi_16.iter_mut().enumerate() {
+        if let Some(hex) = theme.terminal.palette.get(i) {
+            *slot = unpack(hex, *slot);
+        }
+    }
+
+    terminal_palette::PaletteContext {
+        ansi_16,
+        default_fg: unpack(&theme.terminal.foreground, editor_fg),
+        default_bg: unpack(&theme.terminal.background, editor_bg),
+        default_cursor: unpack(&theme.terminal.cursor, editor_caret),
+    }
+}
+
 /// One run of consecutive terminal cells in a single grid row that
 /// share the same background colour. Stored on `State` between the
 /// grid walk in `refresh_terminal_text` and the pixel-rect emission
@@ -3382,17 +3422,13 @@ impl State {
         use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
         use terminal_palette::{brighten_named, resolve, PaletteColor};
 
-        // Theme-driven defaults for the three sentinel named colours.
-        // Programs that emit `Named(Foreground)` get the editor's text
-        // colour back, which is what the chrome uses for status / tab
-        // strip too — keeps the pane looking like part of the editor.
-        let unpack = |hex: &str, fallback: [u8; 4]| -> PaletteColor {
-            let [r, g, b, _] = parse_hex_color(hex).unwrap_or(fallback);
-            PaletteColor::new(r, g, b)
-        };
-        let default_fg = unpack(&self.theme.editor.text_fg, [0xEE, 0xEE, 0xEE, 0xFF]);
-        let default_bg = unpack(&self.theme.editor.background, [0x12, 0x12, 0x16, 0xFF]);
-        let default_cursor = unpack(&self.theme.editor.caret, [0xEE, 0xEE, 0xEE, 0xFF]);
+        // Theme-driven palette. `[terminal]` in theme.toml can override
+        // any of the 16 ANSI slots and the three pane sentinels;
+        // missing or unparseable entries fall back to either the
+        // hardcoded Tango defaults (palette slots) or the editor's
+        // chrome colours (foreground / background / cursor), so the
+        // pane visually stays continuous with the rest of the editor.
+        let palette_ctx = build_terminal_palette(&self.theme);
 
         // Build (run_text, run_color) entries in one pass. A new run
         // starts when the resolved colour differs from the previous
@@ -3401,7 +3437,7 @@ impl State {
         // colour past the line terminator).
         let mut runs: Vec<(String, PaletteColor)> = Vec::with_capacity(pane.rows * 2);
         let mut current = String::new();
-        let mut current_color = default_fg;
+        let mut current_color = palette_ctx.default_fg;
 
         // Per-cell background runs are gathered alongside the text
         // pass: consecutive cells in the same row with the same bg
@@ -3447,7 +3483,7 @@ impl State {
                     // backdrop in the fg colour.
                     let (fg_eff, bg_eff) = if inverse { (bg, fg) } else { (fg, bg) };
 
-                    let fg_color = resolve(fg_eff, default_fg, default_bg, default_cursor);
+                    let fg_color = resolve(fg_eff, &palette_ctx);
                     if fg_color != current_color && !current.is_empty() {
                         runs.push((std::mem::take(&mut current), current_color));
                     }
@@ -3461,7 +3497,7 @@ impl State {
                     let bg_visible =
                         inverse || !matches!(bg_eff, AnsiColor::Named(NamedColor::Background));
                     let bg_color = if bg_visible {
-                        Some(resolve(bg_eff, default_fg, default_bg, default_cursor))
+                        Some(resolve(bg_eff, &palette_ctx))
                     } else {
                         None
                     };
@@ -3536,7 +3572,7 @@ impl State {
             .iter()
             .map(|(s, c)| {
                 let mut attrs = Attrs::new().family(Family::Monospace);
-                if *c != default_fg {
+                if *c != palette_ctx.default_fg {
                     attrs = attrs.color(Color::rgb(c.r, c.g, c.b));
                 }
                 (s.as_str(), attrs)
