@@ -502,14 +502,21 @@ fn text_color(hex: &str) -> Color {
     Color::rgb(r, g, b)
 }
 
-/// Resolve a theme color string into the `wgpu::Color` (linear-ish float
-/// per channel) the surface clear uses.
+/// Resolve a theme color string into the `wgpu::Color` the surface
+/// clear uses. The surface format is `Bgra8UnormSrgb`, so wgpu treats
+/// the values handed to `LoadOp::Clear` as *linear* and gamma-encodes
+/// them to sRGB on its way to the framebuffer. Hex codes are sRGB
+/// bytes by convention, so we apply the sRGB EOTF before handing them
+/// off — otherwise `#1f1f1f` (intended ≈ 31/255 grey) lands closer to
+/// 110/255 visible grey on screen. Same fix
+/// [`Color::to_f32_array`](editor_ui_scene::Color::to_f32_array) does
+/// for the quad path.
 fn clear_color(hex: &str) -> wgpu::Color {
     let [r, g, b, _] = parse_hex_color(hex).unwrap_or([5, 5, 8, 0xff]);
     wgpu::Color {
-        r: r as f64 / 255.0,
-        g: g as f64 / 255.0,
-        b: b as f64 / 255.0,
+        r: editor_ui_scene::srgb_byte_to_linear(r) as f64,
+        g: editor_ui_scene::srgb_byte_to_linear(g) as f64,
+        b: editor_ui_scene::srgb_byte_to_linear(b) as f64,
         a: 1.0,
     }
 }
@@ -4744,12 +4751,36 @@ impl State {
         let dialog = match themes_dir.as_deref() {
             Some(d) => rfd::FileDialog::new()
                 .set_directory(d)
-                .add_filter("Theme", &["toml"]),
-            None => rfd::FileDialog::new().add_filter("Theme", &["toml"]),
+                .add_filter("Theme", &["toml", "json"]),
+            None => rfd::FileDialog::new().add_filter("Theme", &["toml", "json"]),
         };
         let Some(path) = dialog.pick_file() else {
             return;
         };
+        let label = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Custom".to_string());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        // VSCode-format themes are loaded through the JSON converter,
+        // then serialised to TOML for persistence so the existing
+        // theme.toml watcher hot-reload path still works.
+        if matches!(ext.as_deref(), Some("json")) {
+            match editor_config::load_vscode_theme(&path) {
+                Ok(theme) => {
+                    let toml_content = toml::to_string(&theme).unwrap_or_default();
+                    self.apply_bundled_theme(&label, &toml_content);
+                }
+                Err(e) => {
+                    log::error!("could not load VSCode theme {}: {}", path.display(), e);
+                    self.set_status_flash(format!("vscode theme failed: {e}"));
+                }
+            }
+            return;
+        }
         let content = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
@@ -4757,10 +4788,6 @@ impl State {
                 return;
             }
         };
-        let label = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Custom".to_string());
         self.apply_bundled_theme(&label, &content);
     }
 
