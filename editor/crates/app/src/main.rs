@@ -4744,12 +4744,36 @@ impl State {
         let dialog = match themes_dir.as_deref() {
             Some(d) => rfd::FileDialog::new()
                 .set_directory(d)
-                .add_filter("Theme", &["toml"]),
-            None => rfd::FileDialog::new().add_filter("Theme", &["toml"]),
+                .add_filter("Theme", &["toml", "json"]),
+            None => rfd::FileDialog::new().add_filter("Theme", &["toml", "json"]),
         };
         let Some(path) = dialog.pick_file() else {
             return;
         };
+        let label = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Custom".to_string());
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        // VSCode-format themes are loaded through the JSON converter,
+        // then serialised to TOML for persistence so the existing
+        // theme.toml watcher hot-reload path still works.
+        if matches!(ext.as_deref(), Some("json")) {
+            match editor_config::load_vscode_theme(&path) {
+                Ok(theme) => {
+                    let toml_content = toml::to_string(&theme).unwrap_or_default();
+                    self.apply_bundled_theme(&label, &toml_content);
+                }
+                Err(e) => {
+                    log::error!("could not load VSCode theme {}: {}", path.display(), e);
+                    self.set_status_flash(format!("vscode theme failed: {e}"));
+                }
+            }
+            return;
+        }
         let content = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
@@ -4757,10 +4781,6 @@ impl State {
                 return;
             }
         };
-        let label = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Custom".to_string());
         self.apply_bundled_theme(&label, &content);
     }
 
