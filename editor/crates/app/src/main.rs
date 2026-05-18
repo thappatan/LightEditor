@@ -502,14 +502,21 @@ fn text_color(hex: &str) -> Color {
     Color::rgb(r, g, b)
 }
 
-/// Resolve a theme color string into the `wgpu::Color` (linear-ish float
-/// per channel) the surface clear uses.
+/// Resolve a theme color string into the `wgpu::Color` the surface
+/// clear uses. The surface format is `Bgra8UnormSrgb`, so wgpu treats
+/// the values handed to `LoadOp::Clear` as *linear* and gamma-encodes
+/// them to sRGB on its way to the framebuffer. Hex codes are sRGB
+/// bytes by convention, so we apply the sRGB EOTF before handing them
+/// off — otherwise `#1f1f1f` (intended ≈ 31/255 grey) lands closer to
+/// 110/255 visible grey on screen. Same fix
+/// [`Color::to_f32_array`](editor_ui_scene::Color::to_f32_array) does
+/// for the quad path.
 fn clear_color(hex: &str) -> wgpu::Color {
     let [r, g, b, _] = parse_hex_color(hex).unwrap_or([5, 5, 8, 0xff]);
     wgpu::Color {
-        r: r as f64 / 255.0,
-        g: g as f64 / 255.0,
-        b: b as f64 / 255.0,
+        r: editor_ui_scene::srgb_byte_to_linear(r) as f64,
+        g: editor_ui_scene::srgb_byte_to_linear(g) as f64,
+        b: editor_ui_scene::srgb_byte_to_linear(b) as f64,
         a: 1.0,
     }
 }

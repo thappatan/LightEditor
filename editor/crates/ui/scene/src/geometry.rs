@@ -177,14 +177,38 @@ impl Color {
         Self { r, g, b, a }
     }
 
-    /// The color as `[r, g, b, a]` in the 0.0–1.0 range wgpu expects.
+    /// The color as `[r, g, b, a]` in the 0.0–1.0 range wgpu expects,
+    /// with the RGB channels converted from sRGB into linear space.
+    ///
+    /// Why: every render surface in this app uses `Bgra8UnormSrgb` so
+    /// wgpu takes the values written by shaders / clears as **linear**
+    /// and gamma-encodes them to sRGB before blitting to the
+    /// framebuffer. Hex codes (`"#1f1f1f"`) are sRGB bytes by
+    /// convention, so feeding them in as raw `r/255` produces a
+    /// noticeably brighter shade on screen — `#1f1f1f` would land
+    /// somewhere around 110/255 instead of the intended 31/255.
+    /// The standard sRGB EOTF here pre-corrects that so the surface
+    /// encode round-trips to the originally-authored byte.
+    /// Alpha stays linear by definition.
     pub fn to_f32_array(self) -> [f32; 4] {
         [
-            self.r as f32 / 255.0,
-            self.g as f32 / 255.0,
-            self.b as f32 / 255.0,
+            srgb_byte_to_linear(self.r),
+            srgb_byte_to_linear(self.g),
+            srgb_byte_to_linear(self.b),
             self.a as f32 / 255.0,
         ]
+    }
+}
+
+/// sRGB EOTF — convert one 0–255 sRGB byte to a linear 0.0–1.0 value.
+/// Matches the standard piecewise definition (the dark-region
+/// linear segment up to 0.04045 followed by the gamma-2.4 curve).
+pub fn srgb_byte_to_linear(byte: u8) -> f32 {
+    let c = byte as f32 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
     }
 }
 
@@ -261,7 +285,22 @@ mod tests {
     fn color_constructors_and_conversion() {
         assert_eq!(Color::rgb(10, 20, 30), Color::rgba(10, 20, 30, 255));
         assert_eq!(Color::TRANSPARENT.a, 0);
+        // White and black are gamma-curve endpoints — they pass
+        // through 1.0 / 0.0 in both sRGB and linear.
         assert_eq!(Color::WHITE.to_f32_array(), [1.0, 1.0, 1.0, 1.0]);
         assert_eq!(Color::BLACK.to_f32_array(), [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn srgb_byte_to_linear_converts_midtones() {
+        // 0 and 255 are gamma-curve endpoints.
+        assert!((srgb_byte_to_linear(0) - 0.0).abs() < 1e-6);
+        assert!((srgb_byte_to_linear(255) - 1.0).abs() < 1e-6);
+        // Linear-segment cutoff: 10/255 ≈ 0.0392 < 0.04045 → linear branch.
+        // Expected: c/12.92 = (10/255)/12.92 ≈ 0.003035.
+        assert!((srgb_byte_to_linear(10) - 0.003035).abs() < 1e-4);
+        // 128/255 ≈ 0.502 → gamma branch.
+        // Expected: ((0.502 + 0.055)/1.055)^2.4 ≈ 0.2159.
+        assert!((srgb_byte_to_linear(128) - 0.2159).abs() < 1e-3);
     }
 }

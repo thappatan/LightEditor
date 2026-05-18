@@ -12,5 +12,5 @@
 mod geometry;
 mod scene;
 
-pub use geometry::{Color, Point, Rect, Size};
+pub use geometry::{srgb_byte_to_linear, Color, Point, Rect, Size};
 pub use scene::{Primitive, Scene, SceneNode};
