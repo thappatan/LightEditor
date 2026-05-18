@@ -1051,6 +1051,11 @@ struct State {
     /// tab switch, save, and every file-tree reload. Empty when the
     /// workspace isn't a git repo, which silently hides the markers.
     workspace_git_status: HashMap<PathBuf, git::FileGitStatus>,
+    /// Per-directory aggregate of [`workspace_git_status`], used to
+    /// decorate parent rows in the sidebar with the highest-priority
+    /// status anywhere in their subtree. Computed from the file map
+    /// in the same refresh pass.
+    workspace_git_dir_status: HashMap<PathBuf, git::FileGitStatus>,
     /// `package.json` scripts detected in the workspace root, used to
     /// populate the command palette with `Run script: <name>`
     /// entries. Refreshed on every `FileTreeChanged` (which fires for
@@ -1318,6 +1323,7 @@ impl State {
         let file_tree_watcher =
             spawn_file_tree_watcher(&file_tree.root, hidden_dirs, flash_proxy.clone());
         let workspace_git_status = git::compute_workspace_status(&file_tree.root);
+        let workspace_git_dir_status = git::aggregate_dirs(&workspace_git_status, &file_tree.root);
         let npm_scripts = scripts::read_scripts(&file_tree.root);
         let flutter_project = flutter::detect_flutter(&file_tree.root);
 
@@ -1374,6 +1380,7 @@ impl State {
             sidebar_resize_drag: None,
             _file_tree_watcher: file_tree_watcher,
             workspace_git_status,
+            workspace_git_dir_status,
             npm_scripts,
             flutter_project,
             flutter_session_active: false,
@@ -3135,6 +3142,8 @@ impl State {
     /// the markers silently disappear.
     fn refresh_workspace_git_status(&mut self) {
         self.workspace_git_status = git::compute_workspace_status(&self.file_tree.root);
+        self.workspace_git_dir_status =
+            git::aggregate_dirs(&self.workspace_git_status, &self.file_tree.root);
     }
 
     /// Re-read `package.json`'s `"scripts"` map so the next time the
@@ -3201,12 +3210,24 @@ impl State {
                 };
                 s.push_str(marker);
                 s.push_str(&node.name);
-                // Only files get a status marker for v1; surfacing
-                // directory roll-ups (any modified file inside?) needs
-                // a different design and is queued for a follow-up.
+                // Files use the per-file map; directories use the
+                // aggregate (highest-priority status anywhere in
+                // their subtree), so a `src/` row tells the user
+                // "something inside is modified" before they expand.
                 let status = match node.kind {
                     NodeKind::File => self.workspace_git_status.get(&node.path).copied(),
-                    _ => None,
+                    NodeKind::Directory { .. } => {
+                        // The aggregate's canonicalised paths come
+                        // from libgit2's workdir; the file tree's
+                        // paths come from `read_dir`. Try both forms
+                        // so macOS's `/var` → `/private/var` symlink
+                        // doesn't drop a row.
+                        let p = node
+                            .path
+                            .canonicalize()
+                            .unwrap_or_else(|_| node.path.clone());
+                        self.workspace_git_dir_status.get(&p).copied()
+                    }
                 };
                 (s, status)
             })
