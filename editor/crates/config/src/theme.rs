@@ -80,39 +80,43 @@ pub struct EditorTheme {
 
 impl Default for EditorTheme {
     fn default() -> Self {
-        // Hand-picked dark palette — what the editor shipped before themes
-        // landed. Every value carries its alpha as the trailing two hex
+        // Dark palette aligned with VSCode's "Dark+" defaults. The
+        // previous values were hand-tuned against the renderer's old
+        // gamma-incorrect path; with the sRGB fix they would have
+        // rendered nearly pitch-black. These values render at the
+        // shade most editors converge on for a dark theme.
+        // Every value carries its alpha as the trailing two hex
         // digits, so opaque (`ff`) and translucent (`<ff`) read the same.
         Self {
-            background: "#050508ff".into(),
-            text_fg: "#eeeeeeff".into(),
-            caret: "#78a0ffff".into(),
-            selection_bg: "#78a0ff40".into(),
-            active_line_bg: "#ffffff0c".into(),
+            background: "#1e1e1eff".into(),
+            text_fg: "#d4d4d4ff".into(),
+            caret: "#aeafadff".into(),
+            selection_bg: "#264f78aa".into(),
+            active_line_bg: "#2a2d2eff".into(),
 
-            gutter_bg: "#0e0e14ff".into(),
-            gutter_fg: "#b4b4beff".into(),
-            gutter_active_fg: "#eeeeeeff".into(),
+            gutter_bg: "#1e1e1eff".into(),
+            gutter_fg: "#858585ff".into(),
+            gutter_active_fg: "#c6c6c6ff".into(),
 
-            tab_bar_bg: "#16161cff".into(),
-            tab_active_bg: "#30303cff".into(),
-            tab_inactive_bg: "#1e1e26ff".into(),
-            tab_separator: "#3c3c46ff".into(),
-            tab_label_fg: "#dcdcdcff".into(),
-            close_button: "#b4b4beff".into(),
+            tab_bar_bg: "#252526ff".into(),
+            tab_active_bg: "#1e1e1eff".into(),
+            tab_inactive_bg: "#2d2d2dff".into(),
+            tab_separator: "#252526ff".into(),
+            tab_label_fg: "#ffffffff".into(),
+            close_button: "#c5c5c5ff".into(),
 
-            status_bg: "#16161cff".into(),
-            status_fg: "#b4b4beff".into(),
+            status_bg: "#1e1e1eff".into(),
+            status_fg: "#cccccdff".into(),
 
             // Popups must be fully opaque so the editor's text doesn't
             // bleed through the palette / completion / hover panel.
-            overlay_bg: "#262630ff".into(),
+            overlay_bg: "#252526ff".into(),
             overlay_scrim: "#00000060".into(),
-            palette_selection_bg: "#78a0ff60".into(),
+            palette_selection_bg: "#094771ff".into(),
 
-            find_match_bg: "#ffc83c40".into(),
-            indent_guide: "#505064a0".into(),
-            bracket_match: "#b4c8ff24".into(),
+            find_match_bg: "#9e6a0399".into(),
+            indent_guide: "#404040a0".into(),
+            bracket_match: "#0064001a".into(),
         }
     }
 }
@@ -133,14 +137,19 @@ pub struct SyntaxTheme {
 
 impl Default for SyntaxTheme {
     fn default() -> Self {
+        // VSCode Dark+ syntax palette. The previous values were a
+        // hand-mix that worked under the gamma-buggy renderer; these
+        // are the upstream sRGB values readers recognise instantly
+        // and that maintain WCAG-AA contrast against the new
+        // `#1e1e1eff` editor background.
         Self {
-            keyword: "#cd82e9ff".into(),
-            string: "#a0e6a8ff".into(),
-            number: "#ffb87cff".into(),
-            comment: "#7a7a88ff".into(),
-            type_: "#f0d983ff".into(),
-            function: "#8ab4f8ff".into(),
-            punctuation: "#a0a0b0ff".into(),
+            keyword: "#569cd6ff".into(),
+            string: "#ce9178ff".into(),
+            number: "#b5cea8ff".into(),
+            comment: "#6a9955ff".into(),
+            type_: "#4ec9b0ff".into(),
+            function: "#dcdcaaff".into(),
+            punctuation: "#d4d4d4ff".into(),
         }
     }
 }
