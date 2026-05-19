@@ -35,6 +35,8 @@ pub enum Language {
     Bash,
     Lua,
     Ruby,
+    Html,
+    Css,
 }
 
 impl Language {
@@ -58,6 +60,8 @@ impl Language {
             "sh" | "bash" | "zsh" => Some(Language::Bash),
             "lua" => Some(Language::Lua),
             "rb" | "rbw" => Some(Language::Ruby),
+            "html" | "htm" | "xhtml" => Some(Language::Html),
+            "css" => Some(Language::Css),
             _ => None,
         }
     }
@@ -79,6 +83,8 @@ impl Language {
             Language::Bash => tree_sitter_bash::LANGUAGE.into(),
             Language::Lua => tree_sitter_lua::LANGUAGE.into(),
             Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Language::Html => tree_sitter_html::LANGUAGE.into(),
+            Language::Css => tree_sitter_css::LANGUAGE.into(),
         }
     }
 }
@@ -238,6 +244,8 @@ fn classifier_for(lang: Language) -> Classifier {
         Language::Bash => classify_bash,
         Language::Lua => classify_lua,
         Language::Ruby => classify_ruby,
+        Language::Html => classify_html,
+        Language::Css => classify_css,
     }
 }
 
@@ -529,7 +537,9 @@ fn classify_yaml(
     }
 }
 
-/// tree-sitter-dart.
+/// tree-sitter-dart. Covers Flutter idioms — annotations like
+/// `@override`, function calls (`obj.method()`), constructor invocations
+/// — on top of the obvious comments / strings / numbers / type names.
 fn classify_dart(
     kind: &str,
     parent: Option<&str>,
@@ -541,8 +551,22 @@ fn classify_dart(
             (Some("function_signature"), Some("name"))
             | (Some("method_signature"), Some("name"))
             | (Some("getter_signature"), Some("name"))
-            | (Some("setter_signature"), Some("name")) => return Some(Function),
-            (Some("class_definition"), Some("name")) => return Some(Type),
+            | (Some("setter_signature"), Some("name"))
+            | (Some("constructor_signature"), Some("name"))
+            | (Some("factory_constructor_signature"), Some("name")) => return Some(Function),
+            (Some("class_definition"), Some("name"))
+            | (Some("mixin_declaration"), Some("name"))
+            | (Some("enum_declaration"), Some("name"))
+            | (Some("type_alias"), Some("name"))
+            | (Some("extension_declaration"), Some("name")) => return Some(Type),
+            // `@override`, `@deprecated`, `@JsonSerializable()` etc.
+            // The identifier sits under `marker_annotation` / `annotation`
+            // — paint it as Keyword so the `@` stands out.
+            (Some("marker_annotation"), _) | (Some("annotation"), _) => return Some(Keyword),
+            // The method / function name in a call site (`widget.build()`).
+            (Some("selector"), _)
+            | (Some("function_expression_invocation"), Some("function"))
+            | (Some("conditional_assignable_selector"), _) => return Some(Function),
             _ => {}
         }
     }
@@ -555,6 +579,10 @@ fn classify_dart(
         | "true"
         | "false" => Some(Number),
         "type_identifier" | "primitive_type" | "void_type" => Some(Type),
+        // Annotations themselves (the `@` + name unit) read as Keyword
+        // so they don't accidentally collide with function-call colours
+        // when the inner identifier path above misses.
+        "marker_annotation" | "annotation" => Some(Keyword),
         "var" | "final" | "const" | "late" | "static" | "abstract" | "class" | "extends"
         | "implements" | "with" | "mixin" | "enum" | "typedef" | "if" | "else" | "for" | "in"
         | "while" | "do" | "switch" | "case" | "default" | "break" | "continue" | "return"
@@ -562,6 +590,54 @@ fn classify_dart(
         | "await" | "sync" | "new" | "this" | "super" | "is" | "as" | "null" | "void"
         | "import" | "export" | "library" | "part" | "show" | "hide" | "deferred" | "factory"
         | "external" | "operator" | "get" | "set" | "covariant" | "required" => Some(Keyword),
+        _ => None,
+    }
+}
+
+/// tree-sitter-html. Tag names → Type (they read as "things you're
+/// instantiating"), attribute names → Function (callable / namespacey),
+/// attribute values and text content → StringLit, doctype + entities
+/// → Keyword.
+fn classify_html(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        "tag_name" => Some(Type),
+        "attribute_name" => Some(Function),
+        "attribute_value" | "quoted_attribute_value" => Some(StringLit),
+        "doctype" => Some(Keyword),
+        "erroneous_end_tag_name" => Some(Type),
+        "entity" => Some(Keyword),
+        _ => None,
+    }
+}
+
+/// tree-sitter-css. Selectors → Type / Function depending on whether
+/// they're tag, class or id; property names → Function; values
+/// (strings, colours, units) keep their nature.
+fn classify_css(
+    kind: &str,
+    _parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    match kind {
+        "comment" => Some(Comment),
+        // Selectors
+        "tag_name" | "nesting_selector" => Some(Type),
+        "class_name" | "id_name" | "property_name" => Some(Function),
+        "pseudo_class_selector" | "pseudo_element_selector" => Some(Keyword),
+        "attribute_name" | "attribute_selector" => Some(Function),
+        // Literals
+        "string_value" | "url" => Some(StringLit),
+        "color_value" | "color" => Some(StringLit),
+        "integer_value" | "float_value" | "unit" => Some(Number),
+        // At-rules (`@media`, `@import`, …) and important.
+        "at_keyword" | "important" | "from" | "to" => Some(Keyword),
         _ => None,
     }
 }
@@ -845,6 +921,53 @@ fn x() {}
         let cats = categories_with(Language::Dart, src);
         assert!(cats.contains(&HighlightCategory::Keyword)); // void / var
         assert!(cats.contains(&HighlightCategory::StringLit));
+    }
+
+    #[test]
+    fn dart_highlights_annotation_as_keyword() {
+        // `@override` should read as a keyword, not blend with plain
+        // identifiers. The annotation form covers `@deprecated`,
+        // `@JsonSerializable()`, etc. too.
+        let src = "class C {\n  @override\n  String foo() => '';\n}\n";
+        let cats = categories_with(Language::Dart, src);
+        assert!(cats.contains(&HighlightCategory::Keyword));
+    }
+
+    #[test]
+    fn html_highlights_tags_and_attributes() {
+        let src = "<div class=\"x\">hi</div>\n";
+        let cats = categories_with(Language::Html, src);
+        assert!(cats.contains(&HighlightCategory::Type)); // tag_name
+        assert!(cats.contains(&HighlightCategory::Function)); // attribute_name
+        assert!(cats.contains(&HighlightCategory::StringLit)); // attribute_value
+    }
+
+    #[test]
+    fn css_highlights_selectors_and_values() {
+        let src = ".btn { color: #fff; padding: 8px; }\n";
+        let cats = categories_with(Language::Css, src);
+        assert!(cats.contains(&HighlightCategory::Function)); // class_name + property_name
+        assert!(cats.contains(&HighlightCategory::Number)); // 8 + px
+    }
+
+    #[test]
+    fn html_extension_routes_to_html() {
+        assert_eq!(
+            Language::for_path(Path::new("index.html")),
+            Some(Language::Html),
+        );
+        assert_eq!(
+            Language::for_path(Path::new("page.htm")),
+            Some(Language::Html),
+        );
+    }
+
+    #[test]
+    fn css_extension_routes_to_css() {
+        assert_eq!(
+            Language::for_path(Path::new("main.css")),
+            Some(Language::Css),
+        );
     }
 
     #[test]

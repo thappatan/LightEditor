@@ -1263,9 +1263,16 @@ impl State {
             "",
         );
 
+        // Completion-popup rows don't soft-wrap. A long completion
+        // label (`MyLongClassName.factoryConstructorFromParts`)
+        // breaking onto a second visible row would split one logical
+        // entry into two rendered rows, and the selection
+        // highlight / Enter-fires-this-entry math (both keyed on
+        // row index × line_height) would disagree. Clip on the
+        // panel's right edge instead.
         let completion_text = TextStack::new(
             &mut font_system,
-            (COMPLETION_WIDTH_DIP - 2.0 * COMPLETION_PAD_DIP) * scale,
+            NO_WRAP_WIDTH_PX,
             font_size_pt,
             line_height_pt,
             scale,
@@ -1285,9 +1292,15 @@ impl State {
             "",
         );
 
+        // Result rows in the find-in-files panel hold long file paths
+        // and match snippets — they MUST stay one row per result so
+        // `idx × line_height` continues to identify the chosen
+        // result on Enter. Clip on the right edge; the user can
+        // resize their window or move along the row to inspect
+        // long paths.
         let find_in_files_text = TextStack::new(
             &mut font_system,
-            (FIND_FILES_WIDTH_DIP - 2.0 * FIND_FILES_PAD_DIP) * scale,
+            NO_WRAP_WIDTH_PX,
             font_size_pt,
             line_height_pt,
             scale,
