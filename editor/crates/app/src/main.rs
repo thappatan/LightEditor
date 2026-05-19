@@ -3432,10 +3432,19 @@ impl State {
         ) {
             Ok(pane) => {
                 self.terminal = Some(pane);
-                // Match cell count to real pane size on first show; the
-                // initial 100×12 was just a placeholder for the spawn.
-                self.resync_terminal_cells();
+                // Shape the (mostly-empty) pane content FIRST so the
+                // measurement helpers have real glyph metrics from
+                // `terminal_text` to work with. Without this,
+                // `resync_terminal_cells` falls back to the chrome's
+                // `measured_char_width()` / `line_height()` — which
+                // can pick a different monospace face than the pane
+                // and produce mis-sized cells. The visible symptom
+                // is a sparse, mis-aligned first paint that snaps
+                // back after a second Cmd-J toggle.
                 self.refresh_terminal_text();
+                // Now that `terminal_text` has been shaped, resize
+                // the PTY's grid from the real metrics.
+                self.resync_terminal_cells();
                 self.scene_dirty = true;
                 self.window.request_redraw();
             }
@@ -3901,12 +3910,28 @@ impl State {
     /// the status bar — the editor's state is left intact.
     fn open_path(&mut self, path: PathBuf) {
         let flash_label = filename_for_flash(&path);
+        // Canonicalise up front so the "is this file already open?"
+        // check below treats `./src/main.rs`, `src/main.rs`, and the
+        // absolute form as the same tab.
+        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if let Some(idx) = self
+            .docs
+            .iter()
+            .position(|d| d.file_path.as_deref() == Some(canon.as_path()))
+        {
+            // Already open — switch to that tab instead of pushing a
+            // duplicate. Matches VSCode: clicking a file in the
+            // sidebar twice keeps one tab.
+            self.switch_tab(idx);
+            self.set_status_flash(format!("opened · {flash_label}"));
+            return;
+        }
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 // Always store an absolute path: the LSP layer turns it into
                 // a `file://` URL, which requires absolute, and tools like
                 // rust-analyzer use the URI to anchor workspace lookups.
-                let path = std::fs::canonicalize(&path).unwrap_or(path);
+                let path = canon;
                 let new_doc = Document::from_file(path, &content);
                 if self.doc().is_pristine_scratch() {
                     self.docs[self.active] = new_doc;

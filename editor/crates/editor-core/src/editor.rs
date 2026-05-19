@@ -272,6 +272,7 @@ impl Editor {
     }
 
     fn move_lines(&mut self, up: bool) {
+        let pre = self.selections.clone();
         let primary = self.selections.primary();
         let (start_line, end_line) = self.line_range_for_selection(&primary);
         let total_lines = self.buffer.len_lines();
@@ -358,7 +359,7 @@ impl Editor {
             (primary.anchor + adj_len, primary.head + adj_len)
         };
         self.selections = SelectionSet::single(Selection::new(new_anchor, new_head));
-        self.commit();
+        self.commit(pre);
     }
 
     /// Delete every logical line touched by any selection, plus its
@@ -388,6 +389,7 @@ impl Editor {
     /// cursor edits on the *same* line are not supported in v1 — the
     /// primary's selection drives the range.
     pub fn indent_lines(&mut self, indent: &str) {
+        let pre = self.selections.clone();
         let primary = self.selections.primary();
         let (start_line, end_line) = self.line_range_for_selection(&primary);
         if end_line < start_line {
@@ -409,12 +411,13 @@ impl Editor {
             }
         }
         self.selections = SelectionSet::single(Selection::new(anchor, head));
-        self.commit();
+        self.commit(pre);
     }
 
     /// Remove up to `max_spaces` leading spaces (or a single leading tab)
     /// from each line touched by the primary selection.
     pub fn outdent_lines(&mut self, max_spaces: usize) {
+        let pre = self.selections.clone();
         let primary = self.selections.primary();
         let (start_line, end_line) = self.line_range_for_selection(&primary);
         if end_line < start_line {
@@ -452,7 +455,7 @@ impl Editor {
             }
         }
         self.selections = SelectionSet::single(Selection::new(anchor, head));
-        self.commit();
+        self.commit(pre);
     }
 
     /// Toggle a line comment (`prefix + space`) on every line touched by
@@ -461,6 +464,7 @@ impl Editor {
     /// each; otherwise it's added to each. Blank lines are skipped when
     /// adding so they don't grow ragged trailing markers.
     pub fn toggle_comment_lines(&mut self, prefix: &str) {
+        let pre = self.selections.clone();
         let primary = self.selections.primary();
         let (start_line, end_line) = self.line_range_for_selection(&primary);
         if end_line < start_line {
@@ -548,7 +552,7 @@ impl Editor {
             }
         }
         self.selections = SelectionSet::single(Selection::new(anchor, head));
-        self.commit();
+        self.commit(pre);
     }
 
     /// Range of lines touched by a selection. If the selection ends at
@@ -676,6 +680,9 @@ impl Editor {
         &mut self,
         plan: impl Fn(&Selection, &Editor) -> (std::ops::Range<usize>, String),
     ) {
+        // Snapshot the pre-edit selections so the undo system can
+        // restore the user's cursor on undo — see `commit`.
+        let pre = self.selections.clone();
         let primary_index = self.selections.primary_index();
         let mut sels: Vec<Selection> = self.selections.selections().to_vec();
 
@@ -703,7 +710,7 @@ impl Editor {
 
         let primary_head = sels[primary_index].head;
         self.selections = SelectionSet::new(sels, primary_head);
-        self.commit();
+        self.commit(pre);
     }
 
     /// Move every caret one grapheme in the given direction.
@@ -785,10 +792,15 @@ impl Editor {
     }
 
     /// Record the current state as a new undo snapshot and bump the
-    /// revision counter — every edit funnels through here.
-    fn commit(&mut self) {
+    /// revision counter — every edit funnels through here. `pre`
+    /// is where the cursor was right *before* the edit that produced
+    /// the current state; the UndoTree uses it to refresh the
+    /// soon-to-be-parent node so a future undo lands the user back
+    /// at the edit site instead of wherever the cursor happened to
+    /// be at the last commit.
+    fn commit(&mut self, pre: SelectionSet) {
         self.undo
-            .commit(self.buffer.clone(), self.selections.clone());
+            .commit(self.buffer.clone(), self.selections.clone(), pre);
         self.revision = self.revision.wrapping_add(1);
     }
 
