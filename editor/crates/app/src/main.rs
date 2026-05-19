@@ -52,7 +52,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 /// Cross-thread events posted into the winit event loop from background
@@ -403,6 +403,78 @@ const WORKSPACE_CONFIG_SUBDIR: &str = ".lighteditor";
 /// Linux/Windows) is held. Used to gate shortcuts like Cmd-S.
 fn is_cmd_or_ctrl(mods: ModifiersState) -> bool {
     mods.super_key() || mods.control_key()
+}
+
+/// `true` when `event` matches the QWERTY letter `target` (e.g. `'s'`
+/// for Cmd-S). Checks the layout-independent
+/// [`PhysicalKey`](winit::keyboard::PhysicalKey) first so non-Latin
+/// keyboard layouts (Thai, Arabic, Russian, …) still fire shortcuts —
+/// `logical_key` on those layouts reports the localised character
+/// (`"ฆ"` instead of `"s"`) and an `eq_ignore_ascii_case` check would
+/// miss. Falls back to the logical key for completeness on layouts /
+/// platforms where `physical_key` reports `Unidentified`.
+fn shortcut_letter(event: &KeyEvent, target: char) -> bool {
+    shortcut_letter_of(event).is_some_and(|c| c.eq_ignore_ascii_case(&target.to_string()))
+}
+
+/// Lower-case form of the letter/digit/symbol the user pressed,
+/// derived layout-independently from `event.physical_key`. Falls back
+/// to `event.logical_key` for keys whose physical code we haven't
+/// listed (e.g. punctuation specific to a national layout). Returns
+/// `None` when neither path produces a single character. Used to
+/// drive the Cmd-letter shortcut match on layouts where
+/// `logical_key` would otherwise report the localised glyph.
+fn shortcut_letter_of(event: &KeyEvent) -> Option<String> {
+    if let PhysicalKey::Code(code) = event.physical_key {
+        let ch: Option<char> = match code {
+            KeyCode::KeyA => Some('a'),
+            KeyCode::KeyB => Some('b'),
+            KeyCode::KeyC => Some('c'),
+            KeyCode::KeyD => Some('d'),
+            KeyCode::KeyE => Some('e'),
+            KeyCode::KeyF => Some('f'),
+            KeyCode::KeyG => Some('g'),
+            KeyCode::KeyH => Some('h'),
+            KeyCode::KeyI => Some('i'),
+            KeyCode::KeyJ => Some('j'),
+            KeyCode::KeyK => Some('k'),
+            KeyCode::KeyL => Some('l'),
+            KeyCode::KeyM => Some('m'),
+            KeyCode::KeyN => Some('n'),
+            KeyCode::KeyO => Some('o'),
+            KeyCode::KeyP => Some('p'),
+            KeyCode::KeyQ => Some('q'),
+            KeyCode::KeyR => Some('r'),
+            KeyCode::KeyS => Some('s'),
+            KeyCode::KeyT => Some('t'),
+            KeyCode::KeyU => Some('u'),
+            KeyCode::KeyV => Some('v'),
+            KeyCode::KeyW => Some('w'),
+            KeyCode::KeyX => Some('x'),
+            KeyCode::KeyY => Some('y'),
+            KeyCode::KeyZ => Some('z'),
+            KeyCode::Digit0 => Some('0'),
+            KeyCode::Digit1 => Some('1'),
+            KeyCode::Digit2 => Some('2'),
+            KeyCode::Digit3 => Some('3'),
+            KeyCode::Digit4 => Some('4'),
+            KeyCode::Digit5 => Some('5'),
+            KeyCode::Digit6 => Some('6'),
+            KeyCode::Digit7 => Some('7'),
+            KeyCode::Digit8 => Some('8'),
+            KeyCode::Digit9 => Some('9'),
+            KeyCode::Slash => Some('/'),
+            KeyCode::Period => Some('.'),
+            _ => None,
+        };
+        if let Some(c) = ch {
+            return Some(c.to_string());
+        }
+    }
+    if let Key::Character(c) = &event.logical_key {
+        return Some(c.to_lowercase());
+    }
+    None
 }
 
 /// A short language label for the status bar, guessed from `path`'s file
@@ -1624,17 +1696,16 @@ impl State {
 
         // Cmd-Shift-P toggles the palette regardless of whether it is open,
         // so it stays a single muscle-memory key combo.
-        if is_cmd_or_ctrl(self.modifiers) && self.modifiers.shift_key() {
-            if let Key::Character(c) = &event.logical_key {
-                if c.as_str().eq_ignore_ascii_case("p") {
-                    if self.palette.is_some() {
-                        self.close_palette();
-                    } else {
-                        self.open_palette();
-                    }
-                    return;
-                }
+        if is_cmd_or_ctrl(self.modifiers)
+            && self.modifiers.shift_key()
+            && shortcut_letter(&event, 'p')
+        {
+            if self.palette.is_some() {
+                self.close_palette();
+            } else {
+                self.open_palette();
             }
+            return;
         }
 
         // When the palette is open it captures every other key.
@@ -1698,9 +1769,57 @@ impl State {
                 _ => {}
             }
         }
+        // Open dialogs claim Cmd-V before anything else so the user's
+        // paste goes to whichever input they're currently typing in.
+        // Order: palette (already captured above) > find bar >
+        // find-in-files > terminal > editor.
+        if self.doc().find.is_some()
+            && is_cmd_or_ctrl(self.modifiers)
+            && shortcut_letter(&event, 'v')
+        {
+            self.handle_find_key(event);
+            return;
+        }
+        if self.find_in_files.is_some()
+            && is_cmd_or_ctrl(self.modifiers)
+            && shortcut_letter(&event, 'v')
+        {
+            if let Some(text) = clipboard_get() {
+                if let Some(f) = self.find_in_files.as_mut() {
+                    if f.input_focused {
+                        f.query.push_str(&text);
+                    }
+                }
+                self.refresh_find_in_files_text();
+                self.scene_dirty = true;
+                self.window.request_redraw();
+            }
+            return;
+        }
+        // Cmd-V routes to the embedded terminal whenever the pane is
+        // *visible*, even without keyboard focus — the user's mental
+        // model is "I copied text, I want to push it into the
+        // terminal" and they shouldn't have to re-click the pane
+        // first. Has to short-circuit *before* the editor's
+        // Cmd-letter match below, otherwise the editor's `"v"` arm
+        // would fire `paste_clipboard()` against the editor buffer.
+        // Editor paste while the terminal is open requires hiding
+        // the pane (Cmd-J) or a future explicit "Paste into editor"
+        // command.
+        if is_cmd_or_ctrl(self.modifiers)
+            && shortcut_letter(&event, 'v')
+            && self.terminal.as_ref().is_some_and(|t| t.visible)
+        {
+            if let Some(text) = clipboard_get() {
+                if let Some(t) = self.terminal.as_ref() {
+                    t.write(text.into_bytes());
+                }
+            }
+            self.set_status_flash("pasted into terminal".to_string());
+            return;
+        }
         if is_cmd_or_ctrl(self.modifiers) {
-            if let Key::Character(c) = &event.logical_key {
-                let lower = c.to_lowercase();
+            if let Some(lower) = shortcut_letter_of(&event) {
                 let alt = self.modifiers.alt_key();
                 match lower.as_str() {
                     "f" => {
@@ -1883,14 +2002,17 @@ impl State {
         let alt = self.modifiers.alt_key();
         let cmd = is_cmd_or_ctrl(self.modifiers);
 
-        // Embedded terminal claims keys while it has focus — except
-        // shortcuts (cmd / ctrl + something) which still belong to
-        // the host so Cmd-J can hide it, Cmd-S still saves, etc.
+        // Embedded terminal claims keys while it has focus — including
+        // Cmd-V (paste into the PTY). Other Cmd / Alt shortcuts that
+        // the host owns (Cmd-S, Cmd-J, Cmd-Shift-P, …) bounce back
+        // through the function returning `false`. `route_key_to_terminal`
+        // is the single source of truth for which terminal-side
+        // shortcuts exist.
         let terminal_active = self
             .terminal
             .as_ref()
             .is_some_and(|t| t.visible && t.focused);
-        if terminal_active && !cmd && !alt && self.route_key_to_terminal(&event) {
+        if terminal_active && !alt && self.route_key_to_terminal(&event) {
             return;
         }
 
@@ -1898,6 +2020,23 @@ impl State {
         // edits the query, Enter runs / opens, ↑/↓ navigate, Tab flips
         // focus, Esc dismisses.
         if self.find_in_files.is_some() {
+            // Cmd-V pastes the clipboard into the query input. Done
+            // before the match so the localised "V" doesn't fall
+            // through and get appended as a literal character on
+            // non-Latin layouts.
+            if cmd && shortcut_letter(&event, 'v') {
+                if let Some(text) = clipboard_get() {
+                    if let Some(f) = self.find_in_files.as_mut() {
+                        if f.input_focused {
+                            f.query.push_str(&text);
+                            self.refresh_find_in_files_text();
+                            self.scene_dirty = true;
+                            self.window.request_redraw();
+                        }
+                    }
+                }
+                return;
+            }
             match &event.logical_key {
                 Key::Named(NamedKey::Escape) => {
                     self.find_in_files = None;
@@ -3717,11 +3856,29 @@ impl State {
         if !pane.visible || !pane.focused {
             return false;
         }
-        // Cmd-J still toggles the pane; let it fall through.
-        if let Key::Character(c) = &event.logical_key {
-            if is_cmd_or_ctrl(self.modifiers) && c.eq_ignore_ascii_case("j") {
-                return false;
+        // Cmd-J still toggles the pane; let it fall through. Use the
+        // physical key so layouts that remap the J position still
+        // resolve here.
+        if is_cmd_or_ctrl(self.modifiers) && shortcut_letter(event, 'j') {
+            return false;
+        }
+        // Cmd-V pastes the clipboard into the PTY. Standard terminal
+        // behaviour (iTerm, Apple Terminal, alacritty bind it the
+        // same way).
+        if is_cmd_or_ctrl(self.modifiers) && shortcut_letter(event, 'v') {
+            if let Some(text) = clipboard_get() {
+                if let Some(pane) = self.terminal.as_ref() {
+                    pane.write(text.into_bytes());
+                }
             }
+            return true;
+        }
+        // Every other Cmd / Ctrl chord stays with the host — Cmd-S
+        // saves the active doc, Cmd-Shift-P opens the palette, etc.
+        // Without this guard the printable-text fallback below would
+        // forward bytes like Cmd-S's pasteboard escape to the PTY.
+        if is_cmd_or_ctrl(self.modifiers) {
+            return false;
         }
         let bytes: Cow<'static, [u8]> = match &event.logical_key {
             Key::Named(NamedKey::Enter) => Cow::Borrowed(b"\r"),
@@ -4822,6 +4979,25 @@ impl State {
 
     /// Route a key while the palette is open.
     fn handle_palette_key(&mut self, event: KeyEvent) {
+        // Cmd-V pastes the clipboard into the palette query. Without
+        // this the user couldn't paste e.g. a copied file path or a
+        // script name into the prompt. Done before the match so the
+        // localised V (or any cmd-modified character) doesn't fall
+        // through to push_char as a literal.
+        if is_cmd_or_ctrl(self.modifiers) && shortcut_letter(&event, 'v') {
+            if let Some(text) = clipboard_get() {
+                if let Some(p) = self.palette.as_mut() {
+                    for c in text.chars() {
+                        p.push_char(c);
+                    }
+                    p.scroll_into_view(PALETTE_VISIBLE_ROWS);
+                }
+                self.refresh_palette_text();
+                self.scene_dirty = true;
+                self.window.request_redraw();
+            }
+            return;
+        }
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_palette(),
             Key::Named(NamedKey::ArrowUp) => {
@@ -5375,13 +5551,34 @@ impl State {
 
     /// Route a key while the find bar is open.
     fn handle_find_key(&mut self, event: KeyEvent) {
+        // Cmd-V pastes the clipboard into the find query. Checked
+        // before the alt-modified toggles so a Cmd-V chord doesn't
+        // also fire the case-toggle by accident on any layout.
+        if is_cmd_or_ctrl(self.modifiers)
+            && !self.modifiers.alt_key()
+            && shortcut_letter(&event, 'v')
+        {
+            if let Some(text) = clipboard_get() {
+                let buffer_text = self.doc().editor.text();
+                if let Some(f) = self.doc_mut().find.as_mut() {
+                    for c in text.chars() {
+                        f.push_char(c, &buffer_text);
+                    }
+                }
+                self.refresh_find_text();
+                self.select_current_match();
+                self.scene_dirty = true;
+                self.window.request_redraw();
+            }
+            return;
+        }
         // Cmd-Alt-C / Cmd-Alt-W toggle match-case / whole-word — checked
         // before the regular character branch so the chord doesn't insert
         // 'c' or 'w' into the query.
         if is_cmd_or_ctrl(self.modifiers) && self.modifiers.alt_key() {
-            if let Key::Character(c) = &event.logical_key {
+            if let Some(lower) = shortcut_letter_of(&event) {
                 let buffer_text = self.doc().editor.text();
-                match c.to_lowercase().as_str() {
+                match lower.as_str() {
                     "c" => {
                         if let Some(f) = self.doc_mut().find.as_mut() {
                             f.toggle_case_sensitive(&buffer_text);
