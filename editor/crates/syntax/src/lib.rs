@@ -40,6 +40,8 @@ pub enum Language {
     Java,
     Swift,
     Cpp,
+    Kotlin,
+    Scss,
 }
 
 impl Language {
@@ -68,6 +70,8 @@ impl Language {
             "java" => Some(Language::Java),
             "swift" => Some(Language::Swift),
             "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Language::Cpp),
+            "kt" | "kts" => Some(Language::Kotlin),
+            "scss" => Some(Language::Scss),
             _ => None,
         }
     }
@@ -94,6 +98,10 @@ impl Language {
             Language::Java => tree_sitter_java::LANGUAGE.into(),
             Language::Swift => tree_sitter_swift::LANGUAGE.into(),
             Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+            // scss exposes the older `language()` fn rather than a
+            // `LANGUAGE: LanguageFn` const; it still targets ts 0.25.
+            Language::Scss => tree_sitter_scss::language(),
         }
     }
 }
@@ -286,12 +294,15 @@ fn classifier_for(lang: Language) -> Classifier {
         Language::Lua => classify_lua,
         Language::Ruby => classify_ruby,
         Language::Html => classify_html,
-        Language::Css => classify_css,
+        // SCSS is a CSS superset; the CSS classifier covers the shared
+        // node kinds and SCSS extras degrade to no-highlight.
+        Language::Css | Language::Scss => classify_css,
         Language::Java => classify_java,
         Language::Swift => classify_swift,
         // C++ shares enough node kinds with C that the C classifier is
         // a reasonable base; C++-only constructs degrade gracefully.
         Language::Cpp => classify_c,
+        Language::Kotlin => classify_kotlin,
     }
 }
 
@@ -929,6 +940,53 @@ fn classify_swift(ctx: &NodeCtx) -> Option<HighlightCategory> {
     }
 }
 
+/// tree-sitter-kotlin-ng (Flutter's Android side, modern grammar). Most
+/// tokens come through as a bare `identifier` with no field, so this
+/// leans on parent kind + Kotlin's UpperCamelCase = type convention.
+/// `true` / `false` / `null` are identifiers in this grammar, not
+/// keyword nodes, so they're matched by text.
+fn classify_kotlin(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let NodeCtx {
+        kind, text, parent, ..
+    } = *ctx;
+    use HighlightCategory::*;
+    let upper = text.chars().next().is_some_and(|c| c.is_uppercase());
+    if kind == "identifier" {
+        if matches!(text, "true" | "false" | "null") {
+            return Some(Keyword);
+        }
+        match parent {
+            Some("class_declaration")
+            | Some("object_declaration")
+            | Some("user_type")
+            | Some("type_identifier")
+            | Some("type_parameter") => return Some(Type),
+            Some("function_declaration") => return Some(Function),
+            // Direct call: lowercase ⇒ function, UpperCamelCase ⇒
+            // constructor (Type).
+            Some("call_expression") => return Some(if upper { Type } else { Function }),
+            _ => {}
+        }
+        // Locals, params, navigation receivers/members, arguments.
+        return Some(if upper { Type } else { Variable });
+    }
+    match kind {
+        "line_comment" | "block_comment" | "shebang_line" => Some(Comment),
+        "string_content" | "character_literal" | "character_escape_seq" => Some(StringLit),
+        "number_literal" | "integer_literal" | "real_literal" | "hex_literal" | "bin_literal" => {
+            Some(Number)
+        }
+        "fun" | "val" | "var" | "class" | "object" | "interface" | "enum" | "data" | "sealed"
+        | "open" | "abstract" | "override" | "private" | "protected" | "public" | "internal"
+        | "final" | "const" | "lateinit" | "companion" | "import" | "package" | "return" | "if"
+        | "else" | "when" | "for" | "while" | "do" | "break" | "continue" | "throw" | "try"
+        | "catch" | "finally" | "in" | "is" | "as" | "by" | "this" | "super" | "null" | "true"
+        | "false" | "suspend" | "inline" | "operator" | "infix" | "vararg" | "typealias"
+        | "constructor" | "init" | "where" | "out" => Some(Keyword),
+        _ => None,
+    }
+}
+
 /// tree-sitter-md (CommonMark). Block-structure grammar — we surface the
 /// leaf markers and code spans, treat headings as keywords.
 fn classify_markdown(ctx: &NodeCtx) -> Option<HighlightCategory> {
@@ -1318,6 +1376,40 @@ fn x() {}
         );
         assert_eq!(Language::for_path(Path::new("x.cpp")), Some(Language::Cpp));
         assert_eq!(Language::for_path(Path::new("x.hpp")), Some(Language::Cpp));
+        assert_eq!(
+            Language::for_path(Path::new("M.kt")),
+            Some(Language::Kotlin)
+        );
+        assert_eq!(
+            Language::for_path(Path::new("b.kts")),
+            Some(Language::Kotlin)
+        );
+        assert_eq!(
+            Language::for_path(Path::new("a.scss")),
+            Some(Language::Scss)
+        );
+    }
+
+    #[test]
+    fn kotlin_types_calls_and_locals() {
+        let src = "class Foo {\n  fun run() {\n    val count = 5\n    println(count)\n  }\n}\n";
+        let types = spans_of(Language::Kotlin, src, HighlightCategory::Type);
+        assert!(types.contains(&"Foo".to_string()), "types={types:?}");
+        let funcs = spans_of(Language::Kotlin, src, HighlightCategory::Function);
+        assert!(funcs.contains(&"run".to_string()), "funcs={funcs:?}");
+        assert!(funcs.contains(&"println".to_string()), "funcs={funcs:?}");
+        let vars = spans_of(Language::Kotlin, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"count".to_string()), "vars={vars:?}");
+    }
+
+    #[test]
+    fn scss_highlights_via_css_classifier() {
+        let src = "$c: #333;\n.card { color: $c; font-size: 14px; }\n";
+        let cats = categories_with(Language::Scss, src);
+        // Selectors / property names resolve to Function via the CSS
+        // classifier; the px length is a Number.
+        assert!(cats.contains(&HighlightCategory::Function));
+        assert!(cats.contains(&HighlightCategory::Number));
     }
 
     #[test]
