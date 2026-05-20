@@ -21,6 +21,7 @@ mod palette;
 mod scripts;
 mod terminal;
 mod terminal_palette;
+mod vscode_discover;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -1165,6 +1166,12 @@ struct State {
     /// any edit to package.json too, since the watcher covers the
     /// whole root). Empty when no manifest is present.
     npm_scripts: Vec<scripts::NpmScript>,
+    /// VSCode colour themes discovered under `~/.vscode/extensions`
+    /// (and common forks). Scanned lazily on the first command-palette
+    /// open and cached here — disk scanning every open would be wasteful
+    /// and the install set rarely changes mid-session. `None` until the
+    /// first scan; `Some(vec![])` when VSCode isn't installed.
+    vscode_themes: Option<Vec<vscode_discover::DiscoveredTheme>>,
     /// Flutter project (pubspec.yaml with `flutter:` SDK dependency)
     /// detected in the workspace root. `Some` ⇒ the palette gets
     /// `Flutter: Run / Hot Reload / Hot Restart / Stop` entries and
@@ -1498,6 +1505,7 @@ impl State {
             workspace_git_status,
             workspace_git_dir_status,
             npm_scripts,
+            vscode_themes: None,
             flutter_project,
             flutter_session_active: false,
             flutter_devices: Vec::new(),
@@ -4931,6 +4939,20 @@ impl State {
             .cloned()
             .map(CommandEntry::builtin)
             .collect();
+        // VSCode themes installed on the machine. Scanned once and
+        // cached — the scan touches the filesystem so we don't want it
+        // on every palette open.
+        if self.vscode_themes.is_none() {
+            self.vscode_themes = Some(vscode_discover::discover_themes());
+        }
+        if let Some(themes) = self.vscode_themes.as_ref() {
+            for theme in themes {
+                entries.push(CommandEntry {
+                    id: CommandId::ApplyVscodeTheme(theme.path.clone()),
+                    label: format!("Theme: {}", theme.label),
+                });
+            }
+        }
         for script in &self.npm_scripts {
             entries.push(CommandEntry {
                 id: CommandId::RunScript(script.name.clone()),
@@ -5116,6 +5138,7 @@ impl State {
                 self.apply_bundled_theme("Tokyo Night", BUNDLED_TOKYO_NIGHT)
             }
             CommandId::BrowseThemes => self.browse_themes(),
+            CommandId::ApplyVscodeTheme(path) => self.apply_vscode_theme_path(&path),
             CommandId::RunScript(name) => self.run_npm_script(&name),
             CommandId::FlutterRun => {
                 self.flutter_session_active = true;
@@ -5243,16 +5266,7 @@ impl State {
         // then serialised to TOML for persistence so the existing
         // theme.toml watcher hot-reload path still works.
         if matches!(ext.as_deref(), Some("json")) {
-            match editor_config::load_vscode_theme(&path) {
-                Ok(theme) => {
-                    let toml_content = toml::to_string(&theme).unwrap_or_default();
-                    self.apply_bundled_theme(&label, &toml_content);
-                }
-                Err(e) => {
-                    log::error!("could not load VSCode theme {}: {}", path.display(), e);
-                    self.set_status_flash(format!("vscode theme failed: {e}"));
-                }
-            }
+            self.apply_vscode_theme_path(&path);
             return;
         }
         let content = match std::fs::read_to_string(&path) {
@@ -5263,6 +5277,29 @@ impl State {
             }
         };
         self.apply_bundled_theme(&label, &content);
+    }
+
+    /// Load a VSCode-format JSON theme from `path` and apply it. The
+    /// converted theme is serialised to TOML and routed through
+    /// [`apply_bundled_theme`](Self::apply_bundled_theme) so it persists
+    /// to `theme.toml` and rides the existing hot-reload path. Used by
+    /// both `Theme: Browse…` (file dialog) and the auto-discovered
+    /// `Theme: <name>` palette entries.
+    fn apply_vscode_theme_path(&mut self, path: &Path) {
+        let label = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Custom".to_string());
+        match editor_config::load_vscode_theme(path) {
+            Ok(theme) => {
+                let toml_content = toml::to_string(&theme).unwrap_or_default();
+                self.apply_bundled_theme(&label, &toml_content);
+            }
+            Err(e) => {
+                log::error!("could not load VSCode theme {}: {}", path.display(), e);
+                self.set_status_flash(format!("vscode theme failed: {e}"));
+            }
+        }
     }
 
     /// Apply a bundled theme: parse the embedded TOML (or fall back to
