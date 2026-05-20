@@ -36,6 +36,9 @@ pub enum CommandId {
     /// The payload is the absolute path to the theme JSON; the entry's
     /// `label` carries the theme's display name.
     ApplyVscodeTheme(std::path::PathBuf),
+    /// Import editor settings (font size / line height / tab size /
+    /// excluded dirs) from the user's VSCode `settings.json`.
+    ImportVscodeSettings,
     /// Run a `package.json` script by name in the embedded terminal.
     /// The string is the bare script name (the host already knows the
     /// package manager and the workspace root).
@@ -90,6 +93,7 @@ impl CommandEntry {
             // Built dynamically with a per-theme label; this fallback is
             // only hit if someone calls `builtin` on the variant.
             CommandId::ApplyVscodeTheme(_) => "Theme (VSCode)",
+            CommandId::ImportVscodeSettings => "Settings: Import from VSCode…",
             CommandId::RunScript(_) => "Run script",
             CommandId::FlutterRun => "Flutter: Run",
             CommandId::FlutterRunOnDevice(_) => "Flutter: Run on …",
@@ -123,6 +127,7 @@ pub const BUILTIN_COMMAND_IDS: &[CommandId] = &[
     CommandId::ThemeNord,
     CommandId::ThemeTokyoNight,
     CommandId::BrowseThemes,
+    CommandId::ImportVscodeSettings,
 ];
 
 /// The popup's state. Built from a fresh list of entries every time the

@@ -1,0 +1,9 @@
+LightEditor — editable surface
+
+Type to edit. Arrows move; Shift+Arrows select.
+Click to place the caret; drag to select; wheel to scroll.
+
+สวัสดีชาวโลก 
+안녕하세요 세계
+नमस्ते दुनिया
+🇹🇭 🌏 🚀 👨‍👩‍👧‍👦

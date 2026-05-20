@@ -5140,6 +5140,7 @@ impl State {
             }
             CommandId::BrowseThemes => self.browse_themes(),
             CommandId::ApplyVscodeTheme(path) => self.apply_vscode_theme_path(&path),
+            CommandId::ImportVscodeSettings => self.import_vscode_settings(),
             CommandId::RunScript(name) => self.run_npm_script(&name),
             CommandId::FlutterRun => {
                 self.flutter_session_active = true;
@@ -5343,10 +5344,138 @@ impl State {
         log::info!("applied theme: {label}");
     }
 
+    /// Apply a bundled theme matched by display name (case-insensitive),
+    /// returning `true` if one matched. Used to honour a VSCode
+    /// `workbench.colorTheme` on import — the common names map onto the
+    /// themes we ship. Unmatched names return `false` so the caller can
+    /// tell the user to import the theme JSON directly.
+    fn apply_theme_by_name(&mut self, name: &str) -> bool {
+        let key = name.trim().to_ascii_lowercase();
+        let (label, content): (&str, &str) = match key.as_str() {
+            "default dark+"
+            | "dark+"
+            | "dark (visual studio)"
+            | "default dark modern"
+            | "dark modern"
+            | "visual studio dark" => ("Default Dark", ""),
+            "solarized dark" => ("Solarized Dark", BUNDLED_SOLARIZED_DARK),
+            "solarized light" => ("Solarized Light", BUNDLED_SOLARIZED_LIGHT),
+            "monokai" => ("Monokai", BUNDLED_MONOKAI),
+            "gruvbox dark" | "gruvbox dark medium" | "gruvbox dark hard" => {
+                ("Gruvbox Dark", BUNDLED_GRUVBOX_DARK)
+            }
+            "nord" => ("Nord", BUNDLED_NORD),
+            "tokyo night" | "tokyonight" => ("Tokyo Night", BUNDLED_TOKYO_NIGHT),
+            _ => return false,
+        };
+        self.apply_bundled_theme(label, content);
+        true
+    }
+
     /// XDG/macOS path where the user's `theme.toml` lives. `None` if the
     /// OS has no config dir.
     fn theme_file_path(&self) -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join(CONFIG_SUBDIR).join(THEME_FILENAME))
+    }
+
+    /// Our user-level `settings.toml`.
+    fn settings_file_path(&self) -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join(CONFIG_SUBDIR).join(CONFIG_FILENAME))
+    }
+
+    /// Import editor settings from the user's VSCode `settings.json`.
+    ///
+    /// Looks at the stock VSCode location plus the common forks
+    /// (Insiders / VSCodium / Cursor / Windsurf) under the platform
+    /// config dir, and the workspace's `.vscode/settings.json` — the
+    /// workspace file wins where both set a key. Mapped editor keys
+    /// (font size, line height, tab size, excluded dirs) are merged onto
+    /// the current settings, persisted, and applied live; the active
+    /// `workbench.colorTheme` is applied too when it names a theme we
+    /// ship bundled.
+    fn import_vscode_settings(&mut self) {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(cfg) = dirs::config_dir() {
+            for app in ["Code", "Code - Insiders", "VSCodium", "Cursor", "Windsurf"] {
+                candidates.push(cfg.join(app).join("User").join("settings.json"));
+            }
+        }
+        // Workspace settings last so they override the user-level file.
+        candidates.push(self.file_tree.root.join(".vscode").join("settings.json"));
+
+        // The user-level settings.toml is both our merge base and our
+        // write target. (App owns the live `Settings`; we round-trip
+        // through disk so the settings watcher reloads + re-applies via
+        // the canonical path.)
+        let Some(settings_path) = self.settings_file_path() else {
+            return;
+        };
+        let base = Settings::load_or_default(&settings_path);
+        let mut merged = base.clone();
+        let mut color_theme: Option<String> = None;
+        let mut found = 0usize;
+        for path in &candidates {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            found += 1;
+            let partial = editor_config::import_vscode_settings(&text);
+            merged.merge(&partial);
+            // Later files (workspace) override the colour-theme pick.
+            if let Some(name) = editor_config::vscode_color_theme(&text) {
+                color_theme = Some(name);
+            }
+            log::info!("imported VSCode settings from {}", path.display());
+        }
+
+        if found == 0 {
+            self.set_status_flash("no VSCode settings.json found".to_string());
+            return;
+        }
+
+        // Apply + persist the editor settings if anything mapped.
+        let settings_changed = merged != base;
+        if settings_changed {
+            if let Some(parent) = settings_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match toml::to_string(&merged) {
+                Ok(toml_str) => {
+                    if let Err(e) = std::fs::write(&settings_path, toml_str) {
+                        log::error!("could not write {}: {}", settings_path.display(), e);
+                    }
+                }
+                Err(e) => log::error!("could not serialise settings: {e}"),
+            }
+            // Apply immediately; the settings watcher also fires on the
+            // write and re-applies via App, deduped on equality.
+            self.reload_settings(&merged);
+        }
+
+        // Apply the colour theme if it names one we ship.
+        let theme_applied = color_theme
+            .as_deref()
+            .map(|name| self.apply_theme_by_name(name))
+            .unwrap_or(false);
+
+        // Build a status line describing what actually happened.
+        let mut parts: Vec<String> = Vec::new();
+        if settings_changed {
+            parts.push("editor settings".to_string());
+        }
+        match (&color_theme, theme_applied) {
+            (Some(name), true) => parts.push(format!("theme “{name}”")),
+            (Some(name), false) => {
+                parts.push(format!("theme “{name}” (not bundled — use Theme: Browse…)"))
+            }
+            (None, _) => {}
+        }
+        let msg = if parts.is_empty() {
+            "VSCode settings: nothing to import".to_string()
+        } else {
+            format!("imported {}", parts.join(" + "))
+        };
+        self.set_status_flash(msg);
     }
 
     /// Close every tab except the active one. Each dirty non-active tab is
