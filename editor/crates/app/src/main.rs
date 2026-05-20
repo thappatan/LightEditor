@@ -644,6 +644,7 @@ fn syntax_color(theme: &editor_config::SyntaxTheme, category: HighlightCategory)
         HighlightCategory::Comment => &theme.comment,
         HighlightCategory::Type => &theme.type_,
         HighlightCategory::Function => &theme.function,
+        HighlightCategory::Variable => &theme.variable,
         HighlightCategory::Punctuation => &theme.punctuation,
     };
     text_color(hex)
