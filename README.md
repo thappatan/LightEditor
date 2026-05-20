@@ -41,21 +41,36 @@ Full rationale, performance budgets, and architecture live in the
 
 ## Project status
 
-**Early development — pre-1.0, not yet usable as a daily editor.**
+**Early development — pre-1.0, but already a working editor for its
+target stacks.**
 
-The project is built milestone by milestone. M0 proved the core
-graphics + text stack is viable; M1 begins the real editor.
+The project is built milestone by milestone. M0–M2 are complete and
+M3 (the Node.js / Flutter workflow) is largely shipped.
 
 | Milestone | Scope | Status |
 |-----------|-------|--------|
 | **M0** — Spike | winit + wgpu + Thai text shaping + latency baseline | ✅ Complete |
-| **M1** — Editable | Buffer, multi-cursor, undo/redo, command palette | ⏭️ Next |
-| M2 — Smart | LSP + tree-sitter; TypeScript + Dart | Planned |
-| M3 — Developable | Node/Flutter workflow, terminal, hot reload | Planned |
+| **M1** — Editable | Buffer, multi-cursor, undo/redo, command palette | ✅ Complete |
+| **M2** — Smart | LSP + tree-sitter; TypeScript + Dart | ✅ Complete |
+| **M3** — Developable | Node/Flutter workflow, terminal, hot reload | 🟡 Largely shipped |
 | M4 — AI Baseline | LLM client + inline completion | Planned |
 | M5 — AI Power | Inline edit, chat, codebase RAG | Planned |
 | M6 — Agentic | Agent loop + MCP | Planned |
 | M7 — Production | Debugging (DAP), git, polish, cross-platform QA | Planned |
+
+**Working today:** multi-cursor editing with cursor-restoring undo,
+tree-sitter syntax for 17 languages, LSP diagnostics / hover /
+go-to-definition / completion (Rust + TypeScript), a file-tree
+sidebar (keyboard nav, fs-watcher refresh, drag-resize, git-status
+decorations), git gutter, find-in-files, an embedded ANSI-colour
+terminal, npm/pnpm/yarn/bun script running and Flutter
+run / hot-reload / device-picker from the command palette,
+TOML + VSCode-JSON theming with hot-reload, and
+layout-independent keyboard shortcuts. See
+[`editor/README.md`](editor/README.md) for the full feature list.
+
+**Not yet built:** DAP debugging (M7), the AI stack (M4–M6),
+multi-root workspace UX, and split panes.
 
 M0 results — including the frame-time and cold-start baseline — are written
 up in [`docs/research/m0-spike-results.md`](docs/research/m0-spike-results.md).
@@ -84,7 +99,9 @@ path, and Thai is its correctness oracle.
 | Text shaping | [`cosmic-text`](https://docs.rs/cosmic-text) + [`swash`](https://docs.rs/swash) |
 | GPU text | [`glyphon`](https://docs.rs/glyphon) |
 | Text buffer | [`ropey`](https://docs.rs/ropey) |
-| Syntax | [`tree-sitter`](https://tree-sitter.github.io/) |
+| Syntax | [`tree-sitter`](https://tree-sitter.github.io/) (17 grammars) |
+| Git | [`git2`](https://docs.rs/git2) (libgit2) |
+| Terminal | [`alacritty_terminal`](https://docs.rs/alacritty_terminal) (PTY + VT parser) |
 | Protocols | LSP · DAP · MCP |
 
 Every major technical decision is recorded as an
@@ -123,7 +140,9 @@ Every major technical decision is recorded as an
 ```bash
 cd editor
 cargo build --workspace
-cargo run --release --bin app   # M0 spike: a window rendering multilingual text
+cargo run --release --bin app                 # empty editor
+cargo run --release --bin app -- path/to/file # open a file
+cargo run --release --bin app -- path/to/dir  # open a folder as the workspace
 ```
 
 ### Development checks
