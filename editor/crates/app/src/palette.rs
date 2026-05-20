@@ -32,6 +32,9 @@ pub enum CommandId {
     ThemeNord,
     ThemeTokyoNight,
     BrowseThemes,
+    /// Import editor settings (font size / line height / tab size /
+    /// excluded dirs) from the user's VSCode `settings.json`.
+    ImportVscodeSettings,
     /// Run a `package.json` script by name in the embedded terminal.
     /// The string is the bare script name (the host already knows the
     /// package manager and the workspace root).
@@ -83,6 +86,7 @@ impl CommandEntry {
             CommandId::ThemeNord => "Theme: Nord",
             CommandId::ThemeTokyoNight => "Theme: Tokyo Night",
             CommandId::BrowseThemes => "Theme: Browse…",
+            CommandId::ImportVscodeSettings => "Settings: Import from VSCode…",
             CommandId::RunScript(_) => "Run script",
             CommandId::FlutterRun => "Flutter: Run",
             CommandId::FlutterRunOnDevice(_) => "Flutter: Run on …",
@@ -116,6 +120,7 @@ pub const BUILTIN_COMMAND_IDS: &[CommandId] = &[
     CommandId::ThemeNord,
     CommandId::ThemeTokyoNight,
     CommandId::BrowseThemes,
+    CommandId::ImportVscodeSettings,
 ];
 
 /// The popup's state. Built from a fresh list of entries every time the

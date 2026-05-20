@@ -5,6 +5,7 @@
 //! keep working.
 
 mod theme;
+mod vscode_settings;
 mod vscode_theme;
 
 use std::path::Path;
@@ -12,6 +13,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 pub use theme::{parse_hex_color, EditorTheme, SyntaxTheme, TerminalTheme, Theme};
+pub use vscode_settings::import_vscode_settings;
 pub use vscode_theme::{load_vscode_theme, VscodeThemeError};
 
 /// The top-level settings document.
