@@ -577,6 +577,16 @@ fn quad_color(hex: &str) -> SceneColor {
     SceneColor::rgba(r, g, b, a)
 }
 
+/// Which overflowing popup a scrollbar belongs to. Only one is open at
+/// a time, so [`scrollbar_geometry`](State::scrollbar_geometry) returns
+/// the single active one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollTarget {
+    Palette,
+    Completion,
+    FindInFiles,
+}
+
 /// Compute a scrollbar-thumb rect for a scrolling popup list, or
 /// `None` when every item fits (no scroll, no bar). `track` is the
 /// vertical band the rows occupy; `total` / `visible` / `scroll` are
@@ -1145,6 +1155,13 @@ struct State {
     /// so the edge stays glued to the cursor instead of snapping to
     /// it on the first drag move.
     sidebar_resize_drag: Option<f32>,
+    /// `Some(grab_offset_px)` while dragging an overflowing popup's
+    /// scrollbar thumb. The offset is the distance from the mouse-down
+    /// point to the thumb's top edge, so the thumb tracks the cursor
+    /// without snapping. The popup it belongs to is re-derived each move
+    /// from [`scrollbar_geometry`](State::scrollbar_geometry) (only one
+    /// popup is open at a time).
+    scrollbar_drag: Option<f32>,
     /// Recursive filesystem watcher rooted at the sidebar's root.
     /// Fires `AppEvent::FileTreeChanged` after a 200 ms quiet period;
     /// the handler reloads with expansion preserved. `None` when
@@ -1502,6 +1519,7 @@ impl State {
             file_tree_text,
             sidebar_width_dip: SIDEBAR_DEFAULT_WIDTH_DIP,
             sidebar_resize_drag: None,
+            scrollbar_drag: None,
             _file_tree_watcher: file_tree_watcher,
             workspace_git_status,
             workspace_git_dir_status,
@@ -1836,6 +1854,18 @@ impl State {
             }
             return;
         }
+        // Cmd-Shift-V always pastes into the editor buffer, even when the
+        // terminal pane is open (which otherwise captures plain Cmd-V).
+        // This is the explicit "paste into editor" escape hatch the
+        // terminal-route comment below points at.
+        if is_cmd_or_ctrl(self.modifiers)
+            && self.modifiers.shift_key()
+            && shortcut_letter(&event, 'v')
+        {
+            self.paste_clipboard();
+            self.set_status_flash("pasted into editor".to_string());
+            return;
+        }
         // Cmd-V routes to the embedded terminal whenever the pane is
         // *visible*, even without keyboard focus — the user's mental
         // model is "I copied text, I want to push it into the
@@ -1843,9 +1873,8 @@ impl State {
         // first. Has to short-circuit *before* the editor's
         // Cmd-letter match below, otherwise the editor's `"v"` arm
         // would fire `paste_clipboard()` against the editor buffer.
-        // Editor paste while the terminal is open requires hiding
-        // the pane (Cmd-J) or a future explicit "Paste into editor"
-        // command.
+        // Editor paste while the terminal is open uses Cmd-Shift-V
+        // (handled just above) or hiding the pane with Cmd-J.
         if is_cmd_or_ctrl(self.modifiers)
             && shortcut_letter(&event, 'v')
             && self.terminal.as_ref().is_some_and(|t| t.visible)
@@ -2414,6 +2443,13 @@ impl State {
             return;
         };
         self.note_activity();
+        // A click on an open popup's scrollbar starts a drag (and jumps
+        // on a track click). Checked first so it beats the popups' own
+        // row-click handlers.
+        if let Some(off) = self.scrollbar_hit(mx, my) {
+            self.scrollbar_drag = Some(off);
+            return;
+        }
         // Clicks inside the terminal pane focus it; clicks anywhere
         // else unfocus it so the editor regains the keyboard.
         if self.terminal_pane_height() > 0.0 {
@@ -4055,6 +4091,7 @@ impl State {
     fn handle_mouse_release(&mut self) {
         self.drag_anchor = None;
         self.sidebar_resize_drag = None;
+        self.scrollbar_drag = None;
     }
 
     /// Write the active document to its path, or prompt for one with a Save As
@@ -6115,6 +6152,12 @@ impl State {
             self.scene_dirty = true;
             self.window.request_redraw();
         }
+        // Scrollbar drag: while a popup's thumb is held, slide the
+        // popup's scroll to track the cursor.
+        if let Some(grab_offset) = self.scrollbar_drag {
+            self.scrollbar_drag_to(y, grab_offset);
+            return;
+        }
         // Sidebar drag-resize: while the resize handle is held, every
         // mouse move slides the right edge. The branch returns so the
         // selection-drag path below doesn't also fire on the same
@@ -6725,25 +6768,6 @@ impl State {
         if self.completion.is_some() {
             if let Some(rect) = self.completion_panel_rect() {
                 root.push_child(SceneNode::quad(rect, quad_color(&et.overlay_bg)));
-                if let Some(popup) = self.completion.as_ref() {
-                    let lh = self.line_height();
-                    let pad = COMPLETION_PAD_DIP * self.scale;
-                    let track = Rect::new(
-                        rect.min_x(),
-                        rect.min_y() + pad,
-                        rect.size.width,
-                        (rect.size.height - 2.0 * pad).max(lh),
-                    );
-                    if let Some(thumb) = scrollbar_thumb(
-                        track,
-                        popup.filtered.len(),
-                        COMPLETION_MAX_ROWS,
-                        popup.scroll,
-                        self.scale,
-                    ) {
-                        root.push_child(SceneNode::quad(thumb, quad_color(&et.indent_guide)));
-                    }
-                }
             }
             if let Some(rect) = self.completion_selection_rect() {
                 root.push_child(SceneNode::quad(rect, quad_color(&et.palette_selection_bg)));
@@ -6762,26 +6786,6 @@ impl State {
                     quad_color(&et.palette_selection_bg),
                 ));
             }
-            if let Some(p) = self.palette.as_ref() {
-                let lh = self.line_height();
-                let pad = PALETTE_PAD_DIP * self.scale;
-                // Rows sit below the 2-line header (query + blank).
-                let track = Rect::new(
-                    panel.min_x(),
-                    panel.min_y() + pad + 2.0 * lh,
-                    panel.size.width,
-                    (PALETTE_VISIBLE_ROWS as f32 * lh).min(panel.size.height),
-                );
-                if let Some(thumb) = scrollbar_thumb(
-                    track,
-                    p.visible_count(),
-                    PALETTE_VISIBLE_ROWS,
-                    p.scroll(),
-                    self.scale,
-                ) {
-                    root.push_child(SceneNode::quad(thumb, quad_color(&et.indent_guide)));
-                }
-            }
         }
         if self.find_in_files.is_some() {
             // Scrim dims the editor behind the search panel so the
@@ -6795,26 +6799,163 @@ impl State {
             if let Some(rect) = self.find_in_files_selection_rect() {
                 root.push_child(SceneNode::quad(rect, quad_color(&et.palette_selection_bg)));
             }
-            if let Some(f) = self.find_in_files.as_ref() {
-                let lh = self.line_height();
-                let pad = FIND_FILES_PAD_DIP * self.scale;
-                let visible = self.find_in_files_visible_rows();
-                // Results sit below the header rows (input + status).
-                let track = Rect::new(
-                    panel.min_x(),
-                    panel.min_y() + pad + FIND_FILES_HEADER_ROWS as f32 * lh,
-                    panel.size.width,
-                    (visible as f32 * lh).min(panel.size.height),
-                );
-                if let Some(thumb) =
-                    scrollbar_thumb(track, f.results.len(), visible, f.scroll, self.scale)
-                {
-                    root.push_child(SceneNode::quad(thumb, quad_color(&et.indent_guide)));
-                }
+        }
+
+        // Scrollbar thumb for whichever popup is open + overflowing.
+        // Drawn last so it sits over the panel body.
+        if let Some((_, track, total, visible, scroll)) = self.scrollbar_geometry() {
+            if let Some(thumb) = scrollbar_thumb(track, total, visible, scroll, self.scale) {
+                root.push_child(SceneNode::quad(thumb, quad_color(&et.indent_guide)));
             }
         }
 
         self.overlay_scene = Scene::new(root);
+    }
+
+    /// Geometry of the active popup's scroll region: which popup, the
+    /// track rect the thumb lives in, and the `(total, visible, scroll)`
+    /// item counts. `None` when no scrolling popup is open. Shared by the
+    /// overlay renderer and the scrollbar-drag hit-testing so the two can
+    /// never disagree about where the bar is.
+    fn scrollbar_geometry(&self) -> Option<(ScrollTarget, Rect, usize, usize, usize)> {
+        let lh = self.line_height();
+        // Priority matches modality: palette / find-in-files are modal,
+        // completion is inline and never coexists with them.
+        if let Some(p) = self.palette.as_ref() {
+            let panel = self.palette_panel_rect();
+            let pad = PALETTE_PAD_DIP * self.scale;
+            let track = Rect::new(
+                panel.min_x(),
+                panel.min_y() + pad + 2.0 * lh,
+                panel.size.width,
+                (PALETTE_VISIBLE_ROWS as f32 * lh).min(panel.size.height),
+            );
+            return Some((
+                ScrollTarget::Palette,
+                track,
+                p.visible_count(),
+                PALETTE_VISIBLE_ROWS,
+                p.scroll(),
+            ));
+        }
+        if let Some(f) = self.find_in_files.as_ref() {
+            let panel = self.find_in_files_panel_rect();
+            let pad = FIND_FILES_PAD_DIP * self.scale;
+            let visible = self.find_in_files_visible_rows();
+            let track = Rect::new(
+                panel.min_x(),
+                panel.min_y() + pad + FIND_FILES_HEADER_ROWS as f32 * lh,
+                panel.size.width,
+                (visible as f32 * lh).min(panel.size.height),
+            );
+            return Some((
+                ScrollTarget::FindInFiles,
+                track,
+                f.results.len(),
+                visible,
+                f.scroll,
+            ));
+        }
+        if let Some(popup) = self.completion.as_ref() {
+            if let Some(rect) = self.completion_panel_rect() {
+                let pad = COMPLETION_PAD_DIP * self.scale;
+                let track = Rect::new(
+                    rect.min_x(),
+                    rect.min_y() + pad,
+                    rect.size.width,
+                    (rect.size.height - 2.0 * pad).max(lh),
+                );
+                return Some((
+                    ScrollTarget::Completion,
+                    track,
+                    popup.filtered.len(),
+                    COMPLETION_MAX_ROWS,
+                    popup.scroll,
+                ));
+            }
+        }
+        None
+    }
+
+    /// If `(mx, my)` lands on the active popup's scrollbar, return the
+    /// grab offset (mouse-y minus the thumb's top) and apply an
+    /// immediate jump when the click is on the track but off the thumb.
+    /// `None` when there's no bar or the click misses it.
+    fn scrollbar_hit(&mut self, mx: f32, my: f32) -> Option<f32> {
+        let (_, track, total, visible, scroll) = self.scrollbar_geometry()?;
+        let thumb = scrollbar_thumb(track, total, visible, scroll, self.scale)?;
+        // Generous horizontal hit slop — the bar is only a few px wide.
+        let slop = 6.0 * self.scale;
+        let on_bar_x = mx >= thumb.min_x() - slop && mx <= thumb.max_x() + slop;
+        if !on_bar_x || my < track.min_y() || my > track.max_y() {
+            return None;
+        }
+        if my >= thumb.min_y() && my <= thumb.max_y() {
+            Some(my - thumb.min_y())
+        } else {
+            // Click on the track above/below the thumb: centre the thumb
+            // on the click and start dragging from there.
+            let off = thumb.size.height / 2.0;
+            self.scrollbar_drag_to(my, off);
+            Some(off)
+        }
+    }
+
+    /// Move the active popup's scroll so its thumb top sits at
+    /// `my - grab_offset`, clamped to the track.
+    fn scrollbar_drag_to(&mut self, my: f32, grab_offset: f32) {
+        let Some((target, track, total, visible, _)) = self.scrollbar_geometry() else {
+            return;
+        };
+        let max_scroll = total.saturating_sub(visible);
+        if max_scroll == 0 {
+            return;
+        }
+        let track_h = track.size.height;
+        let thumb_h = (track_h * visible as f32 / total as f32).max(16.0 * self.scale);
+        let span = (track_h - thumb_h).max(1.0);
+        let new_top = (my - grab_offset).clamp(track.min_y(), track.min_y() + span);
+        let frac = (new_top - track.min_y()) / span;
+        let new_scroll = (frac * max_scroll as f32).round() as usize;
+        self.set_popup_scroll(target, new_scroll, visible);
+    }
+
+    /// Write a new scroll offset back to the popup `target` (clamped).
+    fn set_popup_scroll(&mut self, target: ScrollTarget, scroll: usize, visible: usize) {
+        match target {
+            ScrollTarget::Palette => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.set_scroll(scroll, visible);
+                }
+            }
+            ScrollTarget::Completion => {
+                if let Some(c) = self.completion.as_mut() {
+                    let max = c.filtered.len().saturating_sub(visible);
+                    c.scroll = scroll.min(max);
+                }
+            }
+            ScrollTarget::FindInFiles => {
+                if let Some(f) = self.find_in_files.as_mut() {
+                    let max = f.results.len().saturating_sub(visible);
+                    f.scroll = scroll.min(max);
+                }
+            }
+        }
+        self.refresh_active_popup_text();
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Re-render the text layer of whichever popup is open so a
+    /// scrollbar-driven scroll change shows new rows.
+    fn refresh_active_popup_text(&mut self) {
+        if self.palette.is_some() {
+            self.refresh_palette_text();
+        } else if self.find_in_files.is_some() {
+            self.refresh_find_in_files_text();
+        } else if self.completion.is_some() {
+            self.shape_completion_popup_inplace();
+        }
     }
 
     /// Selection highlight rectangles.
