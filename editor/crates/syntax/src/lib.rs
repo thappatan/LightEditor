@@ -203,6 +203,7 @@ impl Highlighter {
             None,
             None,
             None,
+            text,
             &byte_to_char,
             classifier,
             &mut out,
@@ -247,6 +248,12 @@ fn build_byte_to_char_map(text: &str) -> Vec<usize> {
 pub struct NodeCtx<'a> {
     /// The node's own kind.
     pub kind: &'a str,
+    /// The node's source text. Cheap (a slice of the buffer). Used by
+    /// classifiers that lean on naming conventions — e.g. Dart, where an
+    /// UpperCamelCase identifier names a type/widget and a lowerCamelCase
+    /// one names a value, a distinction tree-sitter-dart doesn't make in
+    /// its node kinds.
+    pub text: &'a str,
     /// Parent kind, or `None` at the root.
     pub parent: Option<&'a str>,
     /// Field name the node occupies inside its parent.
@@ -295,12 +302,14 @@ fn collect(
     parent_field: Option<&str>,
     grandparent_kind: Option<&str>,
     grandparent_field: Option<&str>,
+    src: &str,
     byte_to_char: &[usize],
     classify: Classifier,
     out: &mut Vec<Highlight>,
 ) {
     let ctx = NodeCtx {
         kind: node.kind(),
+        text: src.get(node.byte_range()).unwrap_or(""),
         parent: parent_kind,
         field: parent_field,
         grandparent: grandparent_kind,
@@ -338,6 +347,7 @@ fn collect(
             field,
             parent_kind,
             parent_field,
+            src,
             byte_to_char,
             classify,
             out,
@@ -398,6 +408,7 @@ fn classify_typescript(ctx: &NodeCtx) -> Option<HighlightCategory> {
         field,
         grandparent,
         grandparent_field,
+        ..
     } = *ctx;
     use HighlightCategory::*;
     if kind == "identifier"
@@ -456,6 +467,7 @@ fn classify_javascript(ctx: &NodeCtx) -> Option<HighlightCategory> {
         field,
         grandparent,
         grandparent_field,
+        ..
     } = *ctx;
     use HighlightCategory::*;
     if kind == "identifier"
@@ -640,43 +652,67 @@ fn classify_yaml(ctx: &NodeCtx) -> Option<HighlightCategory> {
     }
 }
 
-/// tree-sitter-dart. Covers Flutter idioms — annotations like
-/// `@override`, function calls (`obj.method()`), constructor invocations
-/// — on top of the obvious comments / strings / numbers / type names.
+/// tree-sitter-dart. This grammar is JS-shaped — calls are
+/// `call_expression` with a `function` field, member access is
+/// `member_expression` with `object` / `property`, named arguments wrap
+/// their name in a `label`. Dart doesn't tag class vs value identifiers
+/// in its node kinds, so we lean on the language's naming convention:
+/// **UpperCamelCase ⇒ a type/widget** (`Scaffold`, `Theme`,
+/// `MainAxisAlignment`), lowerCamelCase ⇒ a value. That single rule is
+/// what makes Flutter code read like VSCode — every widget name turns
+/// teal — without semantic tokens.
 fn classify_dart(ctx: &NodeCtx) -> Option<HighlightCategory> {
     let NodeCtx {
         kind,
+        text,
         parent,
         field,
-        ..
+        grandparent,
+        grandparent_field,
     } = *ctx;
     use HighlightCategory::*;
+    // A leading uppercase letter is Dart's convention for types/classes.
+    let upper = text.chars().next().is_some_and(|c| c.is_uppercase());
     if kind == "identifier" {
         match (parent, field) {
+            // Declaration names.
             (Some("function_signature"), Some("name"))
             | (Some("method_signature"), Some("name"))
             | (Some("getter_signature"), Some("name"))
             | (Some("setter_signature"), Some("name"))
             | (Some("constructor_signature"), Some("name"))
             | (Some("factory_constructor_signature"), Some("name")) => return Some(Function),
-            (Some("class_definition"), Some("name"))
+            (Some("class_declaration"), Some("name"))
+            | (Some("class_definition"), Some("name"))
             | (Some("mixin_declaration"), Some("name"))
             | (Some("enum_declaration"), Some("name"))
             | (Some("type_alias"), Some("name"))
             | (Some("extension_declaration"), Some("name")) => return Some(Type),
             // `@override`, `@deprecated`, `@JsonSerializable()` etc.
-            // The identifier sits under `marker_annotation` / `annotation`
-            // — paint it as Keyword so the `@` stands out.
             (Some("marker_annotation"), _) | (Some("annotation"), _) => return Some(Keyword),
-            // The method / function name in a call site (`widget.build()`).
-            (Some("selector"), _)
-            | (Some("function_expression_invocation"), Some("function"))
-            | (Some("conditional_assignable_selector"), _) => return Some(Function),
+            // Callee of `foo(...)` / `Widget(...)`. Uppercase ⇒ a
+            // constructor (Type, teal); lowercase ⇒ a function call.
+            (Some("call_expression"), Some("function")) => {
+                return Some(if upper { Type } else { Function })
+            }
+            // `obj.member` — a property of a member_expression that is
+            // itself a callee is a method call; otherwise a property
+            // read (or a static type reference, when UpperCamelCase).
+            (Some("member_expression"), Some("property")) => {
+                if grandparent == Some("call_expression") && grandparent_field == Some("function") {
+                    return Some(Function);
+                }
+                return Some(if upper { Type } else { Variable });
+            }
+            // `Theme.of(...)` — the receiver. Uppercase ⇒ a type.
+            (Some("member_expression"), Some("object")) => {
+                return Some(if upper { Type } else { Variable })
+            }
             _ => {}
         }
-        // Any other identifier names a value — local, parameter, field
-        // access. Light-blue, matching VSCode's Dart highlighting.
-        return Some(Variable);
+        // Any other identifier: a type if UpperCamelCase, else a value
+        // (local / parameter / named-argument label / property).
+        return Some(if upper { Type } else { Variable });
     }
     match kind {
         "comment" | "documentation_comment" | "line_comment" | "block_comment" => Some(Comment),
@@ -1393,6 +1429,27 @@ fn x() {}
         let vars = spans_of(Language::Dart, src, HighlightCategory::Variable);
         assert!(vars.contains(&"count".to_string()), "got {vars:?}");
         assert!(vars.contains(&"items".to_string()), "got {vars:?}");
+    }
+
+    #[test]
+    fn dart_widget_names_are_types_and_methods_are_functions() {
+        // The Flutter idiom: widget constructors should read as Type
+        // (UpperCamelCase), method calls as Function, value identifiers
+        // as Variable — matching VSCode.
+        let src = "class W extends StatefulWidget {\n  Widget build(BuildContext context) {\n    return Scaffold(appBar: AppBar(backgroundColor: Theme.of(context).primary));\n  }\n}\n";
+        let types = spans_of(Language::Dart, src, HighlightCategory::Type);
+        assert!(types.contains(&"Scaffold".to_string()), "types={types:?}");
+        assert!(types.contains(&"AppBar".to_string()), "types={types:?}");
+        assert!(types.contains(&"Theme".to_string()), "types={types:?}");
+
+        let funcs = spans_of(Language::Dart, src, HighlightCategory::Function);
+        assert!(funcs.contains(&"of".to_string()), "funcs={funcs:?}");
+
+        let vars = spans_of(Language::Dart, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"appBar".to_string()), "vars={vars:?}");
+        assert!(vars.contains(&"context".to_string()), "vars={vars:?}");
+        // A widget name must not also be a Function.
+        assert!(!funcs.contains(&"Scaffold".to_string()));
     }
 
     // ── incremental parsing ───────────────────────────────────────────────
