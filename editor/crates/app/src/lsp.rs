@@ -37,26 +37,35 @@ use editor_syntax::Language;
 pub enum ServerKind {
     Rust,
     TypeScript,
+    Dart,
 }
 
 impl ServerKind {
     /// The server backing `lang`, if any. `None` for languages we haven't
-    /// wired (Python, Go, Dart, …) — they fall back to tree-sitter only.
+    /// wired (Python, Go, HTML, …) — they fall back to tree-sitter only.
     pub fn for_language(lang: Language) -> Option<Self> {
         match lang {
             Language::Rust => Some(ServerKind::Rust),
             Language::TypeScript | Language::Tsx | Language::JavaScript => {
                 Some(ServerKind::TypeScript)
             }
+            Language::Dart => Some(ServerKind::Dart),
             _ => None,
         }
     }
 
-    /// The executable + argv that spawns this server.
+    /// The executable + argv that spawns this server. Missing binaries
+    /// disable LSP for that language silently (the spawn just fails and
+    /// we fall back to tree-sitter highlighting).
     fn command(self) -> (&'static str, Vec<&'static str>) {
         match self {
             ServerKind::Rust => ("rust-analyzer", vec![]),
             ServerKind::TypeScript => ("typescript-language-server", vec!["--stdio"]),
+            // The Dart SDK ships its analysis server behind
+            // `dart language-server`. `--protocol=lsp` is the default
+            // on recent SDKs but we pass it explicitly so older ones
+            // don't fall back to the legacy analysis protocol.
+            ServerKind::Dart => ("dart", vec!["language-server", "--protocol=lsp"]),
         }
     }
 }
@@ -746,6 +755,10 @@ mod tests {
         assert_eq!(
             ServerKind::for_language(Language::Rust),
             Some(ServerKind::Rust)
+        );
+        assert_eq!(
+            ServerKind::for_language(Language::Dart),
+            Some(ServerKind::Dart)
         );
         // No server wired yet for these — falls through to None.
         assert_eq!(ServerKind::for_language(Language::Python), None);
