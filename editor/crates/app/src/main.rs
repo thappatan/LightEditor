@@ -1162,6 +1162,11 @@ struct State {
     /// from [`scrollbar_geometry`](State::scrollbar_geometry) (only one
     /// popup is open at a time).
     scrollbar_drag: Option<f32>,
+    /// `Some(grab_offset_px)` while dragging the file-tree sidebar's
+    /// scrollbar thumb. Separate from [`scrollbar_drag`](Self::scrollbar_drag)
+    /// because the sidebar scrolls by pixels (`file_tree.scroll_y`), not
+    /// by whole rows like the popups.
+    sidebar_scroll_drag: Option<f32>,
     /// Recursive filesystem watcher rooted at the sidebar's root.
     /// Fires `AppEvent::FileTreeChanged` after a 200 ms quiet period;
     /// the handler reloads with expansion preserved. `None` when
@@ -1520,6 +1525,7 @@ impl State {
             sidebar_width_dip: SIDEBAR_DEFAULT_WIDTH_DIP,
             sidebar_resize_drag: None,
             scrollbar_drag: None,
+            sidebar_scroll_drag: None,
             _file_tree_watcher: file_tree_watcher,
             workspace_git_status,
             workspace_git_dir_status,
@@ -2490,6 +2496,21 @@ impl State {
             self.last_click = None;
             return;
         }
+        // A click on the sidebar's scrollbar thumb starts a pixel drag.
+        // Tested after the resize handle (which sits just to its right)
+        // and before the row-open handler so it doesn't open a file.
+        if let Some(thumb) = self.sidebar_scrollbar_thumb() {
+            let slop = 4.0 * self.scale;
+            if mx >= thumb.min_x() - slop
+                && mx <= thumb.max_x() + slop
+                && my >= thumb.min_y()
+                && my <= thumb.max_y()
+            {
+                self.sidebar_scroll_drag = Some(my - thumb.min_y());
+                self.last_click = None;
+                return;
+            }
+        }
         // Find-in-files panel claims clicks first while open — clicking
         // a result row opens that file; clicking the input row focuses
         // it; clicking outside the panel dismisses it.
@@ -3292,6 +3313,52 @@ impl State {
         Rect::new(0.0, top, self.sidebar_width(), (bottom - top).max(0.0))
     }
 
+    /// Pixel-based scrollbar thumb for the file-tree sidebar, or `None`
+    /// when the tree fits the visible band. Unlike the popups (whole-row
+    /// scroll), the sidebar scrolls by pixels via `file_tree.scroll_y`,
+    /// so the thumb is sized from content height directly. Positioned
+    /// just left of the resize handle so the two never overlap.
+    fn sidebar_scrollbar_thumb(&self) -> Option<Rect> {
+        if !self.file_tree.visible {
+            return None;
+        }
+        let line_h = self.line_height();
+        let top = TAB_BAR_HEIGHT_DIP * self.scale;
+        let body_h = (self.editor_bottom_y() - top).max(0.0);
+        let content_h = self.file_tree.nodes.len() as f32 * line_h;
+        if content_h <= body_h || body_h <= 0.0 {
+            return None;
+        }
+        let width = (3.0 * self.scale).max(2.0);
+        let resize_half = SIDEBAR_RESIZE_HANDLE_DIP * self.scale * 0.5;
+        let x = self.sidebar_width() - resize_half - width;
+        let thumb_h = (body_h * body_h / content_h).max(16.0 * self.scale);
+        let max_scroll = content_h - body_h;
+        let frac = (self.file_tree.scroll_y / max_scroll).clamp(0.0, 1.0);
+        let y = top + frac * (body_h - thumb_h);
+        Some(Rect::new(x, y, width, thumb_h))
+    }
+
+    /// Move `file_tree.scroll_y` so the thumb top sits at
+    /// `my - grab_offset`, clamped to the visible band.
+    fn sidebar_scroll_to(&mut self, my: f32, grab_offset: f32) {
+        let line_h = self.line_height();
+        let top = TAB_BAR_HEIGHT_DIP * self.scale;
+        let body_h = (self.editor_bottom_y() - top).max(0.0);
+        let content_h = self.file_tree.nodes.len() as f32 * line_h;
+        let max_scroll = content_h - body_h;
+        if max_scroll <= 0.0 {
+            return;
+        }
+        let thumb_h = (body_h * body_h / content_h).max(16.0 * self.scale);
+        let span = (body_h - thumb_h).max(1.0);
+        let new_top = (my - grab_offset).clamp(top, top + span);
+        let frac = (new_top - top) / span;
+        self.file_tree.scroll_y = (frac * max_scroll).clamp(0.0, max_scroll);
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
     /// Toggle the sidebar's visibility and recompute the editor's left
     /// inset so the gutter + text shift to make room (or reclaim it).
     /// Showing the sidebar also gives it keyboard focus and seeds the
@@ -4092,6 +4159,7 @@ impl State {
         self.drag_anchor = None;
         self.sidebar_resize_drag = None;
         self.scrollbar_drag = None;
+        self.sidebar_scroll_drag = None;
     }
 
     /// Write the active document to its path, or prompt for one with a Save As
@@ -6158,6 +6226,11 @@ impl State {
             self.scrollbar_drag_to(y, grab_offset);
             return;
         }
+        // Sidebar scrollbar drag (pixel scroll).
+        if let Some(grab_offset) = self.sidebar_scroll_drag {
+            self.sidebar_scroll_to(y, grab_offset);
+            return;
+        }
         // Sidebar drag-resize: while the resize handle is held, every
         // mouse move slides the right edge. The branch returns so the
         // selection-drag path below doesn't also fire on the same
@@ -6479,6 +6552,10 @@ impl State {
                 ),
                 quad_color(&et.active_line_bg),
             ));
+            // Scrollbar thumb when the tree overflows the panel.
+            if let Some(thumb) = self.sidebar_scrollbar_thumb() {
+                root.push_child(SceneNode::quad(thumb, quad_color(&et.indent_guide)));
+            }
         }
 
         // Gutter backdrop — a slim column on the left of the editor
