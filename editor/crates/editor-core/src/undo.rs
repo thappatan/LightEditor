@@ -55,9 +55,22 @@ impl UndoTree {
 
     /// Record a new state as a child of the current node and move to it.
     ///
+    /// `pre_selections` is where the user's cursor *was* right before
+    /// the edit that produced this snapshot — i.e. where they should
+    /// land after a future undo. We refresh the *current* (about-to-
+    /// become-parent) node's selections to that value so the parent
+    /// accurately reflects "the state the user could undo back to",
+    /// even after the user moved the cursor between commits.
+    ///
     /// If the current node already has children (i.e. we are here after an
     /// undo), this adds a *new branch* rather than replacing the old one.
-    pub fn commit(&mut self, buffer: TextBuffer, selections: SelectionSet) {
+    pub fn commit(
+        &mut self,
+        buffer: TextBuffer,
+        selections: SelectionSet,
+        pre_selections: SelectionSet,
+    ) {
+        self.nodes[self.current].selections = pre_selections;
         let new_index = self.nodes.len();
         self.nodes.push(UndoNode {
             buffer,
@@ -129,9 +142,9 @@ mod tests {
     fn linear_undo_redo() {
         let mut t = tree("a", 1);
         let (b, s) = state("ab", 2);
-        t.commit(b, s);
+        t.commit(b, s, SelectionSet::single(Selection::cursor(1)));
         let (b, s) = state("abc", 3);
-        t.commit(b, s);
+        t.commit(b, s, SelectionSet::single(Selection::cursor(2)));
 
         assert_eq!(t.current_buffer().to_string(), "abc");
         assert!(t.can_undo());
@@ -156,10 +169,12 @@ mod tests {
         t.commit(
             TextBuffer::from("ab"),
             SelectionSet::single(Selection::cursor(2)),
+            SelectionSet::single(Selection::cursor(1)),
         );
         t.commit(
             TextBuffer::from("abc"),
             SelectionSet::single(Selection::cursor(3)),
+            SelectionSet::single(Selection::cursor(2)),
         );
 
         // back to "ab"
@@ -170,6 +185,7 @@ mod tests {
         t.commit(
             TextBuffer::from("abX"),
             SelectionSet::single(Selection::cursor(3)),
+            SelectionSet::single(Selection::cursor(2)),
         );
         assert_eq!(t.current_buffer().to_string(), "abX");
 
@@ -188,13 +204,35 @@ mod tests {
     #[test]
     fn snapshot_carries_selections() {
         let mut t = tree("x", 0);
+        // commit also refreshes the parent's selections to `pre`, so
+        // an undo lands us at the cursor location passed as the
+        // third argument — not the value the parent was constructed
+        // with.
         t.commit(
             TextBuffer::from("xy"),
             SelectionSet::single(Selection::new(0, 2)),
+            SelectionSet::single(Selection::cursor(1)),
         );
         t.undo();
-        assert_eq!(t.current_selections().primary(), Selection::cursor(0));
+        assert_eq!(t.current_selections().primary(), Selection::cursor(1));
         let (_, sels) = t.redo().unwrap();
         assert_eq!(sels.primary(), Selection::new(0, 2));
+    }
+
+    #[test]
+    fn pre_selections_overwrite_parent_at_commit() {
+        // Even though `tree("x", 0)` seeds the root with cursor=0, a
+        // commit whose `pre` says cursor=3 should leave the root
+        // *with* cursor=3 — that's the whole point: parent records
+        // where the user was just before the edit, not where they
+        // happened to be at construction.
+        let mut t = tree("xxx", 0);
+        t.commit(
+            TextBuffer::from("xxxy"),
+            SelectionSet::single(Selection::cursor(4)),
+            SelectionSet::single(Selection::cursor(3)),
+        );
+        let (_, sels) = t.undo().unwrap();
+        assert_eq!(sels.primary(), Selection::cursor(3));
     }
 }

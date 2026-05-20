@@ -124,6 +124,8 @@ fn language_id(lang: Language) -> &'static str {
         Language::Bash => "shellscript",
         Language::Lua => "lua",
         Language::Ruby => "ruby",
+        Language::Html => "html",
+        Language::Css => "css",
     }
 }
 
