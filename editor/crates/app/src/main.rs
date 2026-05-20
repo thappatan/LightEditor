@@ -576,6 +576,37 @@ fn quad_color(hex: &str) -> SceneColor {
     SceneColor::rgba(r, g, b, a)
 }
 
+/// Compute a scrollbar-thumb rect for a scrolling popup list, or
+/// `None` when every item fits (no scroll, no bar). `track` is the
+/// vertical band the rows occupy; `total` / `visible` / `scroll` are
+/// item counts and the current top-row offset. The thumb is a thin
+/// bar pinned to the track's right edge, its height proportional to
+/// the visible fraction (floored so it stays grabbable), its position
+/// proportional to how far the list is scrolled.
+fn scrollbar_thumb(
+    track: Rect,
+    total: usize,
+    visible: usize,
+    scroll: usize,
+    scale: f32,
+) -> Option<Rect> {
+    if total <= visible || visible == 0 {
+        return None;
+    }
+    let width = (3.0 * scale).max(2.0);
+    let x = track.max_x() - width;
+    let track_h = track.size.height;
+    let thumb_h = (track_h * visible as f32 / total as f32).max(16.0 * scale);
+    let max_scroll = (total - visible) as f32;
+    let frac = if max_scroll > 0.0 {
+        (scroll as f32 / max_scroll).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let y = track.min_y() + frac * (track_h - thumb_h);
+    Some(Rect::new(x, y, width, thumb_h))
+}
+
 /// Resolve a theme color string for cosmic-text. Alpha is dropped — glyphs
 /// are either drawn or not; per-glyph transparency isn't useful at the
 /// text layer.
@@ -6527,6 +6558,25 @@ impl State {
         if self.completion.is_some() {
             if let Some(rect) = self.completion_panel_rect() {
                 root.push_child(SceneNode::quad(rect, quad_color(&et.overlay_bg)));
+                if let Some(popup) = self.completion.as_ref() {
+                    let lh = self.line_height();
+                    let pad = COMPLETION_PAD_DIP * self.scale;
+                    let track = Rect::new(
+                        rect.min_x(),
+                        rect.min_y() + pad,
+                        rect.size.width,
+                        (rect.size.height - 2.0 * pad).max(lh),
+                    );
+                    if let Some(thumb) = scrollbar_thumb(
+                        track,
+                        popup.filtered.len(),
+                        COMPLETION_MAX_ROWS,
+                        popup.scroll,
+                        self.scale,
+                    ) {
+                        root.push_child(SceneNode::quad(thumb, quad_color(&et.indent_guide)));
+                    }
+                }
             }
             if let Some(rect) = self.completion_selection_rect() {
                 root.push_child(SceneNode::quad(rect, quad_color(&et.palette_selection_bg)));
@@ -6537,15 +6587,33 @@ impl State {
                 Rect::new(0.0, 0.0, w, h),
                 quad_color(&et.overlay_scrim),
             ));
-            root.push_child(SceneNode::quad(
-                self.palette_panel_rect(),
-                quad_color(&et.overlay_bg),
-            ));
+            let panel = self.palette_panel_rect();
+            root.push_child(SceneNode::quad(panel, quad_color(&et.overlay_bg)));
             if let Some(highlight) = self.palette_selection_rect() {
                 root.push_child(SceneNode::quad(
                     highlight,
                     quad_color(&et.palette_selection_bg),
                 ));
+            }
+            if let Some(p) = self.palette.as_ref() {
+                let lh = self.line_height();
+                let pad = PALETTE_PAD_DIP * self.scale;
+                // Rows sit below the 2-line header (query + blank).
+                let track = Rect::new(
+                    panel.min_x(),
+                    panel.min_y() + pad + 2.0 * lh,
+                    panel.size.width,
+                    (PALETTE_VISIBLE_ROWS as f32 * lh).min(panel.size.height),
+                );
+                if let Some(thumb) = scrollbar_thumb(
+                    track,
+                    p.visible_count(),
+                    PALETTE_VISIBLE_ROWS,
+                    p.scroll(),
+                    self.scale,
+                ) {
+                    root.push_child(SceneNode::quad(thumb, quad_color(&et.indent_guide)));
+                }
             }
         }
         if self.find_in_files.is_some() {
@@ -6555,12 +6623,27 @@ impl State {
                 Rect::new(0.0, 0.0, w, h),
                 quad_color(&et.overlay_scrim),
             ));
-            root.push_child(SceneNode::quad(
-                self.find_in_files_panel_rect(),
-                quad_color(&et.overlay_bg),
-            ));
+            let panel = self.find_in_files_panel_rect();
+            root.push_child(SceneNode::quad(panel, quad_color(&et.overlay_bg)));
             if let Some(rect) = self.find_in_files_selection_rect() {
                 root.push_child(SceneNode::quad(rect, quad_color(&et.palette_selection_bg)));
+            }
+            if let Some(f) = self.find_in_files.as_ref() {
+                let lh = self.line_height();
+                let pad = FIND_FILES_PAD_DIP * self.scale;
+                let visible = self.find_in_files_visible_rows();
+                // Results sit below the header rows (input + status).
+                let track = Rect::new(
+                    panel.min_x(),
+                    panel.min_y() + pad + FIND_FILES_HEADER_ROWS as f32 * lh,
+                    panel.size.width,
+                    (visible as f32 * lh).min(panel.size.height),
+                );
+                if let Some(thumb) =
+                    scrollbar_thumb(track, f.results.len(), visible, f.scroll, self.scale)
+                {
+                    root.push_child(SceneNode::quad(thumb, quad_color(&et.indent_guide)));
+                }
             }
         }
 
