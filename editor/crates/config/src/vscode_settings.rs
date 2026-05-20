@@ -19,8 +19,17 @@
 //!   reduced to their base name. Patterns with slashes or wildcards in
 //!   the middle are too expressive for our basename-only model and are
 //!   skipped.
+//!
+//! **Language-scoped fallback.** Real-world `settings.json` files often
+//! carry no top-level `editor.*` keys at all — the values live inside
+//! per-language blocks (`"[typescript]": { "editor.tabSize": 2 }`).
+//! When a top-level `editor.*` key is absent we fall back to the value
+//! that appears most often across those blocks, so an import isn't a
+//! no-op just because the user only ever set tab size per language.
 
-use serde_json::Value;
+use std::collections::HashMap;
+
+use serde_json::{Map, Value};
 
 use crate::vscode_theme::strip_jsonc;
 use crate::PartialSettings;
@@ -41,14 +50,14 @@ pub fn import_vscode_settings(json_text: &str) -> PartialSettings {
 
     let mut out = PartialSettings::default();
 
-    let font_size = obj.get("editor.fontSize").and_then(Value::as_f64);
+    let font_size = resolve_number(obj, "editor.fontSize");
     if let Some(fs) = font_size {
         out.editor.font_size = Some(fs as f32);
     }
-    if let Some(tab) = obj.get("editor.tabSize").and_then(Value::as_u64) {
+    if let Some(tab) = resolve_number(obj, "editor.tabSize") {
         out.editor.tab_size = Some(tab as usize);
     }
-    if let Some(lh) = obj.get("editor.lineHeight").and_then(Value::as_f64) {
+    if let Some(lh) = resolve_number(obj, "editor.lineHeight") {
         // VSCode: 0 = auto (leave ours); <8 = multiplier; >=8 = pixels.
         let resolved = if lh == 0.0 {
             None
@@ -72,6 +81,53 @@ pub fn import_vscode_settings(json_text: &str) -> PartialSettings {
     }
 
     out
+}
+
+/// Extract `workbench.colorTheme` (the active theme's display name)
+/// from a VSCode settings document, if present. The caller resolves the
+/// name to an actual theme; this only reads the string.
+pub fn vscode_color_theme(json_text: &str) -> Option<String> {
+    let stripped = strip_jsonc(json_text);
+    let value = serde_json::from_str::<Value>(&stripped).ok()?;
+    value
+        .as_object()?
+        .get("workbench.colorTheme")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Resolve a numeric `editor.*` setting, preferring the top-level value
+/// and falling back to the value seen most often across the per-language
+/// (`"[lang]"`) override blocks. Returns `None` when the key is absent
+/// everywhere. Ties between equally-frequent block values resolve to the
+/// numerically smaller one, so the result is deterministic regardless of
+/// JSON object ordering.
+fn resolve_number(obj: &Map<String, Value>, key: &str) -> Option<f64> {
+    if let Some(v) = obj.get(key).and_then(Value::as_f64) {
+        return Some(v);
+    }
+    // Gather the key's value from every `"[lang]"` block.
+    let mut counts: HashMap<u64, (usize, f64)> = HashMap::new();
+    for (k, v) in obj {
+        if !(k.starts_with('[') && k.ends_with(']')) {
+            continue;
+        }
+        let Some(block) = v.as_object() else { continue };
+        let Some(n) = block.get(key).and_then(Value::as_f64) else {
+            continue;
+        };
+        // f64 isn't Hash/Eq; bucket on the bit pattern, which is exact
+        // for the integer-ish values these settings hold.
+        let entry = counts.entry(n.to_bits()).or_insert((0, n));
+        entry.0 += 1;
+    }
+    counts
+        .into_values()
+        .max_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        })
+        .map(|(_, n)| n)
 }
 
 /// Reduce a `files.exclude` glob to a bare directory name, or `None`
@@ -145,6 +201,54 @@ mod tests {
         );
         assert_eq!(p.editor.font_size, Some(15.0));
         assert_eq!(p.editor.tab_size, Some(4));
+    }
+
+    #[test]
+    fn falls_back_to_language_block_tab_size() {
+        // Mirrors a real settings.json: no top-level editor.tabSize, but
+        // several language blocks set it. The most common value wins.
+        let p = import_vscode_settings(
+            r#"{
+                "workbench.colorTheme": "Tokyo Night",
+                "[typescript]": { "editor.tabSize": 2, "editor.defaultFormatter": "x" },
+                "[dockercompose]": { "editor.tabSize": 2 },
+                "[python]": { "editor.tabSize": 4 }
+            }"#,
+        );
+        assert_eq!(p.editor.tab_size, Some(2));
+    }
+
+    #[test]
+    fn top_level_wins_over_language_blocks() {
+        let p = import_vscode_settings(
+            r#"{
+                "editor.tabSize": 8,
+                "[python]": { "editor.tabSize": 4 }
+            }"#,
+        );
+        assert_eq!(p.editor.tab_size, Some(8));
+    }
+
+    #[test]
+    fn language_block_font_and_line_height() {
+        let p = import_vscode_settings(
+            r#"{
+                "[typescript]": { "editor.fontSize": 12, "editor.lineHeight": 1.6 }
+            }"#,
+        );
+        assert_eq!(p.editor.font_size, Some(12.0));
+        // 1.6 < 8 → multiplier of the (block-derived) font size.
+        assert_eq!(p.editor.line_height, Some(12.0 * 1.6));
+    }
+
+    #[test]
+    fn reads_workbench_color_theme() {
+        assert_eq!(
+            vscode_color_theme(r#"{ "workbench.colorTheme": "Tokyo Night" }"#),
+            Some("Tokyo Night".to_string())
+        );
+        assert_eq!(vscode_color_theme(r#"{ "editor.fontSize": 12 }"#), None);
+        assert_eq!(vscode_color_theme("not json"), None);
     }
 
     #[test]
