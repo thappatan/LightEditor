@@ -126,6 +126,9 @@ fn language_id(lang: Language) -> &'static str {
         Language::Ruby => "ruby",
         Language::Html => "html",
         Language::Css => "css",
+        Language::Java => "java",
+        Language::Swift => "swift",
+        Language::Cpp => "cpp",
     }
 }
 

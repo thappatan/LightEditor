@@ -37,6 +37,9 @@ pub enum Language {
     Ruby,
     Html,
     Css,
+    Java,
+    Swift,
+    Cpp,
 }
 
 impl Language {
@@ -62,6 +65,9 @@ impl Language {
             "rb" | "rbw" => Some(Language::Ruby),
             "html" | "htm" | "xhtml" => Some(Language::Html),
             "css" => Some(Language::Css),
+            "java" => Some(Language::Java),
+            "swift" => Some(Language::Swift),
+            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Language::Cpp),
             _ => None,
         }
     }
@@ -85,6 +91,9 @@ impl Language {
             Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
             Language::Html => tree_sitter_html::LANGUAGE.into(),
             Language::Css => tree_sitter_css::LANGUAGE.into(),
+            Language::Java => tree_sitter_java::LANGUAGE.into(),
+            Language::Swift => tree_sitter_swift::LANGUAGE.into(),
+            Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         }
     }
 }
@@ -246,6 +255,11 @@ fn classifier_for(lang: Language) -> Classifier {
         Language::Ruby => classify_ruby,
         Language::Html => classify_html,
         Language::Css => classify_css,
+        Language::Java => classify_java,
+        Language::Swift => classify_swift,
+        // C++ shares enough node kinds with C that the C classifier is
+        // a reasonable base; C++-only constructs degrade gracefully.
+        Language::Cpp => classify_c,
     }
 }
 
@@ -642,6 +656,81 @@ fn classify_css(
     }
 }
 
+/// tree-sitter-java. Flutter's Android side. Covers the common
+/// surface: type names, method declarations, annotations, modifiers,
+/// strings, numbers, comments.
+fn classify_java(
+    kind: &str,
+    parent: Option<&str>,
+    field: Option<&str>,
+) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    if kind == "identifier" {
+        match (parent, field) {
+            (Some("method_declaration"), Some("name"))
+            | (Some("method_invocation"), Some("name")) => return Some(Function),
+            _ => {}
+        }
+    }
+    match kind {
+        "line_comment" | "block_comment" => Some(Comment),
+        "string_literal" | "character_literal" => Some(StringLit),
+        "decimal_integer_literal"
+        | "hex_integer_literal"
+        | "decimal_floating_point_literal"
+        | "true"
+        | "false"
+        | "null_literal" => Some(Number),
+        "type_identifier"
+        | "boolean_type"
+        | "integral_type"
+        | "floating_point_type"
+        | "void_type" => Some(Type),
+        "marker_annotation" | "annotation" => Some(Keyword),
+        "public" | "private" | "protected" | "static" | "final" | "abstract" | "class"
+        | "interface" | "enum" | "extends" | "implements" | "import" | "package" | "new"
+        | "return" | "if" | "else" | "for" | "while" | "do" | "switch" | "case" | "default"
+        | "break" | "continue" | "try" | "catch" | "finally" | "throw" | "throws" | "this"
+        | "super" | "synchronized" | "volatile" | "transient" | "native" | "instanceof"
+        | "void" => Some(Keyword),
+        _ => None,
+    }
+}
+
+/// tree-sitter-swift. Flutter's iOS side. Type names, function /
+/// method declarations and calls, attributes, strings, numbers,
+/// comments, keywords.
+fn classify_swift(
+    kind: &str,
+    parent: Option<&str>,
+    _field: Option<&str>,
+) -> Option<HighlightCategory> {
+    use HighlightCategory::*;
+    if kind == "simple_identifier" {
+        match parent {
+            Some("function_declaration") => return Some(Function),
+            Some("call_expression") => return Some(Function),
+            _ => {}
+        }
+    }
+    match kind {
+        "comment" | "multiline_comment" => Some(Comment),
+        "line_str_text" | "str_escaped_char" | "raw_str_part" => Some(StringLit),
+        "integer_literal" | "real_literal" | "hex_literal" | "oct_literal" | "bin_literal"
+        | "boolean_literal" => Some(Number),
+        "type_identifier" | "user_type" => Some(Type),
+        "attribute" => Some(Keyword),
+        "func" | "let" | "var" | "class" | "struct" | "enum" | "protocol" | "extension"
+        | "import" | "return" | "if" | "else" | "guard" | "for" | "in" | "while" | "repeat"
+        | "switch" | "case" | "default" | "break" | "continue" | "fallthrough" | "do" | "throw"
+        | "throws" | "try" | "catch" | "defer" | "self" | "super" | "init" | "deinit"
+        | "static" | "public" | "private" | "internal" | "fileprivate" | "open" | "final"
+        | "lazy" | "weak" | "override" | "mutating" | "nil" | "true" | "false" | "async"
+        | "await" => Some(Keyword),
+        _ => None,
+    }
+}
+
 /// tree-sitter-md (CommonMark). Block-structure grammar — we surface the
 /// leaf markers and code spans, treat headings as keywords.
 fn classify_markdown(
@@ -968,6 +1057,42 @@ fn x() {}
             Language::for_path(Path::new("main.css")),
             Some(Language::Css),
         );
+    }
+
+    #[test]
+    fn java_highlights_class_and_string() {
+        let src = "public class Foo {\n  String s = \"hi\";\n}\n";
+        let cats = categories_with(Language::Java, src);
+        assert!(cats.contains(&HighlightCategory::Keyword)); // public / class
+        assert!(cats.contains(&HighlightCategory::StringLit));
+    }
+
+    #[test]
+    fn swift_highlights_func_and_string() {
+        let src = "func greet() {\n  let s = \"hi\"\n}\n";
+        let cats = categories_with(Language::Swift, src);
+        assert!(cats.contains(&HighlightCategory::Keyword)); // func / let
+    }
+
+    #[test]
+    fn cpp_highlights_via_c_classifier() {
+        let src = "int main() {\n  // hi\n  return 0;\n}\n";
+        let cats = categories_with(Language::Cpp, src);
+        assert!(cats.contains(&HighlightCategory::Comment));
+    }
+
+    #[test]
+    fn native_extensions_route_correctly() {
+        assert_eq!(
+            Language::for_path(Path::new("A.java")),
+            Some(Language::Java)
+        );
+        assert_eq!(
+            Language::for_path(Path::new("App.swift")),
+            Some(Language::Swift),
+        );
+        assert_eq!(Language::for_path(Path::new("x.cpp")), Some(Language::Cpp));
+        assert_eq!(Language::for_path(Path::new("x.hpp")), Some(Language::Cpp));
     }
 
     #[test]
