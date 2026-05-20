@@ -32,6 +32,11 @@ pub enum CommandId {
     ThemeNord,
     ThemeTokyoNight,
     BrowseThemes,
+    /// Add a folder as a new workspace root (multi-root, spec §4.1.5).
+    AddFolderToWorkspace,
+    /// Remove the workspace root containing the current sidebar
+    /// selection. No-op when only one root is open.
+    RemoveFolderFromWorkspace,
     /// Apply a VSCode theme discovered under `~/.vscode/extensions`.
     /// The payload is the absolute path to the theme JSON; the entry's
     /// `label` carries the theme's display name.
@@ -90,6 +95,8 @@ impl CommandEntry {
             CommandId::ThemeNord => "Theme: Nord",
             CommandId::ThemeTokyoNight => "Theme: Tokyo Night",
             CommandId::BrowseThemes => "Theme: Browse…",
+            CommandId::AddFolderToWorkspace => "Workspace: Add Folder…",
+            CommandId::RemoveFolderFromWorkspace => "Workspace: Remove Folder",
             // Built dynamically with a per-theme label; this fallback is
             // only hit if someone calls `builtin` on the variant.
             CommandId::ApplyVscodeTheme(_) => "Theme (VSCode)",
@@ -128,6 +135,8 @@ pub const BUILTIN_COMMAND_IDS: &[CommandId] = &[
     CommandId::ThemeTokyoNight,
     CommandId::BrowseThemes,
     CommandId::ImportVscodeSettings,
+    CommandId::AddFolderToWorkspace,
+    CommandId::RemoveFolderFromWorkspace,
 ];
 
 /// The popup's state. Built from a fresh list of entries every time the
@@ -334,14 +343,22 @@ mod tests {
 
     #[test]
     fn query_filters_case_insensitively() {
+        // A lowercase query matches the capitalised labels (nucleo
+        // smart-case: an all-lowercase pattern is case-insensitive).
         let mut p = builtin_palette();
         for c in "save".chars() {
             p.push_char(c);
         }
-        let labels: Vec<&str> = p.visible_labels().collect();
-        assert!(labels.iter().all(|l| l.to_lowercase().contains("save")));
-        // Three Save variants in the static list.
-        assert_eq!(labels.len(), 3);
+        let labels: Vec<String> = p.visible_labels().map(|s| s.to_string()).collect();
+        // All three Save variants are reachable. The fuzzy matcher may
+        // also surface incidental subsequence matches (e.g. s-a-v-e in
+        // "Workspace: Remove Folder"), so we assert presence, not count.
+        for want in ["Save", "Save As…", "Save All"] {
+            assert!(
+                labels.contains(&want.to_string()),
+                "missing {want:?} in {labels:?}"
+            );
+        }
     }
 
     #[test]

@@ -1459,19 +1459,23 @@ impl State {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         let hidden_dirs = settings.file_tree.hidden_dirs.clone();
-        let file_tree = FileTree::new(tree_root, hidden_dirs.clone());
+        let file_tree = FileTree::new(vec![tree_root.clone()], hidden_dirs.clone());
         // The watcher snapshots its own copy of the hidden-dirs list at
         // spawn time. A live settings reload won't change which paths
         // the watcher drops until the editor restarts — kept simple
         // because the list rarely changes in practice; if it ever
         // matters, swap the snapshot for an `Arc<RwLock<Vec<String>>>`
         // and update it from the `SettingsChanged` handler.
+        //
+        // Multi-root note: these workspace-scoped reads still anchor on
+        // the primary (first) root only. Spanning every root is the
+        // cross-root follow-up to this foundation.
         let file_tree_watcher =
-            spawn_file_tree_watcher(&file_tree.root, hidden_dirs, flash_proxy.clone());
-        let workspace_git_status = git::compute_workspace_status(&file_tree.root);
-        let workspace_git_dir_status = git::aggregate_dirs(&workspace_git_status, &file_tree.root);
-        let npm_scripts = scripts::read_scripts(&file_tree.root);
-        let flutter_project = flutter::detect_flutter(&file_tree.root);
+            spawn_file_tree_watcher(&tree_root, hidden_dirs, flash_proxy.clone());
+        let workspace_git_status = git::compute_workspace_status(&tree_root);
+        let workspace_git_dir_status = git::aggregate_dirs(&workspace_git_status, &tree_root);
+        let npm_scripts = scripts::read_scripts(&tree_root);
+        let flutter_project = flutter::detect_flutter(&tree_root);
 
         let mut state = Self {
             window,
@@ -3383,6 +3387,56 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// Add a folder as a new workspace root (spec §4.1.5). Opens a
+    /// native folder picker; the chosen directory becomes a new
+    /// top-level root in the sidebar. Shows the sidebar if it was
+    /// hidden so the user sees the result.
+    fn add_folder_to_workspace(&mut self) {
+        let Some(path) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        self.file_tree.add_root(path);
+        if !self.file_tree.visible {
+            self.toggle_file_tree();
+        } else {
+            self.refresh_file_tree_text();
+            self.scene_dirty = true;
+            self.window.request_redraw();
+        }
+        self.set_status_flash(format!("added folder “{name}” to workspace"));
+    }
+
+    /// Remove the workspace root that contains the current sidebar
+    /// selection (spec §4.1.5). No-op — with a status hint — when only
+    /// one folder is open or nothing is selected.
+    fn remove_folder_from_workspace(&mut self) {
+        if self.file_tree.roots.len() <= 1 {
+            self.set_status_flash("workspace has only one folder".to_string());
+            return;
+        }
+        let Some(idx) = self.file_tree.selected else {
+            self.set_status_flash("select a folder's row first".to_string());
+            return;
+        };
+        let Some(root) = self.file_tree.root_path_at(idx) else {
+            return;
+        };
+        let name = root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root.to_string_lossy().into_owned());
+        if self.file_tree.remove_root(&root) {
+            self.refresh_file_tree_text();
+            self.scene_dirty = true;
+            self.window.request_redraw();
+            self.set_status_flash(format!("removed folder “{name}” from workspace"));
+        }
+    }
+
     /// Scroll the file-tree viewport so the selected row sits inside
     /// the visible band. Called after every keyboard move and when the
     /// panel re-opens with a stale selection.
@@ -3430,15 +3484,27 @@ impl State {
         );
     }
 
+    /// The primary (first) workspace root, falling back to `.` only in
+    /// the degenerate no-root case (which can't happen today — the tree
+    /// always carries at least one). The workspace-scoped reads below
+    /// (git, scripts, Flutter, search) anchor here until they're taught
+    /// to span every root.
+    fn primary_root(&self) -> PathBuf {
+        self.file_tree
+            .primary_root()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     /// Recompute the workspace-wide git status. Runs libgit2 once over
-    /// the repo at `file_tree.root` and caches the result on `self` —
-    /// the next `refresh_file_tree_text` call paints the markers from
-    /// this cache. Outside a repo the helper returns an empty map and
-    /// the markers silently disappear.
+    /// the primary root and caches the result on `self` — the next
+    /// `refresh_file_tree_text` call paints the markers from this cache.
+    /// Outside a repo the helper returns an empty map and the markers
+    /// silently disappear.
     fn refresh_workspace_git_status(&mut self) {
-        self.workspace_git_status = git::compute_workspace_status(&self.file_tree.root);
-        self.workspace_git_dir_status =
-            git::aggregate_dirs(&self.workspace_git_status, &self.file_tree.root);
+        let root = self.primary_root();
+        self.workspace_git_status = git::compute_workspace_status(&root);
+        self.workspace_git_dir_status = git::aggregate_dirs(&self.workspace_git_status, &root);
     }
 
     /// Re-read `package.json`'s `"scripts"` map so the next time the
@@ -3446,14 +3512,14 @@ impl State {
     /// one file read plus serde parse — so it runs on every
     /// `FileTreeChanged` alongside the git-status refresh.
     fn refresh_npm_scripts(&mut self) {
-        self.npm_scripts = scripts::read_scripts(&self.file_tree.root);
+        self.npm_scripts = scripts::read_scripts(&self.primary_root());
     }
 
     /// Re-detect whether the workspace is a Flutter project. Pubspec
     /// edits (a Flutter SDK dep getting added or removed) flow through
     /// `FileTreeChanged` just like package.json does.
     fn refresh_flutter_project(&mut self) {
-        self.flutter_project = flutter::detect_flutter(&self.file_tree.root);
+        self.flutter_project = flutter::detect_flutter(&self.primary_root());
         // A pubspec edit can also flip a workspace into a Flutter
         // project (`flutter create .`) — kick off a device refresh
         // when that happens so the palette is ready next open.
@@ -3499,8 +3565,10 @@ impl State {
                     s.push_str("  ");
                 }
                 let marker = match node.kind {
-                    NodeKind::Directory { expanded: true } => "▾ ",
-                    NodeKind::Directory { expanded: false } => "▸ ",
+                    NodeKind::Directory { expanded: true, .. } => "▾ ",
+                    NodeKind::Directory {
+                        expanded: false, ..
+                    } => "▸ ",
                     NodeKind::File => "  ",
                 };
                 s.push_str(marker);
@@ -3600,7 +3668,7 @@ impl State {
     /// the panel. Root is `file_tree.root` (which is the same project
     /// root the LSP uses).
     fn run_find_in_files(&mut self) {
-        let root = self.file_tree.root.clone();
+        let root = self.primary_root();
         let Some(f) = self.find_in_files.as_mut() else {
             return;
         };
@@ -3648,7 +3716,7 @@ impl State {
     /// row 3..N = results inside the visible window.
     fn refresh_find_in_files_text(&mut self) {
         let visible = self.find_in_files_visible_rows();
-        let workspace = self.file_tree.root.clone();
+        let workspace = self.primary_root();
         let text = {
             let Some(f) = self.find_in_files.as_ref() else {
                 return;
@@ -3707,7 +3775,7 @@ impl State {
             return;
         }
         // First open: spawn the shell rooted at the project root.
-        let cwd = Some(self.file_tree.root.clone());
+        let cwd = Some(self.primary_root());
         let pane_height = TERMINAL_HEIGHT_DIP * self.scale;
         // Real cosmic-text monospace advance — see comment in
         // `resync_terminal_cells`. At spawn time `terminal_text` is
@@ -5246,6 +5314,8 @@ impl State {
             CommandId::BrowseThemes => self.browse_themes(),
             CommandId::ApplyVscodeTheme(path) => self.apply_vscode_theme_path(&path),
             CommandId::ImportVscodeSettings => self.import_vscode_settings(),
+            CommandId::AddFolderToWorkspace => self.add_folder_to_workspace(),
+            CommandId::RemoveFolderFromWorkspace => self.remove_folder_from_workspace(),
             CommandId::RunScript(name) => self.run_npm_script(&name),
             CommandId::FlutterRun => {
                 self.flutter_session_active = true;
@@ -5324,7 +5394,7 @@ impl State {
     /// manager is detected from the workspace's lockfile; the cwd is
     /// the file-tree root that the script was discovered against.
     fn run_npm_script(&mut self, name: &str) {
-        let root = self.file_tree.root.clone();
+        let root = self.primary_root();
         let pm = scripts::detect_package_manager(&root);
         let cmd = format!("{} run {}\n", pm.binary(), name);
 
@@ -5506,7 +5576,7 @@ impl State {
             }
         }
         // Workspace settings last so they override the user-level file.
-        candidates.push(self.file_tree.root.join(".vscode").join("settings.json"));
+        candidates.push(self.primary_root().join(".vscode").join("settings.json"));
 
         // The user-level settings.toml is both our merge base and our
         // write target. (App owns the live `Settings`; we round-trip
