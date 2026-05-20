@@ -44,10 +44,13 @@ pub enum CommandId {
     /// Import editor settings (font size / line height / tab size /
     /// excluded dirs) from the user's VSCode `settings.json`.
     ImportVscodeSettings,
-    /// Run a `package.json` script by name in the embedded terminal.
-    /// The string is the bare script name (the host already knows the
-    /// package manager and the workspace root).
-    RunScript(String),
+    /// Run a `package.json` script in the embedded terminal. Carries the
+    /// bare script name plus the workspace root it lives in, so a
+    /// multi-root workspace runs the right manifest's script.
+    RunScript {
+        name: String,
+        dir: std::path::PathBuf,
+    },
     /// Start `flutter run` in the embedded terminal (auto-opens the
     /// pane). Surfaces only when the workspace has a Flutter pubspec
     /// *and* the editor doesn't have a cached device list yet —
@@ -101,7 +104,7 @@ impl CommandEntry {
             // only hit if someone calls `builtin` on the variant.
             CommandId::ApplyVscodeTheme(_) => "Theme (VSCode)",
             CommandId::ImportVscodeSettings => "Settings: Import from VSCode…",
-            CommandId::RunScript(_) => "Run script",
+            CommandId::RunScript { .. } => "Run script",
             CommandId::FlutterRun => "Flutter: Run",
             CommandId::FlutterRunOnDevice(_) => "Flutter: Run on …",
             CommandId::FlutterHotReload => "Flutter: Hot Reload",
@@ -391,7 +394,10 @@ mod tests {
             .map(CommandEntry::builtin)
             .collect();
         entries.push(CommandEntry {
-            id: CommandId::RunScript("dev".into()),
+            id: CommandId::RunScript {
+                name: "dev".into(),
+                dir: std::path::PathBuf::from("."),
+            },
             label: "Run script: dev".into(),
         });
         let palette = CommandPalette::new(entries);

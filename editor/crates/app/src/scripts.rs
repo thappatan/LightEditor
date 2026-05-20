@@ -10,7 +10,7 @@
 //! the manifest plus a few `path.exists()` checks for lockfiles. Anything
 //! more elaborate (monorepo walking, melos, turborepo) is a follow-up.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -45,6 +45,10 @@ pub struct NpmScript {
     /// can show it as a hint and the runner doesn't have to re-read the
     /// manifest.
     pub command: String,
+    /// The workspace root the script lives in. In a multi-root workspace
+    /// several roots can each have a `package.json`; the runner `cd`s
+    /// here so the command executes against the right manifest.
+    pub dir: PathBuf,
 }
 
 /// Look at the workspace root and pick a package manager from the
@@ -87,7 +91,11 @@ pub fn read_scripts(root: &Path) -> Vec<NpmScript> {
     // stable across reloads.
     pkg.scripts
         .into_iter()
-        .map(|(name, command)| NpmScript { name, command })
+        .map(|(name, command)| NpmScript {
+            name,
+            command,
+            dir: root.to_path_buf(),
+        })
         .collect()
 }
 
@@ -176,6 +184,8 @@ mod tests {
         // BTreeMap → alphabetical order.
         assert_eq!(names, vec!["build", "dev", "test"]);
         assert_eq!(scripts[1].command, "vite");
+        // Every script remembers its owning root (multi-root cwd).
+        assert!(scripts.iter().all(|s| s.dir == root));
         std::fs::remove_dir_all(&root).ok();
     }
 

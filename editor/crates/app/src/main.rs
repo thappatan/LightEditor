@@ -577,6 +577,13 @@ fn quad_color(hex: &str) -> SceneColor {
     SceneColor::rgba(r, g, b, a)
 }
 
+/// POSIX single-quote a path for safe interpolation into a shell command
+/// line (used when `cd`-ing into a multi-root script's folder). Embedded
+/// single quotes are escaped the standard `'\''` way.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
 /// Which overflowing popup a scrollbar belongs to. Only one is open at
 /// a time, so [`scrollbar_geometry`](State::scrollbar_geometry) returns
 /// the single active one.
@@ -3400,6 +3407,11 @@ impl State {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
         self.file_tree.add_root(path);
+        // The new root brings its own git repo / scripts / pubspec into
+        // scope — recompute the cross-root caches.
+        self.refresh_workspace_git_status();
+        self.refresh_npm_scripts();
+        self.refresh_flutter_project();
         if !self.file_tree.visible {
             self.toggle_file_tree();
         } else {
@@ -3430,6 +3442,9 @@ impl State {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.to_string_lossy().into_owned());
         if self.file_tree.remove_root(&root) {
+            self.refresh_workspace_git_status();
+            self.refresh_npm_scripts();
+            self.refresh_flutter_project();
             self.refresh_file_tree_text();
             self.scene_dirty = true;
             self.window.request_redraw();
@@ -3496,30 +3511,53 @@ impl State {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    /// Recompute the workspace-wide git status. Runs libgit2 once over
-    /// the primary root and caches the result on `self` — the next
-    /// `refresh_file_tree_text` call paints the markers from this cache.
-    /// Outside a repo the helper returns an empty map and the markers
-    /// silently disappear.
+    /// Every workspace root, in display order. Cross-root features
+    /// (git status, search, scripts, Flutter detection) iterate this.
+    fn root_paths(&self) -> Vec<PathBuf> {
+        self.file_tree
+            .roots
+            .iter()
+            .map(|r| r.path.clone())
+            .collect()
+    }
+
+    /// Recompute git status across **every** workspace root and merge
+    /// into one cache — the next `refresh_file_tree_text` call paints the
+    /// markers from it. Each root runs libgit2 once; the per-file and
+    /// per-directory maps are keyed by path so roots can't collide.
+    /// Roots outside a repo contribute nothing.
     fn refresh_workspace_git_status(&mut self) {
-        let root = self.primary_root();
-        self.workspace_git_status = git::compute_workspace_status(&root);
-        self.workspace_git_dir_status = git::aggregate_dirs(&self.workspace_git_status, &root);
+        let mut files = std::collections::HashMap::new();
+        let mut dirs = std::collections::HashMap::new();
+        for root in self.root_paths() {
+            let status = git::compute_workspace_status(&root);
+            dirs.extend(git::aggregate_dirs(&status, &root));
+            files.extend(status);
+        }
+        self.workspace_git_status = files;
+        self.workspace_git_dir_status = dirs;
     }
 
-    /// Re-read `package.json`'s `"scripts"` map so the next time the
-    /// palette opens, its entries reflect the current state. Cheap —
-    /// one file read plus serde parse — so it runs on every
-    /// `FileTreeChanged` alongside the git-status refresh.
+    /// Re-read every root's `package.json` `"scripts"` so the next
+    /// palette open reflects the current state. Each [`scripts::NpmScript`]
+    /// remembers the root it came from so it runs in the right cwd.
     fn refresh_npm_scripts(&mut self) {
-        self.npm_scripts = scripts::read_scripts(&self.primary_root());
+        self.npm_scripts = self
+            .root_paths()
+            .iter()
+            .flat_map(|r| scripts::read_scripts(r))
+            .collect();
     }
 
-    /// Re-detect whether the workspace is a Flutter project. Pubspec
-    /// edits (a Flutter SDK dep getting added or removed) flow through
-    /// `FileTreeChanged` just like package.json does.
+    /// Re-detect whether **any** workspace root is a Flutter project.
+    /// The first matching root wins (its path drives `flutter run`'s
+    /// cwd). Pubspec edits flow through `FileTreeChanged` like
+    /// package.json does.
     fn refresh_flutter_project(&mut self) {
-        self.flutter_project = flutter::detect_flutter(&self.primary_root());
+        self.flutter_project = self
+            .root_paths()
+            .iter()
+            .find_map(|r| flutter::detect_flutter(r));
         // A pubspec edit can also flip a workspace into a Flutter
         // project (`flutter create .`) — kick off a device refresh
         // when that happens so the palette is ready next open.
@@ -3668,11 +3706,16 @@ impl State {
     /// the panel. Root is `file_tree.root` (which is the same project
     /// root the LSP uses).
     fn run_find_in_files(&mut self) {
-        let root = self.primary_root();
+        let roots = self.root_paths();
         let Some(f) = self.find_in_files.as_mut() else {
             return;
         };
-        f.results = find_in_files::search(&f.query, &root);
+        // Search every root and concatenate. Results carry absolute
+        // paths, so matches from different roots coexist in one list.
+        f.results = roots
+            .iter()
+            .flat_map(|r| find_in_files::search(&f.query, r))
+            .collect();
         f.selected = 0;
         f.scroll = 0;
         // Move focus to the results list so Enter now opens; ↑/↓
@@ -5127,10 +5170,32 @@ impl State {
                 });
             }
         }
+        // When scripts come from more than one root, disambiguate the
+        // label with the owning folder's name so two roots' `build`
+        // scripts don't look identical.
+        let multi_root_scripts = {
+            let mut dirs: Vec<&Path> = self.npm_scripts.iter().map(|s| s.dir.as_path()).collect();
+            dirs.sort();
+            dirs.dedup();
+            dirs.len() > 1
+        };
         for script in &self.npm_scripts {
+            let label = if multi_root_scripts {
+                let root = script
+                    .dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                format!("Run script: {} ({})", script.name, root)
+            } else {
+                format!("Run script: {}", script.name)
+            };
             entries.push(CommandEntry {
-                id: CommandId::RunScript(script.name.clone()),
-                label: format!("Run script: {}", script.name),
+                id: CommandId::RunScript {
+                    name: script.name.clone(),
+                    dir: script.dir.clone(),
+                },
+                label,
             });
         }
         if self.flutter_project.is_some() {
@@ -5316,10 +5381,10 @@ impl State {
             CommandId::ImportVscodeSettings => self.import_vscode_settings(),
             CommandId::AddFolderToWorkspace => self.add_folder_to_workspace(),
             CommandId::RemoveFolderFromWorkspace => self.remove_folder_from_workspace(),
-            CommandId::RunScript(name) => self.run_npm_script(&name),
+            CommandId::RunScript { name, dir } => self.run_npm_script(&name, &dir),
             CommandId::FlutterRun => {
                 self.flutter_session_active = true;
-                self.flutter_send(b"flutter run\n", "flutter run");
+                self.flutter_run_in_project();
                 self.refresh_flutter_devices_async();
             }
             CommandId::FlutterRunOnDevice(id) => {
@@ -5357,6 +5422,35 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// `cd <flutter-root> && ` prefix for a `flutter run` command, or an
+    /// empty string when the Flutter project is the terminal's default
+    /// cwd (the primary root) or unknown. Lets a Flutter app that lives
+    /// in a non-primary workspace root still launch correctly.
+    fn flutter_cd_prefix(&self) -> String {
+        match self.flutter_project.as_ref() {
+            Some(p) if p.root != self.primary_root() => {
+                format!("cd {} && ", shell_quote(&p.root))
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Start `flutter run` in the Flutter project's own root.
+    fn flutter_run_in_project(&mut self) {
+        let cmd = format!("{}flutter run\n", self.flutter_cd_prefix());
+        let needs_show = !self.terminal.as_ref().is_some_and(|t| t.visible);
+        if needs_show {
+            self.toggle_terminal();
+        }
+        if let Some(t) = self.terminal.as_mut() {
+            t.focused = true;
+            t.write(cmd.into_bytes());
+        }
+        self.set_status_flash("flutter run".to_string());
+        self.scene_dirty = true;
+        self.window.request_redraw();
+    }
+
     /// Variant of [`flutter_send`](Self::flutter_send) that runs
     /// `flutter run -d <id>` for the picker-selected device. Builds
     /// the bytes per-call because the id is owned data — the static
@@ -5366,7 +5460,7 @@ impl State {
         if needs_show {
             self.toggle_terminal();
         }
-        let cmd = format!("flutter run -d {device_id}\n");
+        let cmd = format!("{}flutter run -d {device_id}\n", self.flutter_cd_prefix());
         if let Some(t) = self.terminal.as_mut() {
             t.focused = true;
             t.write(cmd.into_bytes());
@@ -5393,10 +5487,17 @@ impl State {
     /// auto-opening the pane if it's currently hidden. The package
     /// manager is detected from the workspace's lockfile; the cwd is
     /// the file-tree root that the script was discovered against.
-    fn run_npm_script(&mut self, name: &str) {
-        let root = self.primary_root();
-        let pm = scripts::detect_package_manager(&root);
-        let cmd = format!("{} run {}\n", pm.binary(), name);
+    fn run_npm_script(&mut self, name: &str, dir: &Path) {
+        let pm = scripts::detect_package_manager(dir);
+        // `cd` into the script's own root first so the right manifest
+        // runs even when it isn't the terminal's default cwd (multi-root).
+        // Skip the `cd` when it's already the primary root to keep the
+        // command line clean in the common single-root case.
+        let cmd = if dir == self.primary_root() {
+            format!("{} run {}\n", pm.binary(), name)
+        } else {
+            format!("cd {} && {} run {}\n", shell_quote(dir), pm.binary(), name)
+        };
 
         // Make sure the pane is visible and focused before we feed it
         // the command — `Cmd-J` users expect to see the output.

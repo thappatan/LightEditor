@@ -14,7 +14,7 @@
 //! line-scan. A full YAML parser is a follow-up if we ever need more
 //! structure.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -85,6 +85,10 @@ pub struct FlutterProject {
     /// `pubspec.yaml` had no `name:` line, which is unusual but
     /// shouldn't crash.
     pub name: String,
+    /// The root the project lives in. In a multi-root workspace the
+    /// Flutter app may not be the primary root, so `flutter run` `cd`s
+    /// here first.
+    pub root: PathBuf,
 }
 
 /// Inspect `root/pubspec.yaml`. Returns `Some(FlutterProject)` when
@@ -98,7 +102,10 @@ pub fn detect_flutter(root: &Path) -> Option<FlutterProject> {
         return None;
     }
     let name = parse_name(&text).unwrap_or_default();
-    Some(FlutterProject { name })
+    Some(FlutterProject {
+        name,
+        root: root.to_path_buf(),
+    })
 }
 
 /// `name: <value>` extractor. The Flutter / Dart manifest puts this
@@ -193,6 +200,8 @@ mod tests {
         .unwrap();
         let detected = detect_flutter(&root).expect("Flutter project");
         assert_eq!(detected.name, "my_app");
+        // The project remembers its root so `flutter run` can cd there.
+        assert_eq!(detected.root, root);
         std::fs::remove_dir_all(&root).ok();
     }
 
