@@ -138,6 +138,8 @@ fn language_id(lang: Language) -> &'static str {
         Language::Java => "java",
         Language::Swift => "swift",
         Language::Cpp => "cpp",
+        Language::Kotlin => "kotlin",
+        Language::Scss => "scss",
     }
 }
 

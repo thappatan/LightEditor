@@ -226,6 +226,15 @@ impl CommandPalette {
         self.scroll
     }
 
+    /// Set the scroll offset directly (e.g. from a scrollbar drag),
+    /// clamped so at least `window` worth of rows stay reachable. Leaves
+    /// `selected` alone — dragging the bar moves the viewport, not the
+    /// highlighted row, matching VSCode.
+    pub fn set_scroll(&mut self, scroll: usize, window: usize) {
+        let max_scroll = self.visible.len().saturating_sub(window);
+        self.scroll = scroll.min(max_scroll);
+    }
+
     /// Slide the scroll offset so the selected row sits inside the
     /// first `window` rows. Call after every key that mutates
     /// `selected`.

@@ -27,3 +27,5 @@ tree-sitter-css = { workspace = true }
 tree-sitter-java = { workspace = true }
 tree-sitter-swift = { workspace = true }
 tree-sitter-cpp = { workspace = true }
+tree-sitter-kotlin-ng = { workspace = true }
+tree-sitter-scss = { workspace = true }

@@ -94,6 +94,8 @@ tree-sitter-css = "0.25"
 tree-sitter-java = "0.23"
 tree-sitter-swift = "0.7"
 tree-sitter-cpp = "0.23"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-scss = "1.0"
 editor-syntax = { path = "crates/syntax" }
 editor-lsp-client = { path = "crates/lsp-client" }
 lsp-types = "0.95"
