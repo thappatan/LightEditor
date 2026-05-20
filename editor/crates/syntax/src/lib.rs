@@ -108,6 +108,11 @@ pub enum HighlightCategory {
     Comment,
     Type,
     Function,
+    /// Identifiers that name a value: local variables, parameters, and
+    /// object-property *reads* (`res.statusCode`). VSCode paints these
+    /// light blue (`#9cdcfe`); without the bucket they fall through to
+    /// default text and most of a typical file ends up uncoloured.
+    Variable,
     Punctuation,
 }
 
@@ -196,6 +201,9 @@ impl Highlighter {
             &tree.root_node(),
             None,
             None,
+            None,
+            None,
+            text,
             &byte_to_char,
             classifier,
             &mut out,
@@ -230,12 +238,36 @@ fn build_byte_to_char_map(text: &str) -> Vec<usize> {
     map
 }
 
-/// Per-language classifier function pointer. The first argument is the
-/// node's kind; the second is the parent's kind (or `None` at root); the
-/// third is the field name the node occupies inside its parent. Returning
-/// `None` falls through to the recursive walk and lets a more specific
-/// child node provide the highlight.
-type Classifier = fn(&str, Option<&str>, Option<&str>) -> Option<HighlightCategory>;
+/// Context handed to a classifier for one node. Carries two ancestor
+/// levels so rules can distinguish e.g. a plain property read
+/// (`obj.prop`) from a method call (`obj.method()`): the property name
+/// is a `property_identifier` under a `member_expression`, but only in
+/// the call case is that `member_expression` the `function` field of a
+/// `call_expression` (the grandparent).
+#[derive(Clone, Copy)]
+pub struct NodeCtx<'a> {
+    /// The node's own kind.
+    pub kind: &'a str,
+    /// The node's source text. Cheap (a slice of the buffer). Used by
+    /// classifiers that lean on naming conventions — e.g. Dart, where an
+    /// UpperCamelCase identifier names a type/widget and a lowerCamelCase
+    /// one names a value, a distinction tree-sitter-dart doesn't make in
+    /// its node kinds.
+    pub text: &'a str,
+    /// Parent kind, or `None` at the root.
+    pub parent: Option<&'a str>,
+    /// Field name the node occupies inside its parent.
+    pub field: Option<&'a str>,
+    /// Grandparent kind, or `None` near the root.
+    pub grandparent: Option<&'a str>,
+    /// Field name the *parent* occupies inside the grandparent.
+    pub grandparent_field: Option<&'a str>,
+}
+
+/// Per-language classifier function pointer. Returning `None` falls
+/// through to the recursive walk and lets a more specific child node
+/// provide the highlight.
+type Classifier = fn(&NodeCtx) -> Option<HighlightCategory>;
 
 fn classifier_for(lang: Language) -> Classifier {
     match lang {
@@ -263,15 +295,27 @@ fn classifier_for(lang: Language) -> Classifier {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect(
     node: &Node,
     parent_kind: Option<&str>,
     parent_field: Option<&str>,
+    grandparent_kind: Option<&str>,
+    grandparent_field: Option<&str>,
+    src: &str,
     byte_to_char: &[usize],
     classify: Classifier,
     out: &mut Vec<Highlight>,
 ) {
-    if let Some(cat) = classify(node.kind(), parent_kind, parent_field) {
+    let ctx = NodeCtx {
+        kind: node.kind(),
+        text: src.get(node.byte_range()).unwrap_or(""),
+        parent: parent_kind,
+        field: parent_field,
+        grandparent: grandparent_kind,
+        grandparent_field,
+    };
+    if let Some(cat) = classify(&ctx) {
         let start = byte_to_char
             .get(node.start_byte())
             .copied()
@@ -289,14 +333,25 @@ fn collect(
     }
     // Walk children manually so we can pass field-name info downward — the
     // `children(&mut cursor)` iterator borrows the cursor exclusively which
-    // makes querying `cursor.field_name()` mid-iteration awkward.
+    // makes querying `cursor.field_name()` mid-iteration awkward. The child's
+    // grandparent context is *this* node's parent context.
     let this_kind = node.kind();
     for i in 0..node.child_count() {
         let Some(child) = node.child(i) else {
             continue;
         };
         let field = node.field_name_for_child(i as u32);
-        collect(&child, Some(this_kind), field, byte_to_char, classify, out);
+        collect(
+            &child,
+            Some(this_kind),
+            field,
+            parent_kind,
+            parent_field,
+            src,
+            byte_to_char,
+            classify,
+            out,
+        );
     }
 }
 
@@ -304,22 +359,46 @@ fn collect(
 /// as their `kind()`, which is what powers the long keyword match arm.
 /// Specific context-sensitive cases (function names, macro invocations,
 /// field access, lifetimes) check `parent_kind` / `field` first.
-fn classify_rust(
-    kind: &str,
-    parent: Option<&str>,
-    field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_rust(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let NodeCtx {
+        kind,
+        text,
+        parent,
+        field,
+        grandparent,
+        grandparent_field,
+    } = *ctx;
     use HighlightCategory::*;
+    let upper = text.chars().next().is_some_and(|c| c.is_uppercase());
     // Field-specific identifier classifications. Each line is
     // (parent_kind, field_name) → category.
     if kind == "identifier" {
         match (parent, field) {
             (Some("function_item"), Some("name")) => return Some(Function),
             (Some("function_signature_item"), Some("name")) => return Some(Function),
-            (Some("call_expression"), Some("function")) => return Some(Function),
+            (Some("call_expression"), Some("function")) => {
+                return Some(if upper { Type } else { Function })
+            }
             (Some("macro_invocation"), Some("macro")) => return Some(Function),
+            // `Vec::new()` — path segment is a type, the trailing name is
+            // the associated fn. Uppercase path ⇒ Type; lowercase ⇒ value.
+            (Some("scoped_identifier"), _) => return Some(if upper { Type } else { Variable }),
             _ => {}
         }
+        // A value identifier: local, parameter, field-init, argument.
+        // UpperCamelCase ones are types / enum variants / consts.
+        return Some(if upper { Type } else { Variable });
+    }
+    // `obj.method()` — the field of a field_expression that is the callee
+    // of a call_expression is a method call; a bare `obj.field` is a read.
+    if kind == "field_identifier" {
+        if parent == Some("field_expression")
+            && grandparent == Some("call_expression")
+            && grandparent_field == Some("function")
+        {
+            return Some(Function);
+        }
+        return Some(Variable);
     }
     match kind {
         "line_comment" | "block_comment" => Some(Comment),
@@ -328,9 +407,6 @@ fn classify_rust(
         "type_identifier" | "primitive_type" => Some(Type),
         // Lifetimes — `'a`, `'static`. Distinct enough to colour as Type.
         "lifetime" => Some(Type),
-        // `obj.field` — colour the field name like punctuation so it sits
-        // between value-loud and keyword-loud.
-        "field_identifier" => Some(Punctuation),
         "fn" | "let" | "mut" | "pub" | "const" | "static" | "use" | "mod" | "struct" | "enum"
         | "impl" | "trait" | "for" | "in" | "if" | "else" | "while" | "loop" | "match"
         | "return" | "break" | "continue" | "as" | "ref" | "self" | "Self" | "true" | "false"
@@ -340,24 +416,47 @@ fn classify_rust(
     }
 }
 
-/// tree-sitter-typescript (also serves TSX). Function-context identifiers
-/// (function_declaration.name, call_expression.function, method names) get
-/// the Function colour; other identifiers fall through to default text.
-fn classify_typescript(
-    kind: &str,
-    parent: Option<&str>,
-    field: Option<&str>,
-) -> Option<HighlightCategory> {
+/// tree-sitter-typescript (also serves TSX). Identifiers that name or
+/// call a function get the Function colour; every other value identifier
+/// (locals, params, property reads) gets Variable so the file reads like
+/// VSCode's instead of falling through to plain text.
+fn classify_typescript(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let NodeCtx {
+        kind,
+        parent,
+        field,
+        grandparent,
+        grandparent_field,
+        ..
+    } = *ctx;
     use HighlightCategory::*;
-    if kind == "identifier" || kind == "property_identifier" {
+    if kind == "identifier"
+        || kind == "property_identifier"
+        || kind == "shorthand_property_identifier"
+    {
         match (parent, field) {
             (Some("function_declaration"), Some("name"))
             | (Some("function_signature"), Some("name"))
+            | (Some("function_expression"), Some("name"))
+            | (Some("generator_function_declaration"), Some("name"))
             | (Some("method_definition"), Some("name"))
             | (Some("method_signature"), Some("name")) => return Some(Function),
+            // Direct call: `foo(...)`.
             (Some("call_expression"), Some("function")) => return Some(Function),
+            // Method call: `obj.method(...)`. The name is the `property`
+            // of a `member_expression` that is itself the callee
+            // (`function` field of the enclosing `call_expression`).
+            (Some("member_expression"), Some("property"))
+                if grandparent == Some("call_expression")
+                    && grandparent_field == Some("function") =>
+            {
+                return Some(Function)
+            }
             _ => {}
         }
+        // Any other identifier names a value: a local, a parameter, or a
+        // property read.
+        return Some(Variable);
     }
     match kind {
         "comment" => Some(Comment),
@@ -378,21 +477,37 @@ fn classify_typescript(
     }
 }
 
-/// tree-sitter-javascript — same context-sensitive function rules as TS
-/// minus the TS-only keywords.
-fn classify_javascript(
-    kind: &str,
-    parent: Option<&str>,
-    field: Option<&str>,
-) -> Option<HighlightCategory> {
+/// tree-sitter-javascript — same context-sensitive function/variable
+/// rules as TS minus the TS-only keywords.
+fn classify_javascript(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let NodeCtx {
+        kind,
+        parent,
+        field,
+        grandparent,
+        grandparent_field,
+        ..
+    } = *ctx;
     use HighlightCategory::*;
-    if kind == "identifier" || kind == "property_identifier" {
+    if kind == "identifier"
+        || kind == "property_identifier"
+        || kind == "shorthand_property_identifier"
+    {
         match (parent, field) {
             (Some("function_declaration"), Some("name"))
+            | (Some("function_expression"), Some("name"))
+            | (Some("generator_function_declaration"), Some("name"))
             | (Some("method_definition"), Some("name")) => return Some(Function),
             (Some("call_expression"), Some("function")) => return Some(Function),
+            (Some("member_expression"), Some("property"))
+                if grandparent == Some("call_expression")
+                    && grandparent_field == Some("function") =>
+            {
+                return Some(Function)
+            }
             _ => {}
         }
+        return Some(Variable);
     }
     match kind {
         "comment" => Some(Comment),
@@ -412,11 +527,8 @@ fn classify_javascript(
 }
 
 /// tree-sitter-json — small grammar, four buckets.
-fn classify_json(
-    kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_json(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let kind = ctx.kind;
     use HighlightCategory::*;
     match kind {
         "comment" => Some(Comment),
@@ -428,20 +540,36 @@ fn classify_json(
 }
 
 /// tree-sitter-python.
-fn classify_python(
-    kind: &str,
-    parent: Option<&str>,
-    field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_python(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let NodeCtx {
+        kind,
+        text,
+        parent,
+        field,
+        grandparent,
+        grandparent_field,
+    } = *ctx;
     use HighlightCategory::*;
+    let upper = text.chars().next().is_some_and(|c| c.is_uppercase());
     if kind == "identifier" {
         match (parent, field) {
             (Some("function_definition"), Some("name")) => return Some(Function),
             (Some("class_definition"), Some("name")) => return Some(Type),
             (Some("call"), Some("function")) => return Some(Function),
             (Some("decorator"), _) => return Some(Function),
+            // `obj.attr` — a method call when the attribute is the callee
+            // (`obj.method()`); otherwise a property read.
+            (Some("attribute"), Some("attribute")) => {
+                if grandparent == Some("call") && grandparent_field == Some("function") {
+                    return Some(Function);
+                }
+                return Some(if upper { Type } else { Variable });
+            }
             _ => {}
         }
+        // Locals, params, attribute receivers, arguments. UpperCamelCase
+        // ⇒ a class / type reference.
+        return Some(if upper { Type } else { Variable });
     }
     match kind {
         "comment" => Some(Comment),
@@ -460,15 +588,35 @@ fn classify_python(
 }
 
 /// tree-sitter-go.
-fn classify_go(kind: &str, parent: Option<&str>, field: Option<&str>) -> Option<HighlightCategory> {
+fn classify_go(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let NodeCtx {
+        kind,
+        text,
+        parent,
+        field,
+        grandparent,
+        grandparent_field,
+    } = *ctx;
     use HighlightCategory::*;
+    let upper = text.chars().next().is_some_and(|c| c.is_uppercase());
     if matches!(kind, "identifier" | "field_identifier") {
         match (parent, field) {
             (Some("function_declaration"), Some("name")) => return Some(Function),
             (Some("method_declaration"), Some("name")) => return Some(Function),
             (Some("call_expression"), Some("function")) => return Some(Function),
+            // `pkg.Fn()` / `obj.Method()` — the field of a selector that is
+            // the callee of a call is a function/method call.
+            (Some("selector_expression"), Some("field")) => {
+                if grandparent == Some("call_expression") && grandparent_field == Some("function") {
+                    return Some(Function);
+                }
+                return Some(Variable);
+            }
             _ => {}
         }
+        // Values: short-var names, operands, arguments. Exported
+        // (UpperCamelCase) identifiers used as values are usually types.
+        return Some(if upper { Type } else { Variable });
     }
     match kind {
         "comment" => Some(Comment),
@@ -483,15 +631,36 @@ fn classify_go(kind: &str, parent: Option<&str>, field: Option<&str>) -> Option<
     }
 }
 
-/// tree-sitter-c.
-fn classify_c(kind: &str, parent: Option<&str>, field: Option<&str>) -> Option<HighlightCategory> {
+/// tree-sitter-c (also the base for C++). No name-case heuristic — C
+/// macros are upper-case, so it would mislabel them.
+fn classify_c(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let NodeCtx {
+        kind,
+        parent,
+        field,
+        grandparent,
+        grandparent_field,
+        ..
+    } = *ctx;
     use HighlightCategory::*;
     if kind == "identifier" {
         match (parent, field) {
             (Some("call_expression"), Some("function")) => return Some(Function),
             (Some("function_declarator"), Some("declarator")) => return Some(Function),
+            (Some("init_declarator"), Some("declarator")) => return Some(Variable),
             _ => {}
         }
+        return Some(Variable);
+    }
+    // `s.field` / `p->method()` — method call when the field is the callee.
+    if kind == "field_identifier" {
+        if parent == Some("field_expression")
+            && grandparent == Some("call_expression")
+            && grandparent_field == Some("function")
+        {
+            return Some(Function);
+        }
+        return Some(Variable);
     }
     match kind {
         "comment" => Some(Comment),
@@ -508,11 +677,8 @@ fn classify_c(kind: &str, parent: Option<&str>, field: Option<&str>) -> Option<H
 }
 
 /// tree-sitter-toml-ng.
-fn classify_toml(
-    kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_toml(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let kind = ctx.kind;
     use HighlightCategory::*;
     match kind {
         "comment" => Some(Comment),
@@ -530,11 +696,8 @@ fn classify_toml(
 }
 
 /// tree-sitter-yaml.
-fn classify_yaml(
-    kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_yaml(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let kind = ctx.kind;
     use HighlightCategory::*;
     match kind {
         "comment" => Some(Comment),
@@ -551,38 +714,67 @@ fn classify_yaml(
     }
 }
 
-/// tree-sitter-dart. Covers Flutter idioms — annotations like
-/// `@override`, function calls (`obj.method()`), constructor invocations
-/// — on top of the obvious comments / strings / numbers / type names.
-fn classify_dart(
-    kind: &str,
-    parent: Option<&str>,
-    field: Option<&str>,
-) -> Option<HighlightCategory> {
+/// tree-sitter-dart. This grammar is JS-shaped — calls are
+/// `call_expression` with a `function` field, member access is
+/// `member_expression` with `object` / `property`, named arguments wrap
+/// their name in a `label`. Dart doesn't tag class vs value identifiers
+/// in its node kinds, so we lean on the language's naming convention:
+/// **UpperCamelCase ⇒ a type/widget** (`Scaffold`, `Theme`,
+/// `MainAxisAlignment`), lowerCamelCase ⇒ a value. That single rule is
+/// what makes Flutter code read like VSCode — every widget name turns
+/// teal — without semantic tokens.
+fn classify_dart(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let NodeCtx {
+        kind,
+        text,
+        parent,
+        field,
+        grandparent,
+        grandparent_field,
+    } = *ctx;
     use HighlightCategory::*;
+    // A leading uppercase letter is Dart's convention for types/classes.
+    let upper = text.chars().next().is_some_and(|c| c.is_uppercase());
     if kind == "identifier" {
         match (parent, field) {
+            // Declaration names.
             (Some("function_signature"), Some("name"))
             | (Some("method_signature"), Some("name"))
             | (Some("getter_signature"), Some("name"))
             | (Some("setter_signature"), Some("name"))
             | (Some("constructor_signature"), Some("name"))
             | (Some("factory_constructor_signature"), Some("name")) => return Some(Function),
-            (Some("class_definition"), Some("name"))
+            (Some("class_declaration"), Some("name"))
+            | (Some("class_definition"), Some("name"))
             | (Some("mixin_declaration"), Some("name"))
             | (Some("enum_declaration"), Some("name"))
             | (Some("type_alias"), Some("name"))
             | (Some("extension_declaration"), Some("name")) => return Some(Type),
             // `@override`, `@deprecated`, `@JsonSerializable()` etc.
-            // The identifier sits under `marker_annotation` / `annotation`
-            // — paint it as Keyword so the `@` stands out.
             (Some("marker_annotation"), _) | (Some("annotation"), _) => return Some(Keyword),
-            // The method / function name in a call site (`widget.build()`).
-            (Some("selector"), _)
-            | (Some("function_expression_invocation"), Some("function"))
-            | (Some("conditional_assignable_selector"), _) => return Some(Function),
+            // Callee of `foo(...)` / `Widget(...)`. Uppercase ⇒ a
+            // constructor (Type, teal); lowercase ⇒ a function call.
+            (Some("call_expression"), Some("function")) => {
+                return Some(if upper { Type } else { Function })
+            }
+            // `obj.member` — a property of a member_expression that is
+            // itself a callee is a method call; otherwise a property
+            // read (or a static type reference, when UpperCamelCase).
+            (Some("member_expression"), Some("property")) => {
+                if grandparent == Some("call_expression") && grandparent_field == Some("function") {
+                    return Some(Function);
+                }
+                return Some(if upper { Type } else { Variable });
+            }
+            // `Theme.of(...)` — the receiver. Uppercase ⇒ a type.
+            (Some("member_expression"), Some("object")) => {
+                return Some(if upper { Type } else { Variable })
+            }
             _ => {}
         }
+        // Any other identifier: a type if UpperCamelCase, else a value
+        // (local / parameter / named-argument label / property).
+        return Some(if upper { Type } else { Variable });
     }
     match kind {
         "comment" | "documentation_comment" | "line_comment" | "block_comment" => Some(Comment),
@@ -612,11 +804,8 @@ fn classify_dart(
 /// instantiating"), attribute names → Function (callable / namespacey),
 /// attribute values and text content → StringLit, doctype + entities
 /// → Keyword.
-fn classify_html(
-    kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_html(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let kind = ctx.kind;
     use HighlightCategory::*;
     match kind {
         "comment" => Some(Comment),
@@ -633,11 +822,8 @@ fn classify_html(
 /// tree-sitter-css. Selectors → Type / Function depending on whether
 /// they're tag, class or id; property names → Function; values
 /// (strings, colours, units) keep their nature.
-fn classify_css(
-    kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_css(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let kind = ctx.kind;
     use HighlightCategory::*;
     match kind {
         "comment" => Some(Comment),
@@ -659,18 +845,27 @@ fn classify_css(
 /// tree-sitter-java. Flutter's Android side. Covers the common
 /// surface: type names, method declarations, annotations, modifiers,
 /// strings, numbers, comments.
-fn classify_java(
-    kind: &str,
-    parent: Option<&str>,
-    field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_java(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let NodeCtx {
+        kind,
+        text,
+        parent,
+        field,
+        ..
+    } = *ctx;
     use HighlightCategory::*;
+    let upper = text.chars().next().is_some_and(|c| c.is_uppercase());
     if kind == "identifier" {
         match (parent, field) {
+            // `method_invocation.name` covers both `foo()` and `obj.foo()`.
             (Some("method_declaration"), Some("name"))
             | (Some("method_invocation"), Some("name")) => return Some(Function),
+            (Some("variable_declarator"), Some("name")) => return Some(Variable),
             _ => {}
         }
+        // Receivers, field access, arguments. UpperCamelCase ⇒ a class
+        // reference (`System`, `Math`); lowerCamelCase ⇒ a value.
+        return Some(if upper { Type } else { Variable });
     }
     match kind {
         "line_comment" | "block_comment" => Some(Comment),
@@ -700,18 +895,21 @@ fn classify_java(
 /// tree-sitter-swift. Flutter's iOS side. Type names, function /
 /// method declarations and calls, attributes, strings, numbers,
 /// comments, keywords.
-fn classify_swift(
-    kind: &str,
-    parent: Option<&str>,
-    _field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_swift(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let NodeCtx {
+        kind, text, parent, ..
+    } = *ctx;
     use HighlightCategory::*;
+    let upper = text.chars().next().is_some_and(|c| c.is_uppercase());
     if kind == "simple_identifier" {
         match parent {
             Some("function_declaration") => return Some(Function),
             Some("call_expression") => return Some(Function),
             _ => {}
         }
+        // Locals, params, members, arguments. Swift types are
+        // UpperCamelCase (`Scaffold`-style), values lowerCamelCase.
+        return Some(if upper { Type } else { Variable });
     }
     match kind {
         "comment" | "multiline_comment" => Some(Comment),
@@ -733,11 +931,8 @@ fn classify_swift(
 
 /// tree-sitter-md (CommonMark). Block-structure grammar — we surface the
 /// leaf markers and code spans, treat headings as keywords.
-fn classify_markdown(
-    kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_markdown(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let kind = ctx.kind;
     use HighlightCategory::*;
     match kind {
         "atx_h1_marker"
@@ -766,11 +961,8 @@ fn classify_markdown(
 }
 
 /// tree-sitter-bash.
-fn classify_bash(
-    kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_bash(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let kind = ctx.kind;
     use HighlightCategory::*;
     match kind {
         "comment" => Some(Comment),
@@ -786,12 +978,32 @@ fn classify_bash(
 }
 
 /// tree-sitter-lua.
-fn classify_lua(
-    kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_lua(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let NodeCtx {
+        kind,
+        parent,
+        field,
+        grandparent,
+        ..
+    } = *ctx;
     use HighlightCategory::*;
+    if kind == "identifier" {
+        match (parent, field) {
+            (Some("function_call"), Some("name")) => return Some(Function),
+            // `obj.fn(...)` — the field is a call when its dot-index is the
+            // callee of a function_call; otherwise a field read.
+            (Some("dot_index_expression"), Some("field")) => {
+                if grandparent == Some("function_call") {
+                    return Some(Function);
+                }
+                return Some(Variable);
+            }
+            // `obj:method(...)` is always a method call.
+            (Some("method_index_expression"), Some("method")) => return Some(Function),
+            _ => {}
+        }
+        return Some(Variable);
+    }
     match kind {
         "comment" => Some(Comment),
         "string" => Some(StringLit),
@@ -804,18 +1016,31 @@ fn classify_lua(
 }
 
 /// tree-sitter-ruby.
-fn classify_ruby(
-    kind: &str,
-    _parent: Option<&str>,
-    _field: Option<&str>,
-) -> Option<HighlightCategory> {
+fn classify_ruby(ctx: &NodeCtx) -> Option<HighlightCategory> {
+    let NodeCtx {
+        kind,
+        parent,
+        field,
+        ..
+    } = *ctx;
     use HighlightCategory::*;
+    if kind == "identifier" {
+        match (parent, field) {
+            // `call.method` covers both `foo(...)` and `obj.foo(...)`.
+            (Some("call"), Some("method")) => return Some(Function),
+            (Some("method"), Some("name")) => return Some(Function),
+            (Some("assignment"), Some("left")) => return Some(Variable),
+            _ => {}
+        }
+        return Some(Variable);
+    }
     match kind {
         "comment" => Some(Comment),
         "string" | "string_content" | "string_array" | "symbol_array" | "heredoc_body" => {
             Some(StringLit)
         }
         "integer" | "float" => Some(Number),
+        // `Foo`, `CONST` — Ruby constants/classes.
         "constant" => Some(Type),
         "simple_symbol" | "delimited_symbol" => Some(Function),
         "def" | "class" | "module" | "if" | "elsif" | "else" | "unless" | "while" | "until"
@@ -1199,12 +1424,13 @@ fn x() {}
     }
 
     #[test]
-    fn rust_highlights_field_access() {
+    fn rust_field_read_is_a_variable() {
+        // A bare `p.bar` field read colours as Variable (a value); only
+        // `p.bar()` method calls become Function.
         let src = "fn x(p: Foo) { p.bar }";
-        let hs = highlights_of(Language::Rust, src);
-        assert!(hs
-            .iter()
-            .any(|h| h.category == HighlightCategory::Punctuation));
+        let vars = spans_of(Language::Rust, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"bar".to_string()), "vars={vars:?}");
+        assert!(vars.contains(&"p".to_string()), "vars={vars:?}");
     }
 
     #[test]
@@ -1263,6 +1489,139 @@ fn x() {}
         let src = "function greet() { return 1; }";
         let hs = highlights_of(Language::TypeScript, src);
         assert!(hs.iter().any(|h| h.category == HighlightCategory::Function));
+    }
+
+    /// Return the source slice for every highlight of `category`.
+    fn spans_of(lang: Language, src: &str, category: HighlightCategory) -> Vec<String> {
+        let chars: Vec<char> = src.chars().collect();
+        highlights_of(lang, src)
+            .into_iter()
+            .filter(|h| h.category == category)
+            .map(|h| chars[h.range].iter().collect())
+            .collect()
+    }
+
+    #[test]
+    fn js_method_call_is_a_function() {
+        // `http.createServer` — the method name is a property of a
+        // member_expression that is the callee. It must read as Function,
+        // not Variable, while the receiver `http` stays a Variable.
+        let src = "const s = http.createServer();";
+        let funcs = spans_of(Language::JavaScript, src, HighlightCategory::Function);
+        assert!(
+            funcs.contains(&"createServer".to_string()),
+            "method name should be Function, got {funcs:?}"
+        );
+        let vars = spans_of(Language::JavaScript, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"http".to_string()), "got {vars:?}");
+        assert!(vars.contains(&"s".to_string()), "got {vars:?}");
+        // The method name must NOT also be a Variable.
+        assert!(!vars.contains(&"createServer".to_string()));
+    }
+
+    #[test]
+    fn js_property_read_is_a_variable_not_a_function() {
+        // `res.statusCode` (no call) — the property reads as Variable.
+        let src = "res.statusCode = 200;";
+        let vars = spans_of(Language::JavaScript, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"statusCode".to_string()), "got {vars:?}");
+        let funcs = spans_of(Language::JavaScript, src, HighlightCategory::Function);
+        assert!(!funcs.contains(&"statusCode".to_string()), "got {funcs:?}");
+    }
+
+    #[test]
+    fn ts_direct_call_and_locals() {
+        let src = "const x = require('m');";
+        let funcs = spans_of(Language::TypeScript, src, HighlightCategory::Function);
+        assert!(funcs.contains(&"require".to_string()), "got {funcs:?}");
+        let vars = spans_of(Language::TypeScript, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"x".to_string()), "got {vars:?}");
+    }
+
+    #[test]
+    fn dart_identifier_falls_through_to_variable() {
+        let src = "var count = items;";
+        let vars = spans_of(Language::Dart, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"count".to_string()), "got {vars:?}");
+        assert!(vars.contains(&"items".to_string()), "got {vars:?}");
+    }
+
+    #[test]
+    fn dart_widget_names_are_types_and_methods_are_functions() {
+        // The Flutter idiom: widget constructors should read as Type
+        // (UpperCamelCase), method calls as Function, value identifiers
+        // as Variable — matching VSCode.
+        let src = "class W extends StatefulWidget {\n  Widget build(BuildContext context) {\n    return Scaffold(appBar: AppBar(backgroundColor: Theme.of(context).primary));\n  }\n}\n";
+        let types = spans_of(Language::Dart, src, HighlightCategory::Type);
+        assert!(types.contains(&"Scaffold".to_string()), "types={types:?}");
+        assert!(types.contains(&"AppBar".to_string()), "types={types:?}");
+        assert!(types.contains(&"Theme".to_string()), "types={types:?}");
+
+        let funcs = spans_of(Language::Dart, src, HighlightCategory::Function);
+        assert!(funcs.contains(&"of".to_string()), "funcs={funcs:?}");
+
+        let vars = spans_of(Language::Dart, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"appBar".to_string()), "vars={vars:?}");
+        assert!(vars.contains(&"context".to_string()), "vars={vars:?}");
+        // A widget name must not also be a Function.
+        assert!(!funcs.contains(&"Scaffold".to_string()));
+    }
+
+    #[test]
+    fn rust_methods_and_locals() {
+        let src = "fn f() { let count = 5; obj.push(count); }";
+        let funcs = spans_of(Language::Rust, src, HighlightCategory::Function);
+        assert!(funcs.contains(&"push".to_string()), "funcs={funcs:?}");
+        let vars = spans_of(Language::Rust, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"count".to_string()), "vars={vars:?}");
+        assert!(vars.contains(&"obj".to_string()), "vars={vars:?}");
+    }
+
+    #[test]
+    fn python_method_call_and_local() {
+        let src = "x = 1\nitems.append(x)\n";
+        let funcs = spans_of(Language::Python, src, HighlightCategory::Function);
+        assert!(funcs.contains(&"append".to_string()), "funcs={funcs:?}");
+        let vars = spans_of(Language::Python, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"x".to_string()), "vars={vars:?}");
+        assert!(vars.contains(&"items".to_string()), "vars={vars:?}");
+    }
+
+    #[test]
+    fn go_selector_call_is_a_function() {
+        let src = "package m\nfunc f() { fmt.Println(x) }\n";
+        let funcs = spans_of(Language::Go, src, HighlightCategory::Function);
+        assert!(funcs.contains(&"Println".to_string()), "funcs={funcs:?}");
+        let vars = spans_of(Language::Go, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"fmt".to_string()), "vars={vars:?}");
+    }
+
+    #[test]
+    fn java_method_invocation_and_local() {
+        let src = "class C { void m() { int n = 1; obj.run(n); } }";
+        let funcs = spans_of(Language::Java, src, HighlightCategory::Function);
+        assert!(funcs.contains(&"run".to_string()), "funcs={funcs:?}");
+        let vars = spans_of(Language::Java, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"n".to_string()), "vars={vars:?}");
+    }
+
+    #[test]
+    fn ruby_call_method_is_a_function() {
+        let src = "def r\n  x = 1\n  obj.run(x)\nend\n";
+        let funcs = spans_of(Language::Ruby, src, HighlightCategory::Function);
+        assert!(funcs.contains(&"run".to_string()), "funcs={funcs:?}");
+        let vars = spans_of(Language::Ruby, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"x".to_string()), "vars={vars:?}");
+    }
+
+    #[test]
+    fn lua_dot_and_colon_calls_are_functions() {
+        let src = "local x = 1\nobj.run(x)\nobj:m(x)\n";
+        let funcs = spans_of(Language::Lua, src, HighlightCategory::Function);
+        assert!(funcs.contains(&"run".to_string()), "funcs={funcs:?}");
+        assert!(funcs.contains(&"m".to_string()), "funcs={funcs:?}");
+        let vars = spans_of(Language::Lua, src, HighlightCategory::Variable);
+        assert!(vars.contains(&"x".to_string()), "vars={vars:?}");
     }
 
     // ── incremental parsing ───────────────────────────────────────────────

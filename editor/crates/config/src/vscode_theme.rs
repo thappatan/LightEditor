@@ -483,6 +483,12 @@ fn build_syntax(token_colors: &[TokenColorEntry], fallback_fg: &str) -> SyntaxTh
             "support.class",
         ]),
         function: pick(&["entity.name.function", "support.function"]),
+        variable: pick(&[
+            "variable",
+            "variable.other",
+            "meta.definition.variable",
+            "support.variable",
+        ]),
         punctuation: pick(&["punctuation", "meta.brace", "meta.delimiter"]),
     }
 }

@@ -132,6 +132,7 @@ pub struct SyntaxTheme {
     #[serde(rename = "type")]
     pub type_: String,
     pub function: String,
+    pub variable: String,
     pub punctuation: String,
 }
 
@@ -149,6 +150,7 @@ impl Default for SyntaxTheme {
             comment: "#6a9955ff".into(),
             type_: "#4ec9b0ff".into(),
             function: "#dcdcaaff".into(),
+            variable: "#9cdcfeff".into(),
             punctuation: "#d4d4d4ff".into(),
         }
     }
